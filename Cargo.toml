@@ -1,0 +1,11 @@
+[package]
+name = "mf4-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nom = "7.1"  # Used for parsing binary MDF data
+byteorder = "1.4"  # Helps with reading binary data
+memmap2 = "0.5"
+meval = "0.2"  # Used for evaluating mathematical expressions
+thiserror = "2.0"
