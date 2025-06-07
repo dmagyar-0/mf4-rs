@@ -5,6 +5,9 @@ use std::io::{Write, Seek, SeekFrom};
 use std::collections::HashMap;
 use byteorder::{LittleEndian, WriteBytesExt};
 
+use crate::blocks::common::{BlockHeader, DataType};
+use crate::parsing::decoder::DecodedValue;
+
 use crate::error::MdfError;
 use crate::blocks::identification_block::IdentificationBlock;
 use crate::blocks::header_block::HeaderBlock;
@@ -12,6 +15,23 @@ use crate::blocks::data_group_block::DataGroupBlock;
 use crate::blocks::channel_group_block::ChannelGroupBlock;
 use crate::blocks::channel_block::ChannelBlock;
 use crate::blocks::text_block::TextBlock;
+use crate::blocks::data_list_block::DataListBlock;
+
+/// Maximum size of a DTBLOCK including header (4 MiB)
+const MAX_DT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Helper structure tracking an open DTBLOCK during writing
+struct OpenDataBlock {
+    dg_id: String,
+    dt_id: String,
+    start_pos: u64,
+    record_size: usize,
+    record_count: u64,
+    record_id_len: usize,
+    channels: Vec<ChannelBlock>,
+    dt_ids: Vec<String>,
+    dt_positions: Vec<u64>,
+}
 
 /// Writer for MDF blocks, ensuring 8-byte alignment and zero padding.
 /// Tracks block positions and supports updating links at a later stage.
@@ -23,6 +43,8 @@ pub struct MdfWriter {
     /// Maps block IDs (user-provided keys) to their file offsets
     /// This allows retrieving positions later for link updates
     block_positions: HashMap<String, u64>,
+    /// Track open DT blocks per channel group
+    open_dts: HashMap<String, OpenDataBlock>,
 }
 
 impl MdfWriter {
@@ -30,10 +52,11 @@ impl MdfWriter {
     /// Initializes with an empty block position tracker.
     pub fn new(path: &str) -> Result<Self, MdfError> {
         let file = File::create(path)?;
-        Ok(MdfWriter { 
-            file, 
+        Ok(MdfWriter {
+            file,
             offset: 0,
             block_positions: HashMap::new(),
+            open_dts: HashMap::new(),
         })
     }
 
@@ -256,8 +279,8 @@ impl MdfWriter {
     /// # Returns
     /// The ID assigned to the new channel block (for future reference)
     pub fn add_channel(
-        &mut self, 
-        cg_id: &str, 
+        &mut self,
+        cg_id: &str,
         prev_cn_id: Option<&str>,
         name: Option<&str>,
         byte_offset: u32,
@@ -309,6 +332,172 @@ impl MdfWriter {
         }
         
         Ok(cn_id)
+    }
+
+    /// Start writing a DTBLOCK for the given data group.
+    /// `channels` describes the fixed layout of one record.
+    pub fn start_data_block(
+        &mut self,
+        dg_id: &str,
+        cg_id: &str,
+        record_id_len: u8,
+        channels: &[ChannelBlock],
+    ) -> Result<(), MdfError> {
+        if self.open_dts.contains_key(cg_id) {
+            return Err(MdfError::BlockSerializationError("data block already open for this channel group".into()));
+        }
+
+        let mut record_bytes = 0usize;
+        for ch in channels {
+            let byte_end = ch.byte_offset as usize + ((ch.bit_offset as usize + ch.bit_count as usize + 7) / 8);
+            record_bytes = record_bytes.max(byte_end);
+        }
+        let record_size = record_bytes + record_id_len as usize;
+
+        // Write DT header with placeholder length
+        let header = BlockHeader {
+            id: "##DT".to_string(),
+            reserved0: 0,
+            block_len: 24,
+            links_nr: 0,
+        };
+        let header_bytes = header.to_bytes()?;
+
+        let dt_count = self.block_positions.keys().filter(|k| k.starts_with("dt_")).count();
+        let dt_id = format!("dt_{}", dt_count);
+        let dt_pos = self.write_block_with_id(&header_bytes, &dt_id)?;
+
+        // Patch DG's data pointer to this DT block
+        let dg_data_link_offset = 40; // data_block_addr field within DG
+        self.update_block_link(dg_id, dg_data_link_offset, &dt_id)?;
+
+        self.open_dts.insert(
+            cg_id.to_string(),
+            OpenDataBlock {
+                dg_id: dg_id.to_string(),
+                dt_id: dt_id.clone(),
+                start_pos: dt_pos,
+                record_size,
+                record_count: 0,
+                record_id_len: record_id_len as usize,
+                channels: channels.to_vec(),
+                dt_ids: vec![dt_id],
+                dt_positions: vec![dt_pos],
+            },
+        );
+        Ok(())
+    }
+
+    /// Append one record to the currently open DTBLOCK for the given channel group.
+    pub fn write_record(&mut self, cg_id: &str, values: &[DecodedValue]) -> Result<(), MdfError> {
+        // first check block size without holding a mutable borrow on self
+        let potential_new_block = {
+            let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+                MdfError::BlockSerializationError("no open DT block for this channel group".into())
+            })?;
+            if values.len() != dt.channels.len() {
+                return Err(MdfError::BlockSerializationError("value count mismatch".into()));
+            }
+            24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
+        };
+
+        if potential_new_block {
+            // retrieve info needed to finalize the current block
+            let (start_pos, record_count, record_size) = {
+                let dt = self.open_dts.get(cg_id).unwrap();
+                (dt.start_pos, dt.record_count, dt.record_size)
+            };
+            let size = 24 + record_size * record_count as usize;
+            self.update_link(start_pos + 8, size as u64)?;
+
+            // start new DT block
+            let header = BlockHeader {
+                id: "##DT".to_string(),
+                reserved0: 0,
+                block_len: 24,
+                links_nr: 0,
+            };
+            let header_bytes = header.to_bytes()?;
+            let dt_count = self
+                .block_positions
+                .keys()
+                .filter(|k| k.starts_with("dt_"))
+                .count();
+            let new_dt_id = format!("dt_{}", dt_count);
+            let new_dt_pos = self.write_block_with_id(&header_bytes, &new_dt_id)?;
+
+            let dt = self.open_dts.get_mut(cg_id).unwrap();
+            dt.dt_id = new_dt_id.clone();
+            dt.start_pos = new_dt_pos;
+            dt.record_count = 0;
+            dt.dt_ids.push(new_dt_id);
+            dt.dt_positions.push(new_dt_pos);
+        }
+
+        let dt = self.open_dts.get_mut(cg_id).unwrap();
+        if values.len() != dt.channels.len() {
+            return Err(MdfError::BlockSerializationError("value count mismatch".into()));
+        }
+
+        let mut buf = vec![0u8; dt.record_size];
+
+        for (ch, val) in dt.channels.iter().zip(values.iter()) {
+            let offset = dt.record_id_len + ch.byte_offset as usize;
+            match (&ch.data_type, val) {
+                (DataType::UnsignedIntegerLE, DecodedValue::UnsignedInteger(v)) => {
+                    let bytes = (*v).to_le_bytes();
+                    let n = ((ch.bit_count + 7) / 8) as usize;
+                    buf[offset..offset + n].copy_from_slice(&bytes[..n]);
+                }
+                (DataType::SignedIntegerLE, DecodedValue::SignedInteger(v)) => {
+                    let bytes = (*v as i64).to_le_bytes();
+                    let n = ((ch.bit_count + 7) / 8) as usize;
+                    buf[offset..offset + n].copy_from_slice(&bytes[..n]);
+                }
+                (DataType::FloatLE, DecodedValue::Float(v)) => {
+                    if ch.bit_count == 32 {
+                        buf[offset..offset + 4].copy_from_slice(&(*v as f32).to_le_bytes());
+                    } else if ch.bit_count == 64 {
+                        buf[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.file.write_all(&buf)?;
+        dt.record_count += 1;
+        self.offset += buf.len() as u64;
+        Ok(())
+    }
+
+    /// Finalize the currently open DTBLOCK for a given channel group and patch its size field.
+    pub fn finish_data_block(&mut self, cg_id: &str) -> Result<(), MdfError> {
+        let mut dt = self.open_dts.remove(cg_id).ok_or_else(|| {
+            MdfError::BlockSerializationError("no open DT block for this channel group".into())
+        })?;
+        // finalize the current DT block
+        let size = 24 + dt.record_size as u64 * dt.record_count;
+        self.update_link(dt.start_pos + 8, size)?;
+
+        // If multiple DT blocks were created, generate a DLBLOCK referencing them all
+        if dt.dt_ids.len() > 1 {
+            let dl_count = self
+                .block_positions
+                .keys()
+                .filter(|k| k.starts_with("dl_"))
+                .count();
+            let dl_id = format!("dl_{}", dl_count);
+            let dl_block = DataListBlock::new(dt.dt_positions.clone());
+            let dl_bytes = dl_block.to_bytes()?;
+            let _pos = self.write_block_with_id(&dl_bytes, &dl_id)?;
+
+            // Patch DG to point to the DL instead of the first DT
+            let dg_data_link_offset = 40;
+            self.update_block_link(&dt.dg_id, dg_data_link_offset, &dl_id)?;
+        }
+
+        Ok(())
     }
     
     /// Writes a complete simple MDF file with a single data group, channel group, and two channels.
