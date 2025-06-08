@@ -558,13 +558,13 @@ impl MdfWriter {
     pub fn write_simple_mdf_file(file_path: &str) -> Result<(), MdfError> {
         // Create a new MDF writer
         let mut writer = MdfWriter::new(file_path)?;
-        
+
         // Initialize with ID and HD blocks
         let (_id_pos, _hd_pos) = writer.init_mdf_file()?;
-        
+
         // Add a data group
         let dg_id = writer.add_data_group(None)?;
-        
+
         // Add a channel group to the data group
         let cg_block = ChannelGroupBlock::default();
         let cg_id = writer.add_channel_group(&dg_id, None, &cg_block)?;
@@ -582,8 +582,9 @@ impl MdfWriter {
         ch2.data_type = DataType::UnsignedIntegerLE;
         ch2.name = Some("Channel 2".to_string());
         let _cn2_id = writer.add_channel(&cg_id, Some(&cn1_id), &ch2)?;
-        
+
         // Finalize the file
         writer.finalize()
     }
+
 }
