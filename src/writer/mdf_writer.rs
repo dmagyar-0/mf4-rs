@@ -16,6 +16,7 @@ use crate::blocks::channel_group_block::ChannelGroupBlock;
 use crate::blocks::channel_block::ChannelBlock;
 use crate::blocks::text_block::TextBlock;
 use crate::blocks::data_list_block::DataListBlock;
+use crate::blocks::conversion::{ConversionBlock, ConversionType};
 
 /// Maximum size of a DTBLOCK including header (4 MiB)
 const MAX_DT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
@@ -319,6 +320,60 @@ impl MdfWriter {
         }
         
         Ok(cg_id)
+    }
+
+    /// Creates and writes a simple value-to-text conversion block.
+    /// Returns the ID and file position of the created block.
+    pub fn add_value_to_text_conversion(
+        &mut self,
+        mapping: &[(i64, &str)],
+        default_text: &str,
+    ) -> Result<(String, u64), MdfError> {
+        // Determine unique ID for this conversion
+        let cc_count = self
+            .block_positions
+            .keys()
+            .filter(|k| k.starts_with("cc_"))
+            .count();
+        let cc_id = format!("cc_{}", cc_count);
+
+        // Create text blocks for each value and default
+        let mut refs = Vec::new();
+        for (idx, (_, txt)) in mapping.iter().enumerate() {
+            let tx_id = format!("tx_{}_{}", cc_id, idx);
+            let tx_block = TextBlock::new(txt);
+            let tx_bytes = tx_block.to_bytes()?;
+            let pos = self.write_block_with_id(&tx_bytes, &tx_id)?;
+            refs.push(pos);
+        }
+        let tx_default_id = format!("tx_{}_default", cc_id);
+        let tx_default = TextBlock::new(default_text);
+        let tx_bytes = tx_default.to_bytes()?;
+        let default_pos = self.write_block_with_id(&tx_bytes, &tx_default_id)?;
+        refs.push(default_pos);
+
+        let vals: Vec<f64> = mapping.iter().map(|(v, _)| *v as f64).collect();
+
+        let block = ConversionBlock {
+            header: BlockHeader { id: "##CC".into(), reserved0: 0, block_len: 0, links_nr: 0 },
+            cc_tx_name: None,
+            cc_md_unit: None,
+            cc_md_comment: None,
+            cc_cc_inverse: None,
+            cc_ref: refs,
+            cc_type: ConversionType::ValueToText,
+            cc_precision: 0,
+            cc_flags: 0,
+            cc_ref_count: (mapping.len() + 1) as u16,
+            cc_val_count: mapping.len() as u16,
+            cc_phy_range_min: None,
+            cc_phy_range_max: None,
+            cc_val: vals,
+            formula: None,
+        };
+        let cc_bytes = block.to_bytes()?;
+        let pos = self.write_block_with_id(&cc_bytes, &cc_id)?;
+        Ok((cc_id, pos))
     }
     
     /// Adds a channel block to the specified channel group and links it properly.

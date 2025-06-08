@@ -30,18 +30,34 @@ fn main() -> Result<(), MdfError> {
     // Create a second data group for the next channel group
     let dg2_id = writer.add_data_group(Some(&dg1_id))?;
 
-    // -------- Channel Group 2 with 2 channels --------
+    // -------- Channel Group 2 with 3 channels --------
     let cg2_id = writer.add_channel_group(&dg2_id, None, &cg_block)?;
+
     let mut ch3 = ChannelBlock::default();
     ch3.byte_offset = 0;
     ch3.bit_count = 16;
-    ch3.data_type = DataType::UnsignedIntegerLE;
+    ch3.data_type = DataType::SignedIntegerLE;
     ch3.name = Some("Temperature".into());
-    let mut ch4 = ch3.clone();
+
+    let mut ch4 = ChannelBlock::default();
     ch4.byte_offset = 2;
+    ch4.bit_count = 32;
+    ch4.data_type = DataType::FloatLE;
     ch4.name = Some("Pressure".into());
+
+    // Value to text conversion for a status channel
+    let status_map = [(0i64, "OK"), (1i64, "WARN")];
+    let (_cc_id, cc_pos) = writer.add_value_to_text_conversion(&status_map, "UNKNOWN")?;
+    let mut ch5 = ChannelBlock::default();
+    ch5.byte_offset = 6;
+    ch5.bit_count = 8;
+    ch5.data_type = DataType::UnsignedIntegerLE;
+    ch5.name = Some("Status".into());
+    ch5.conversion_addr = cc_pos;
+
     let cn3_id = writer.add_channel(&cg2_id, None, &ch3)?;
-    writer.add_channel(&cg2_id, Some(&cn3_id), &ch4)?;
+    let cn4_id = writer.add_channel(&cg2_id, Some(&cn3_id), &ch4)?;
+    writer.add_channel(&cg2_id, Some(&cn4_id), &ch5)?;
 
     // -------- Write sample data for both groups --------
     // Write 100 records for the first group
@@ -58,13 +74,14 @@ fn main() -> Result<(), MdfError> {
     writer.finish_data_block(&cg1_id)?;
 
     // Write 100 records for the second group
-    writer.start_data_block(&dg2_id, &cg2_id, 0, &[ch3.clone(), ch4.clone()])?;
+    writer.start_data_block(&dg2_id, &cg2_id, 0, &[ch3.clone(), ch4.clone(), ch5.clone()])?;
     for i in 0u32..100 {
         writer.write_record(
             &cg2_id,
             &[
-                DecodedValue::UnsignedInteger((i + 50).into()),
-                DecodedValue::UnsignedInteger((i + 100).into()),
+                DecodedValue::SignedInteger(i as i64 - 50),
+                DecodedValue::Float(i as f64 * 0.1),
+                DecodedValue::UnsignedInteger((i % 2).into()),
             ],
         )?;
     }
@@ -86,8 +103,12 @@ fn main() -> Result<(), MdfError> {
         }
     }
 
-    // Optionally verify with tools like `asammdf` using Python
-    // (not shown here)
+    // Optionally verify with asammdf (Python)
+    std::process::Command::new("python3")
+        .arg("-c")
+        .arg("import asammdf,sys;m=asammdf.MDF('multi_group_data.mf4');\nprint('asammdf channels',len(m.channels_db))")
+        .status()
+        .ok();
 
     Ok(())
 }
