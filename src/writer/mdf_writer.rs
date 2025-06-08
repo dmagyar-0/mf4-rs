@@ -169,6 +169,16 @@ impl MdfWriter {
         Ok(())
     }
 
+    /// Updates a 64-bit value at the given file offset, restoring the current
+    /// position afterwards.
+    fn update_u64(&mut self, offset: u64, value: u64) -> Result<(), MdfError> {
+        let current_pos = self.offset;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_u64::<LittleEndian>(value)?;
+        self.file.seek(SeekFrom::Start(current_pos))?;
+        Ok(())
+    }
+
     /// Updates an 8-bit value at the given file offset, restoring the current
     /// position afterwards.
     fn update_u8(&mut self, offset: u64, value: u8) -> Result<(), MdfError> {
@@ -193,6 +203,14 @@ impl MdfWriter {
         let block_pos = self.get_block_position(block_id)
             .ok_or_else(|| MdfError::BlockLinkError(format!("Block '{}' not found", block_id)))?;
         self.update_u8(block_pos + field_offset, value)
+    }
+
+    /// Convenience wrapper around [`update_u64`] that updates a field within a
+    /// previously written block identified by `block_id`.
+    fn update_block_u64(&mut self, block_id: &str, field_offset: u64, value: u64) -> Result<(), MdfError> {
+        let block_pos = self.get_block_position(block_id)
+            .ok_or_else(|| MdfError::BlockLinkError(format!("Block '{}' not found", block_id)))?;
+        self.update_u64(block_pos + field_offset, value)
     }
 
     /// Returns the current file offset (for block address calculation).
@@ -504,6 +522,10 @@ impl MdfWriter {
         // finalize the current DT block
         let size = 24 + dt.record_size as u64 * dt.record_count;
         self.update_link(dt.start_pos + 8, size)?;
+
+        // Store the total number of records in the channel group
+        // cycles_nr field is located at offset 80 within the CG block
+        self.update_block_u64(cg_id, 80, dt.record_count)?;
 
         // If multiple DT blocks were created, generate a DLBLOCK referencing them all
         if dt.dt_ids.len() > 1 {
