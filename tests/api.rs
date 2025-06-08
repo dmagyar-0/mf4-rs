@@ -12,7 +12,18 @@ fn writer_and_parser_roundtrip() -> Result<(), MdfError> {
         std::fs::remove_file(&path)?;
     }
 
-    MdfWriter::write_simple_mdf_file(path.to_str().unwrap())?;
+    let mut writer = MdfWriter::new(path.to_str().unwrap())?;
+    writer.init_mdf_file()?;
+    let cg_id = writer.add_channel_group(None, |_| {})?;
+    let cn1_id = writer.add_channel(&cg_id, None, |ch| {
+        ch.data_type = DataType::UnsignedIntegerLE;
+        ch.name = Some("Channel 1".to_string());
+    })?;
+    writer.add_channel(&cg_id, Some(&cn1_id), |ch| {
+        ch.data_type = DataType::UnsignedIntegerLE;
+        ch.name = Some("Channel 2".to_string());
+    })?;
+    writer.finalize()?;
 
     let mdf = MDF::from_file(path.to_str().unwrap())?;
     let groups = mdf.channel_groups();
