@@ -46,6 +46,14 @@ pub struct MdfWriter {
     block_positions: HashMap<String, u64>,
     /// Track open DT blocks per channel group
     open_dts: HashMap<String, OpenDataBlock>,
+    /// Remember last created data group for auto creation
+    last_dg: Option<String>,
+    /// Map channel group IDs to their data group
+    cg_to_dg: HashMap<String, String>,
+    /// Track current byte offset for each channel group
+    cg_offsets: HashMap<String, usize>,
+    /// Store channels added to each channel group
+    cg_channels: HashMap<String, Vec<ChannelBlock>>, 
 }
 
 impl MdfWriter {
@@ -58,6 +66,10 @@ impl MdfWriter {
             offset: 0,
             block_positions: HashMap::new(),
             open_dts: HashMap::new(),
+            last_dg: None,
+            cg_to_dg: HashMap::new(),
+            cg_offsets: HashMap::new(),
+            cg_channels: HashMap::new(),
         })
     }
 
@@ -291,7 +303,7 @@ impl MdfWriter {
     /// 
     /// # Returns
     /// The ID assigned to the new channel group block (for future reference)
-    pub fn add_channel_group(
+    pub fn add_channel_group_with_dg(
         &mut self,
         dg_id: &str,
         prev_cg_id: Option<&str>,
@@ -319,6 +331,25 @@ impl MdfWriter {
             self.update_block_link(prev_cg_id, prev_cg_next_link_offset, &cg_id)?;
         }
         
+        Ok(cg_id)
+    }
+
+    /// Adds a channel group and automatically creates a new data group for it.
+    pub fn add_channel_group(
+        &mut self,
+        prev_cg_id: Option<&str>,
+        cg_block: &ChannelGroupBlock,
+    ) -> Result<String, MdfError> {
+        // Create a new data group linked after the previous one if present
+        let dg_id = match self.last_dg.clone() {
+            Some(last) => self.add_data_group(Some(&last))?,
+            None => self.add_data_group(None)?,
+        };
+        self.last_dg = Some(dg_id.clone());
+        let cg_id = self.add_channel_group_with_dg(&dg_id, prev_cg_id, cg_block)?;
+        self.cg_to_dg.insert(cg_id.clone(), dg_id);
+        self.cg_offsets.insert(cg_id.clone(), 0);
+        self.cg_channels.insert(cg_id.clone(), Vec::new());
         Ok(cg_id)
     }
 
@@ -398,12 +429,24 @@ impl MdfWriter {
             .filter(|k| k.starts_with("cn_"))
             .count();
         let cn_id = format!("cn_{}", cn_count);
-        
-        // Serialize the provided channel block
-        let cn_bytes = channel.to_bytes()?;
+        // Clone and adjust bit/byte offsets if not specified
+        let mut ch = channel.clone();
+        if ch.bit_count == 0 {
+            ch.bit_count = ch.data_type.default_bits();
+        }
+        if let Some(off) = self.cg_offsets.get_mut(cg_id) {
+            if ch.byte_offset == 0 {
+                ch.byte_offset = *off as u32;
+            }
+            let used = ((ch.bit_offset as usize + ch.bit_count as usize + 7) / 8) as usize;
+            *off = ch.byte_offset as usize + used;
+        }
+
+        // Serialize the provided (possibly adjusted) channel block
+        let cn_bytes = ch.to_bytes()?;
         let cn_pos = self.write_block_with_id(&cn_bytes, &cn_id)?;
         // If a channel name is provided, create a TextBlock for it
-        if let Some(channel_name) = &channel.name {
+        if let Some(channel_name) = &ch.name {
             let tx_id = format!("tx_name_{}", cn_id);
             let tx_block = TextBlock::new(channel_name);
             let tx_bytes = tx_block.to_bytes()?;
@@ -411,6 +454,12 @@ impl MdfWriter {
             let name_link_offset = 40; // name_addr field offset
             self.update_link(cn_pos + name_link_offset, tx_pos)?;
         }
+
+        // Store channel for later convenience
+        self.cg_channels
+            .entry(cg_id.to_string())
+            .or_default()
+            .push(ch.clone());
         
         // Link from channel group to the first channel
         if prev_cn_id.is_none() {
@@ -485,6 +534,22 @@ impl MdfWriter {
             },
         );
         Ok(())
+    }
+
+    /// Convenience wrapper to start a data block for a channel group without
+    /// specifying its data group explicitly.
+    pub fn start_data_block_for_cg(
+        &mut self,
+        cg_id: &str,
+        record_id_len: u8,
+    ) -> Result<(), MdfError> {
+        let dg = self.cg_to_dg.get(cg_id).ok_or_else(|| {
+            MdfError::BlockSerializationError("unknown channel group".into())
+        })?.clone();
+        let channels = self.cg_channels.get(cg_id).ok_or_else(|| {
+            MdfError::BlockSerializationError("no channels for channel group".into())
+        })?.clone();
+        self.start_data_block(&dg, cg_id, record_id_len, &channels)
     }
 
     /// Append one record to the currently open DTBLOCK for the given channel group.
@@ -618,23 +683,16 @@ impl MdfWriter {
         // Initialize with ID and HD blocks
         let (_id_pos, _hd_pos) = writer.init_mdf_file()?;
 
-        // Add a data group
-        let dg_id = writer.add_data_group(None)?;
-
-        // Add a channel group to the data group
+        // Add a channel group (a data group is created automatically)
         let cg_block = ChannelGroupBlock::default();
-        let cg_id = writer.add_channel_group(&dg_id, None, &cg_block)?;
+        let cg_id = writer.add_channel_group(None, &cg_block)?;
 
         // Add two channels to the channel group
         let mut ch1 = ChannelBlock::default();
-        ch1.byte_offset = 0;
-        ch1.bit_count = 32;
         ch1.data_type = DataType::UnsignedIntegerLE;
         ch1.name = Some("Channel 1".to_string());
         let cn1_id = writer.add_channel(&cg_id, None, &ch1)?;
         let mut ch2 = ChannelBlock::default();
-        ch2.byte_offset = 4;
-        ch2.bit_count = 32;
         ch2.data_type = DataType::UnsignedIntegerLE;
         ch2.name = Some("Channel 2".to_string());
         let _cn2_id = writer.add_channel(&cg_id, Some(&cn1_id), &ch2)?;
