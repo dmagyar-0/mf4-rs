@@ -11,7 +11,7 @@ use crate::writer::MdfWriter;
 /// structure as the input but only records whose timestamp lies within the
 /// `[start_time, end_time]` range.
 ///
-/// The implementation looks for the channel marked as master (channel type 1
+/// The implementation looks for the channel marked as master (channel type 2
 /// and sync type 1) to determine the timestamp of each record.
 pub fn cut_mdf_by_time(
     input_path: &str,
@@ -32,7 +32,8 @@ pub fn cut_mdf_by_time(
             let mut prev_cn: Option<String> = None;
             let mut channel_blocks: Vec<ChannelBlock> = Vec::new();
             for ch in &cg.raw_channels {
-                let block = ch.block.clone();
+                let mut block = ch.block.clone();
+                block.resolve_name(&mdf.mmap)?;
                 let id = writer.add_channel(&cg_id, prev_cn.as_deref(), |c| {
                     *c = block.clone();
                 })?;
@@ -49,7 +50,7 @@ pub fn cut_mdf_by_time(
             // Identify the time (master) channel index
             let mut time_idx: Option<usize> = None;
             for (idx, ch) in cg.raw_channels.iter().enumerate() {
-                if ch.block.channel_type == 1 && ch.block.sync_type == 1 {
+                if ch.block.channel_type == 2 && ch.block.sync_type == 1 {
                     time_idx = Some(idx);
                     break;
                 }
