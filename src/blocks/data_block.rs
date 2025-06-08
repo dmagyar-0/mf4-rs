@@ -10,7 +10,12 @@ pub struct DataBlock<'a> {
 
 impl<'a> BlockParse<'a> for DataBlock<'a> {
     const ID: &'static str = "##DT";
-    fn from_bytes(bytes: &'a[u8]) -> Result<Self, MdfError> {
+    /// Parse a DTBLOCK from the given byte slice.
+    ///
+    /// The slice must contain at least the number of bytes specified by the
+    /// block length in the header. Only a reference to the data portion is
+    /// stored to avoid unnecessary allocations.
+    fn from_bytes(bytes: &'a [u8]) -> Result<Self, MdfError> {
 
         let header = Self::parse_header(bytes)?;
 
