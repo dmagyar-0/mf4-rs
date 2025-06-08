@@ -18,6 +18,15 @@ impl<'a> RawChannel {
     ///
     /// The iterator yields a `Result` for each record and transparently handles
     /// both fixed-size and VLSD storage schemes.
+    ///
+    /// # Arguments
+    /// * `data_group` - Parent data group owning the records
+    /// * `channel_group` - Channel group this channel belongs to
+    /// * `mmap` - Memory mapped MDF data
+    ///
+    /// # Returns
+    /// An iterator over byte slices containing each raw record, or an
+    /// [`MdfError`] if the underlying blocks could not be parsed.
     pub fn records(
         &self,
         data_group: &'a RawDataGroup,

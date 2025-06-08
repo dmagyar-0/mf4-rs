@@ -77,6 +77,18 @@ fn metas_equal(a: &GroupMeta, b: &GroupMeta) -> bool {
 }
 
 /// Merge two MDF files into a new file.
+///
+/// All channel groups that share the same layout are concatenated. Groups that
+/// do not match are appended as new channel groups. The resulting file is
+/// written to `output`.
+///
+/// # Arguments
+/// * `output` - Path for the merged file
+/// * `first` - Path to the first input file
+/// * `second` - Path to the second input file
+///
+/// # Returns
+/// `Ok(())` on success or an [`MdfError`] otherwise.
 pub fn merge_files(output: &str, first: &str, second: &str) -> Result<(), MdfError> {
     let mdf1 = MdfFile::parse_from_file(first)?;
     let mdf2 = MdfFile::parse_from_file(second)?;

@@ -19,6 +19,12 @@ impl RawDataGroup {
     ///
     /// The returned vector contains the `DT` or `DV` blocks in the order they
     /// appear on disk, transparently following any `DL` list chains.
+    ///
+    /// # Arguments
+    /// * `mmap` - Memory mapped file containing the MDF data
+    ///
+    /// # Returns
+    /// A vector of [`DataBlock`] objects or an [`MdfError`] if parsing fails.
     pub fn data_blocks<'a>(
         &self,
         mmap: &'a [u8],

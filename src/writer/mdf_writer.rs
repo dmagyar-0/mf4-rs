@@ -507,8 +507,15 @@ impl MdfWriter {
     }
 
 /// Mark an existing channel as the time (master) channel.
+///
 /// This sets the channel's type to 2 and sync type to 1 in the file and updates
 /// the stored channel metadata.
+///
+/// # Arguments
+/// * `cn_id` - Identifier of the channel previously returned by [`add_channel`]
+///
+/// # Returns
+/// `Ok(())` on success or an [`MdfError`] if the channel could not be updated.
 pub fn set_time_channel(&mut self, cn_id: &str) -> Result<(), MdfError> {
     // Offsets of channel_type and sync_type within the CN block
     const CHANNEL_TYPE_OFFSET: u64 = 88;

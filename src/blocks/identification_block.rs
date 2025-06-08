@@ -116,7 +116,14 @@ impl IdentificationBlock {
         Ok(buffer)
     }
 
-    /// Creates an IdentificationBlock from a 64-byte slice.
+    /// Parse an identification block from a 64 byte slice.
+    ///
+    /// # Arguments
+    /// * `bytes` - Slice containing the complete `##ID` block.
+    ///
+    /// # Returns
+    /// The populated [`IdentificationBlock`] or an [`MdfError`] if the slice is
+    /// invalid.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MdfError> {
         let expected_bytes = 64;
         if bytes.len() < expected_bytes {
@@ -152,9 +159,14 @@ impl IdentificationBlock {
             custom_unfinalized_flags: LittleEndian::read_u16(&bytes[62..64]),
         })
     }
-    /// Helper to parse the version string stored in the identification block.
+    /// Parse the textual version stored in the identification block.
     ///
-    /// Returns the major and minor version numbers as `(major, minor)`.
+    /// # Arguments
+    /// * `bytes` - Eight bytes containing the version string, e.g. `"4.10\0"`.
+    ///
+    /// # Returns
+    /// `(major, minor)` on success or an [`MdfError`] when the format is
+    /// unexpected.
     pub fn parse_block_version(bytes: &[u8]) -> Result<(u16,u16), MdfError> {
         // 1) Decode to &str, ignoring invalid UTF-8 (there shouldn’t be any).
         let raw = from_utf8(&bytes)

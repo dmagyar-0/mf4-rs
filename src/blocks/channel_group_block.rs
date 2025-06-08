@@ -165,7 +165,14 @@ impl ChannelGroupBlock {
         Ok(buffer)
     }
     
-    /// Reads all channels linked to this channel group from the memory-mapped file.
+    /// Read all channels linked to this channel group.
+    ///
+    /// # Arguments
+    /// * `mmap` - Memory mapped MDF data used to follow the channel chain.
+    ///
+    /// # Returns
+    /// A vector of fully parsed [`ChannelBlock`]s or an [`MdfError`] if any
+    /// channel cannot be decoded.
     pub fn read_channels(&mut self, mmap: &[u8]) -> Result<Vec<ChannelBlock>, MdfError> {
         let mut channels = Vec::new();
         let mut current_ch_addr = self.first_ch_addr;

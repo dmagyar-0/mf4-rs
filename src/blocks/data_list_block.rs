@@ -85,7 +85,14 @@ impl BlockParse<'_> for DataListBlock {
 }
 
 impl DataListBlock {
-    /// Create a new DataListBlock for equal-length data blocks.
+    /// Create a new `DataListBlock` for equal-length data blocks.
+    ///
+    /// # Arguments
+    /// * `data_links` - Addresses of all data blocks referenced by this list.
+    /// * `data_block_len` - Length in bytes of every referenced data block.
+    ///
+    /// # Returns
+    /// A [`DataListBlock`] ready for serialization.
     pub fn new_equal(data_links: Vec<u64>, data_block_len: u64) -> Self {
         let links_nr = data_links.len() as u64 + 1; // +1 for 'next'
         let block_len = 24 + links_nr * 8 + 1 + 3 + 4 + 8;
@@ -108,6 +115,9 @@ impl DataListBlock {
     }
 
     /// Serialize this DLBLOCK to bytes.
+    ///
+    /// # Returns
+    /// The binary representation of the block or an [`MdfError`] on failure.
     pub fn to_bytes(&self) -> Result<Vec<u8>, MdfError> {
         if self.header.id != "##DL" {
             return Err(MdfError::BlockSerializationError(
