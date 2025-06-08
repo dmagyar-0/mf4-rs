@@ -10,11 +10,12 @@ fn main() -> Result<(), MdfError> {
     // Create writer and basic structure
     let mut writer = MdfWriter::new("multi_group_data.mf4")?;
     let (_id, _hd) = writer.init_mdf_file()?;
-    let dg_id = writer.add_data_group(None)?;
+    // Create a data group for the first channel group
+    let dg1_id = writer.add_data_group(None)?;
     let cg_block = ChannelGroupBlock::default();
 
     // -------- Channel Group 1 with 2 channels --------
-    let cg1_id = writer.add_channel_group(&dg_id, None, &cg_block)?;
+    let cg1_id = writer.add_channel_group(&dg1_id, None, &cg_block)?;
     let mut ch1 = ChannelBlock::default();
     ch1.byte_offset = 0;
     ch1.bit_count = 32;
@@ -26,8 +27,11 @@ fn main() -> Result<(), MdfError> {
     let cn1_id = writer.add_channel(&cg1_id, None, &ch1)?;
     writer.add_channel(&cg1_id, Some(&cn1_id), &ch2)?;
 
+    // Create a second data group for the next channel group
+    let dg2_id = writer.add_data_group(Some(&dg1_id))?;
+
     // -------- Channel Group 2 with 2 channels --------
-    let cg2_id = writer.add_channel_group(&dg_id, Some(&cg1_id), &cg_block)?;
+    let cg2_id = writer.add_channel_group(&dg2_id, None, &cg_block)?;
     let mut ch3 = ChannelBlock::default();
     ch3.byte_offset = 0;
     ch3.bit_count = 16;
@@ -40,8 +44,8 @@ fn main() -> Result<(), MdfError> {
     writer.add_channel(&cg2_id, Some(&cn3_id), &ch4)?;
 
     // -------- Write sample data for both groups --------
-    writer.start_data_block(&dg_id, &cg1_id, 0, &[ch1.clone(), ch2.clone()])?;
-    writer.start_data_block(&dg_id, &cg2_id, 0, &[ch3.clone(), ch4.clone()])?;
+    // Write 100 records for the first group
+    writer.start_data_block(&dg1_id, &cg1_id, 0, &[ch1.clone(), ch2.clone()])?;
     for i in 0u32..100 {
         writer.write_record(
             &cg1_id,
@@ -50,6 +54,12 @@ fn main() -> Result<(), MdfError> {
                 DecodedValue::UnsignedInteger((i * 2).into()),
             ],
         )?;
+    }
+    writer.finish_data_block(&cg1_id)?;
+
+    // Write 100 records for the second group
+    writer.start_data_block(&dg2_id, &cg2_id, 0, &[ch3.clone(), ch4.clone()])?;
+    for i in 0u32..100 {
         writer.write_record(
             &cg2_id,
             &[
@@ -58,8 +68,8 @@ fn main() -> Result<(), MdfError> {
             ],
         )?;
     }
-    writer.finish_data_block(&cg1_id)?;
     writer.finish_data_block(&cg2_id)?;
+
     writer.finalize()?;
 
     // -------- Verify using the crate parser --------
