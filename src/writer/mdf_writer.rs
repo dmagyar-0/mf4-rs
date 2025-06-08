@@ -363,11 +363,12 @@ impl MdfWriter {
             cc_ref: refs,
             cc_type: ConversionType::ValueToText,
             cc_precision: 0,
-            cc_flags: 0,
+            // Value‑to‑text conversions store a physical range even if unused
+            cc_flags: 0b10,
             cc_ref_count: (mapping.len() + 1) as u16,
             cc_val_count: mapping.len() as u16,
-            cc_phy_range_min: None,
-            cc_phy_range_max: None,
+            cc_phy_range_min: Some(0.0),
+            cc_phy_range_max: Some(0.0),
             cc_val: vals,
             formula: None,
         };
