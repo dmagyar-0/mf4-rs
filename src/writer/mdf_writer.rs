@@ -303,19 +303,28 @@ impl MdfWriter {
     /// 
     /// # Returns
     /// The ID assigned to the new channel group block (for future reference)
-    pub fn add_channel_group_with_dg(
+    pub fn add_channel_group_with_dg<F>(
         &mut self,
         dg_id: &str,
         prev_cg_id: Option<&str>,
-        cg_block: &ChannelGroupBlock,
-    ) -> Result<String, MdfError> {
+        configure: F,
+    ) -> Result<String, MdfError>
+    where
+        F: FnOnce(&mut ChannelGroupBlock),
+    {
         // Generate a unique ID for this channel group
-        let cg_count = self.block_positions.keys()
+        let cg_count = self
+            .block_positions
+            .keys()
             .filter(|k| k.starts_with("cg_"))
             .count();
         let cg_id = format!("cg_{}", cg_count);
-        
-        // Serialize the provided channel group block
+
+        // Create default block and allow caller to modify it
+        let mut cg_block = ChannelGroupBlock::default();
+        configure(&mut cg_block);
+
+        // Serialize the configured channel group block
         let cg_bytes = cg_block.to_bytes()?;
         let _cg_pos = self.write_block_with_id(&cg_bytes, &cg_id)?;
         
@@ -335,18 +344,21 @@ impl MdfWriter {
     }
 
     /// Adds a channel group and automatically creates a new data group for it.
-    pub fn add_channel_group(
+    pub fn add_channel_group<F>(
         &mut self,
         prev_cg_id: Option<&str>,
-        cg_block: &ChannelGroupBlock,
-    ) -> Result<String, MdfError> {
+        configure: F,
+    ) -> Result<String, MdfError>
+    where
+        F: FnOnce(&mut ChannelGroupBlock),
+    {
         // Create a new data group linked after the previous one if present
         let dg_id = match self.last_dg.clone() {
             Some(last) => self.add_data_group(Some(&last))?,
             None => self.add_data_group(None)?,
         };
         self.last_dg = Some(dg_id.clone());
-        let cg_id = self.add_channel_group_with_dg(&dg_id, prev_cg_id, cg_block)?;
+        let cg_id = self.add_channel_group_with_dg(&dg_id, prev_cg_id, configure)?;
         self.cg_to_dg.insert(cg_id.clone(), dg_id);
         self.cg_offsets.insert(cg_id.clone(), 0);
         self.cg_channels.insert(cg_id.clone(), Vec::new());
@@ -359,6 +371,7 @@ impl MdfWriter {
         &mut self,
         mapping: &[(i64, &str)],
         default_text: &str,
+        channel_id: Option<&str>,
     ) -> Result<(String, u64), MdfError> {
         // Determine unique ID for this conversion
         let cc_count = self
@@ -405,6 +418,13 @@ impl MdfWriter {
         };
         let cc_bytes = block.to_bytes()?;
         let pos = self.write_block_with_id(&cc_bytes, &cc_id)?;
+
+        if let Some(cn) = channel_id {
+            // Offset of conversion_addr within CN block
+            let conv_offset = 56u64;
+            self.update_block_link(cn, conv_offset, &cc_id)?;
+        }
+
         Ok((cc_id, pos))
     }
     
@@ -418,19 +438,23 @@ impl MdfWriter {
     /// 
     /// # Returns
     /// The ID assigned to the new channel block (for future reference)
-    pub fn add_channel(
+    pub fn add_channel<F>(
         &mut self,
         cg_id: &str,
         prev_cn_id: Option<&str>,
-        channel: &ChannelBlock,
-    ) -> Result<String, MdfError> {
+        configure: F,
+    ) -> Result<String, MdfError>
+    where
+        F: FnOnce(&mut ChannelBlock),
+    {
         // Generate a unique ID for this channel
         let cn_count = self.block_positions.keys()
             .filter(|k| k.starts_with("cn_"))
             .count();
         let cn_id = format!("cn_{}", cn_count);
-        // Clone and adjust bit/byte offsets if not specified
-        let mut ch = channel.clone();
+        // Create channel block and let caller configure it
+        let mut ch = ChannelBlock::default();
+        configure(&mut ch);
         if ch.bit_count == 0 {
             ch.bit_count = ch.data_type.default_bits();
         }
@@ -684,18 +708,17 @@ impl MdfWriter {
         let (_id_pos, _hd_pos) = writer.init_mdf_file()?;
 
         // Add a channel group (a data group is created automatically)
-        let cg_block = ChannelGroupBlock::default();
-        let cg_id = writer.add_channel_group(None, &cg_block)?;
+        let cg_id = writer.add_channel_group(None, |_| {})?;
 
         // Add two channels to the channel group
-        let mut ch1 = ChannelBlock::default();
-        ch1.data_type = DataType::UnsignedIntegerLE;
-        ch1.name = Some("Channel 1".to_string());
-        let cn1_id = writer.add_channel(&cg_id, None, &ch1)?;
-        let mut ch2 = ChannelBlock::default();
-        ch2.data_type = DataType::UnsignedIntegerLE;
-        ch2.name = Some("Channel 2".to_string());
-        let _cn2_id = writer.add_channel(&cg_id, Some(&cn1_id), &ch2)?;
+        let cn1_id = writer.add_channel(&cg_id, None, |ch| {
+            ch.data_type = DataType::UnsignedIntegerLE;
+            ch.name = Some("Channel 1".to_string());
+        })?;
+        writer.add_channel(&cg_id, Some(&cn1_id), |ch| {
+            ch.data_type = DataType::UnsignedIntegerLE;
+            ch.name = Some("Channel 2".to_string());
+        })?;
 
         // Finalize the file
         writer.finalize()
