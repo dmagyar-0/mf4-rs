@@ -159,6 +159,42 @@ impl MdfWriter {
         self.update_link(link_pos, target_pos)
     }
 
+    /// Updates a 32-bit value at the given file offset, restoring the current
+    /// position afterwards.
+    fn update_u32(&mut self, offset: u64, value: u32) -> Result<(), MdfError> {
+        let current_pos = self.offset;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_u32::<LittleEndian>(value)?;
+        self.file.seek(SeekFrom::Start(current_pos))?;
+        Ok(())
+    }
+
+    /// Updates an 8-bit value at the given file offset, restoring the current
+    /// position afterwards.
+    fn update_u8(&mut self, offset: u64, value: u8) -> Result<(), MdfError> {
+        let current_pos = self.offset;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_u8(value)?;
+        self.file.seek(SeekFrom::Start(current_pos))?;
+        Ok(())
+    }
+
+    /// Convenience wrapper around [`update_u32`] that updates a field within a
+    /// previously written block identified by `block_id`.
+    fn update_block_u32(&mut self, block_id: &str, field_offset: u64, value: u32) -> Result<(), MdfError> {
+        let block_pos = self.get_block_position(block_id)
+            .ok_or_else(|| MdfError::BlockLinkError(format!("Block '{}' not found", block_id)))?;
+        self.update_u32(block_pos + field_offset, value)
+    }
+
+    /// Convenience wrapper around [`update_u8`] that updates a field within a
+    /// previously written block identified by `block_id`.
+    fn update_block_u8(&mut self, block_id: &str, field_offset: u64, value: u8) -> Result<(), MdfError> {
+        let block_pos = self.get_block_position(block_id)
+            .ok_or_else(|| MdfError::BlockLinkError(format!("Block '{}' not found", block_id)))?;
+        self.update_u8(block_pos + field_offset, value)
+    }
+
     /// Returns the current file offset (for block address calculation).
     pub fn offset(&self) -> u64 {
         self.offset
@@ -370,6 +406,12 @@ impl MdfWriter {
         // Patch DG's data pointer to this DT block
         let dg_data_link_offset = 40; // data_block_addr field within DG
         self.update_block_link(dg_id, dg_data_link_offset, &dt_id)?;
+
+        // Update metadata in DG and CG blocks
+        // record_id_len field resides at offset 56 within the DG block
+        self.update_block_u8(dg_id, 56, record_id_len)?;
+        // samples_byte_nr field resides at offset 96 within the CG block
+        self.update_block_u32(cg_id, 96, record_bytes as u32)?;
 
         self.open_dts.insert(
             cg_id.to_string(),
