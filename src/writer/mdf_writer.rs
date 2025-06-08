@@ -32,6 +32,7 @@ struct OpenDataBlock {
     channels: Vec<ChannelBlock>,
     dt_ids: Vec<String>,
     dt_positions: Vec<u64>,
+    dt_sizes: Vec<u64>,
 }
 
 /// Writer for MDF blocks, ensuring 8-byte alignment and zero padding.
@@ -555,6 +556,7 @@ impl MdfWriter {
                 channels: channels.to_vec(),
                 dt_ids: vec![dt_id],
                 dt_positions: vec![dt_pos],
+                dt_sizes: Vec::new(),
             },
         );
         Ok(())
@@ -597,6 +599,10 @@ impl MdfWriter {
             };
             let size = 24 + record_size * record_count as usize;
             self.update_link(start_pos + 8, size as u64)?;
+            {
+                let dt = self.open_dts.get_mut(cg_id).unwrap();
+                dt.dt_sizes.push(size as u64);
+            }
 
             // start new DT block
             let header = BlockHeader {
@@ -661,12 +667,13 @@ impl MdfWriter {
 
     /// Finalize the currently open DTBLOCK for a given channel group and patch its size field.
     pub fn finish_data_block(&mut self, cg_id: &str) -> Result<(), MdfError> {
-        let dt = self.open_dts.remove(cg_id).ok_or_else(|| {
+        let mut dt = self.open_dts.remove(cg_id).ok_or_else(|| {
             MdfError::BlockSerializationError("no open DT block for this channel group".into())
         })?;
         // finalize the current DT block
         let size = 24 + dt.record_size as u64 * dt.record_count;
         self.update_link(dt.start_pos + 8, size)?;
+        dt.dt_sizes.push(size);
 
         // Store the total number of records in the channel group
         // cycles_nr field is located at offset 80 within the CG block
@@ -680,7 +687,8 @@ impl MdfWriter {
                 .filter(|k| k.starts_with("dl_"))
                 .count();
             let dl_id = format!("dl_{}", dl_count);
-            let dl_block = DataListBlock::new(dt.dt_positions.clone());
+            let common_len = *dt.dt_sizes.first().unwrap_or(&size);
+            let dl_block = DataListBlock::new_equal(dt.dt_positions.clone(), common_len);
             let dl_bytes = dl_block.to_bytes()?;
             let _pos = self.write_block_with_id(&dl_bytes, &dl_id)?;
 

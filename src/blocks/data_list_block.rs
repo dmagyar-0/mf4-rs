@@ -7,6 +7,11 @@ pub struct DataListBlock {
     pub header: BlockHeader,
     pub next: u64,             // link to next DLBLOCK
     pub data_links: Vec<u64>,  // list of offsets to DT/RD/DV/RV/SDBLOCKs
+    pub flags: u8,
+    pub reserved1: [u8; 3],
+    pub data_block_nr: u32,
+    pub data_block_len: Option<u64>,
+    pub offsets: Option<Vec<u64>>,
 }
 
 impl BlockParse<'_> for DataListBlock {
@@ -15,11 +20,11 @@ impl BlockParse<'_> for DataListBlock {
 
         let header = Self::parse_header(bytes)?;
         
-        let expected_bytes = 24 + (header.links_nr as usize * 8);
-        if bytes.len() < expected_bytes {
+        let min_len = 24 + (header.links_nr as usize * 8) + 1 + 3 + 4;
+        if bytes.len() < min_len {
             return Err(MdfError::TooShortBuffer {
                 actual: bytes.len(),
-                expected: expected_bytes,
+                expected: min_len,
                 file: file!(), line: line!(),
             });
         }
@@ -36,23 +41,66 @@ impl BlockParse<'_> for DataListBlock {
             data_links.push(l);
             off += 8;
         }
+        let flags = bytes[off];
+        off += 1;
+        let reserved1 = [bytes[off], bytes[off+1], bytes[off+2]];
+        off += 3;
+        let data_block_nr = u32::from_le_bytes(bytes[off..off+4].try_into().unwrap());
+        off += 4;
 
-        Ok(DataListBlock { header, next, data_links })
+        let (data_block_len, offsets) = if flags & 1 != 0 {
+            if bytes.len() < off + 8 {
+                return Err(MdfError::TooShortBuffer {
+                    actual: bytes.len(),
+                    expected: off + 8,
+                    file: file!(), line: line!(),
+                });
+            }
+            let len = u64::from_le_bytes(bytes[off..off+8].try_into().unwrap());
+            off += 8;
+            (Some(len), None)
+        } else {
+            let mut offs = Vec::with_capacity(data_block_nr as usize);
+            if bytes.len() < off + (data_block_nr as usize * 8) {
+                return Err(MdfError::TooShortBuffer {
+                    actual: bytes.len(),
+                    expected: off + data_block_nr as usize * 8,
+                    file: file!(), line: line!(),
+                });
+            }
+            for _ in 0..data_block_nr {
+                let o = u64::from_le_bytes(bytes[off..off+8].try_into().unwrap());
+                offs.push(o);
+                off += 8;
+            }
+            (None, Some(offs))
+        };
+
+        Ok(DataListBlock { header, next, data_links, flags, reserved1, data_block_nr, data_block_len, offsets })
     }
 }
 
 impl DataListBlock {
-    /// Create a new DataListBlock referencing the provided data blocks.
-    pub fn new(data_links: Vec<u64>) -> Self {
-        let links_nr = data_links.len() as u64 + 1; // +1 for the 'next' link
-        let block_len = 24 + links_nr * 8;
+    /// Create a new DataListBlock for equal-length data blocks.
+    pub fn new_equal(data_links: Vec<u64>, data_block_len: u64) -> Self {
+        let links_nr = data_links.len() as u64 + 1; // +1 for 'next'
+        let block_len = 24 + links_nr * 8 + 1 + 3 + 4 + 8;
         let header = BlockHeader {
             id: "##DL".to_string(),
             reserved0: 0,
             block_len,
             links_nr,
         };
-        Self { header, next: 0, data_links }
+        Self {
+            header,
+            next: 0,
+            data_links,
+            flags: 1,
+            reserved1: [0; 3],
+            data_block_nr: links_nr as u32 - 1,
+            data_block_len: Some(data_block_len),
+            offsets: None,
+        }
     }
 
     /// Serialize this DLBLOCK to bytes.
@@ -64,7 +112,12 @@ impl DataListBlock {
         }
 
         let links_nr = self.data_links.len() as u64 + 1;
-        let block_len = 24 + links_nr * 8;
+        let extra = if self.flags & 1 != 0 {
+            1 + 3 + 4 + 8
+        } else {
+            1 + 3 + 4 + (self.data_block_nr as usize * 8)
+        };
+        let block_len = 24 + links_nr * 8 + extra as u64;
 
         if self.header.links_nr != links_nr {
             return Err(MdfError::BlockSerializationError(
@@ -82,6 +135,16 @@ impl DataListBlock {
         buf.extend_from_slice(&self.next.to_le_bytes());
         for link in &self.data_links {
             buf.extend_from_slice(&link.to_le_bytes());
+        }
+        buf.push(self.flags);
+        buf.extend_from_slice(&self.reserved1);
+        buf.extend_from_slice(&self.data_block_nr.to_le_bytes());
+        if self.flags & 1 != 0 {
+            buf.extend_from_slice(&self.data_block_len.unwrap_or(0).to_le_bytes());
+        } else if let Some(offsets) = &self.offsets {
+            for o in offsets {
+                buf.extend_from_slice(&o.to_le_bytes());
+            }
         }
         Ok(buf)
     }
