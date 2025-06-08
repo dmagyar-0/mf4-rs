@@ -25,7 +25,7 @@ impl<'a> RawChannel {
         mmap: &'a [u8],
     ) -> Result<Box<dyn Iterator<Item = Result<&'a [u8], MdfError>> + 'a>, MdfError> {
         // 1) VLSD path: channel has its own data pointer => SD/DL chain
-        if self.block.channel_type == 1 {
+        if self.block.channel_type == 1 && self.block.data != 0 {
             // Capture the file bytes and channel pointer
             let bytes = mmap;
             let mut next_addr = self.block.data;

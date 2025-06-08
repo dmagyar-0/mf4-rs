@@ -2,8 +2,6 @@ use crate::error::MdfError;
 use crate::parsing::mdf_file::MdfFile;
 use crate::parsing::decoder::{decode_channel_value, DecodedValue};
 use crate::blocks::channel_block::ChannelBlock;
-use crate::blocks::common::read_string_block;
-use crate::blocks::common::DataType;
 use crate::writer::MdfWriter;
 
 /// Cut a segment of an MDF file given start and end times (in the unit
@@ -13,9 +11,8 @@ use crate::writer::MdfWriter;
 /// structure as the input but only records whose timestamp lies within the
 /// `[start_time, end_time]` range.
 ///
-/// The implementation looks for a channel named "time" (case insensitive) or a
-/// channel using the `CanOpenTime` data type to determine the timestamp of each
-/// record.
+/// The implementation looks for the channel marked as master (channel type 1
+/// and sync type 1) to determine the timestamp of each record.
 pub fn cut_mdf_by_time(
     input_path: &str,
     output_path: &str,
@@ -49,18 +46,12 @@ pub fn cut_mdf_by_time(
                 iters.push(ch.records(dg, cg, &mdf.mmap)?);
             }
 
-            // Identify the time channel index
+            // Identify the time (master) channel index
             let mut time_idx: Option<usize> = None;
             for (idx, ch) in cg.raw_channels.iter().enumerate() {
-                if ch.block.data_type == DataType::CanOpenTime {
+                if ch.block.channel_type == 1 && ch.block.sync_type == 1 {
                     time_idx = Some(idx);
                     break;
-                }
-                if let Ok(Some(name)) = read_string_block(&mdf.mmap, ch.block.name_addr) {
-                    if name.to_lowercase().contains("time") {
-                        time_idx = Some(idx);
-                        break;
-                    }
                 }
             }
             let time_idx = match time_idx {
