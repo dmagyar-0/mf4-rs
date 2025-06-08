@@ -3,6 +3,8 @@ pub mod error;
 pub mod writer;
 pub mod cut;
 
+pub mod merge;
+
 pub mod parsing {
     pub mod decoder;
     pub mod mdf_file;
