@@ -7,41 +7,31 @@ use mf4_rs::api::mdf::MDF;
 use mf4_rs::error::MdfError;
 
 fn main() -> Result<(), MdfError> {
-    // Create writer and basic structure
+    // Create writer and base structure
     let mut writer = MdfWriter::new("multi_group_data.mf4")?;
     let (_id, _hd) = writer.init_mdf_file()?;
-    // Create a data group for the first channel group
-    let dg1_id = writer.add_data_group(None)?;
     let cg_block = ChannelGroupBlock::default();
 
     // -------- Channel Group 1 with 2 channels --------
-    let cg1_id = writer.add_channel_group(&dg1_id, None, &cg_block)?;
+    let cg1_id = writer.add_channel_group(None, &cg_block)?;
     let mut ch1 = ChannelBlock::default();
-    ch1.byte_offset = 0;
-    ch1.bit_count = 32;
     ch1.data_type = DataType::UnsignedIntegerLE;
     ch1.name = Some("Speed".into());
-    let mut ch2 = ch1.clone();
-    ch2.byte_offset = 4;
-    ch2.name = Some("RPM".into());
     let cn1_id = writer.add_channel(&cg1_id, None, &ch1)?;
+
+    let mut ch2 = ChannelBlock::default();
+    ch2.data_type = DataType::UnsignedIntegerLE;
+    ch2.name = Some("RPM".into());
     writer.add_channel(&cg1_id, Some(&cn1_id), &ch2)?;
 
-    // Create a second data group for the next channel group
-    let dg2_id = writer.add_data_group(Some(&dg1_id))?;
-
     // -------- Channel Group 2 with 3 channels --------
-    let cg2_id = writer.add_channel_group(&dg2_id, None, &cg_block)?;
-
+    // A new data group is created automatically
+    let cg2_id = writer.add_channel_group(None, &cg_block)?;
     let mut ch3 = ChannelBlock::default();
-    ch3.byte_offset = 0;
-    ch3.bit_count = 16;
     ch3.data_type = DataType::SignedIntegerLE;
     ch3.name = Some("Temperature".into());
 
     let mut ch4 = ChannelBlock::default();
-    ch4.byte_offset = 2;
-    ch4.bit_count = 32;
     ch4.data_type = DataType::FloatLE;
     ch4.name = Some("Pressure".into());
 
@@ -49,8 +39,6 @@ fn main() -> Result<(), MdfError> {
     let status_map = [(0i64, "OK"), (1i64, "WARN")];
     let (_cc_id, cc_pos) = writer.add_value_to_text_conversion(&status_map, "UNKNOWN")?;
     let mut ch5 = ChannelBlock::default();
-    ch5.byte_offset = 6;
-    ch5.bit_count = 8;
     ch5.data_type = DataType::UnsignedIntegerLE;
     ch5.name = Some("Status".into());
     ch5.conversion_addr = cc_pos;
@@ -60,8 +48,7 @@ fn main() -> Result<(), MdfError> {
     writer.add_channel(&cg2_id, Some(&cn4_id), &ch5)?;
 
     // -------- Write sample data for both groups --------
-    // Write 100 records for the first group
-    writer.start_data_block(&dg1_id, &cg1_id, 0, &[ch1.clone(), ch2.clone()])?;
+    writer.start_data_block_for_cg(&cg1_id, 0)?;
     for i in 0u32..100 {
         writer.write_record(
             &cg1_id,
@@ -73,8 +60,7 @@ fn main() -> Result<(), MdfError> {
     }
     writer.finish_data_block(&cg1_id)?;
 
-    // Write 100 records for the second group
-    writer.start_data_block(&dg2_id, &cg2_id, 0, &[ch3.clone(), ch4.clone(), ch5.clone()])?;
+    writer.start_data_block_for_cg(&cg2_id, 0)?;
     for i in 0u32..100 {
         writer.write_record(
             &cg2_id,
@@ -91,7 +77,7 @@ fn main() -> Result<(), MdfError> {
 
     // -------- Verify using the crate parser --------
     let mdf = MDF::from_file("multi_group_data.mf4")?;
-    println!("Our parser found {} channel groups", mdf.channel_groups().len());
+    println!("Channel groups: {}", mdf.channel_groups().len());
     for (idx, group) in mdf.channel_groups().iter().enumerate() {
         let chans = group.channels();
         print!("  Group {} has {} channels", idx + 1, chans.len());
@@ -103,13 +89,5 @@ fn main() -> Result<(), MdfError> {
         }
     }
 
-    // Optionally verify with asammdf (Python)
-    std::process::Command::new("python3")
-        .arg("-c")
-        .arg("import asammdf,sys;m=asammdf.MDF('multi_group_data.mf4');\nprint('asammdf channels',len(m.channels_db))")
-        .status()
-        .ok();
-
     Ok(())
 }
-

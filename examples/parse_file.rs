@@ -3,7 +3,8 @@ use mf4_rs::api::mdf::MDF;
 
 fn main() -> Result<(), MdfError> {
     // 1) Parse the file (no data is decoded yet)
-    let path = r"C:\Users\david\Documents\mf4_lib\BaseStandard\data\demo.mf4";
+    // This assumes `multi_groups_with_data` has been run to create the file
+    let path = "multi_group_data.mf4";
     let mdf = MDF::from_file(path)?;
     println!();
 

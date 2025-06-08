@@ -186,6 +186,28 @@ impl DataType {
             _ => DataType::Unknown(()),
         }
     }
+
+    /// Returns a typical bit width for this data type.
+    /// This is used when creating channels without an explicit bit count.
+    pub fn default_bits(&self) -> u32 {
+        match self {
+            DataType::UnsignedIntegerLE
+            | DataType::UnsignedIntegerBE
+            | DataType::SignedIntegerLE
+            | DataType::SignedIntegerBE => 32,
+            DataType::FloatLE | DataType::FloatBE => 32,
+            DataType::StringLatin1
+            | DataType::StringUtf8
+            | DataType::StringUtf16LE
+            | DataType::StringUtf16BE
+            | DataType::ByteArray
+            | DataType::MimeSample
+            | DataType::MimeStream => 8,
+            DataType::CanOpenDate | DataType::CanOpenTime => 64,
+            DataType::ComplexLE | DataType::ComplexBE => 64,
+            DataType::Unknown(_) => 8,
+        }
+    }
 }
 
 pub fn read_string_block(mmap: &[u8], address: u64) -> Result<Option<String>, MdfError> {
