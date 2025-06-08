@@ -10,6 +10,9 @@ simple data logging and inspection tasks.
 Run `cargo run --example cut_file` to create a small MF4 file and cut it between
 two timestamps. The resulting file can be verified with tools such as
 `asammdf`.
+When inspected with `asammdf` the trimmed output shows the expected
+time values `0.3`, `0.4`, `0.5` and `0.6` alongside integer values
+`3` to `6`.
 
 Run `cargo run --example write_records` to generate a file using
 `MdfWriter::write_records` for appending multiple records at once.
