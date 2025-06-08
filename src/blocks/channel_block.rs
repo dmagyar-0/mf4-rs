@@ -244,8 +244,14 @@ impl ChannelBlock {
         Ok(buffer)
     }
     
-    /// Resolves the channel name from the file data (typically the entire mmap slice)
-    /// using the `name_addr` field. This function must be explicitly called.
+    /// Load the channel name from the file using the stored `name_addr`.
+    ///
+    /// # Arguments
+    /// * `file_data` - Memory mapped bytes of the entire MDF file.
+    ///
+    /// # Returns
+    /// `Ok(())` on success or an [`MdfError`] if the referenced block is
+    /// incomplete.
     pub fn resolve_name(&mut self, file_data: &[u8]) -> Result<(), MdfError> {
         if self.name.is_none() && self.name_addr != 0 {
             let offset = self.name_addr as usize;
@@ -258,9 +264,14 @@ impl ChannelBlock {
         Ok(())
     }
 
-    /// Resolves the conversion block from the file data (typically the entire file's memory map)
-    /// using the `conversion_addr` field. If the conversion block is present and can be parsed,
-    /// it is stored in the channel's `conversion` field.
+    /// Resolve and store the conversion block pointed to by `conversion_addr`.
+    ///
+    /// # Arguments
+    /// * `bytes` - Memory mapped MDF file bytes.
+    ///
+    /// # Returns
+    /// `Ok(())` on success or an [`MdfError`] if the conversion block cannot be
+    /// read or parsed.
     pub fn resolve_conversion(&mut self, bytes: &[u8]) -> Result<(), MdfError> {
         if self.conversion.is_none() && self.conversion_addr != 0 {
             let offset = self.conversion_addr as usize;
@@ -285,8 +296,17 @@ impl ChannelBlock {
         Ok(())
     }
 
-    /// Applies the conversion directly to a DecodedValue using the associated conversion block.
-    /// If no conversion block is attached, returns the DecodedValue unchanged.
+    /// Apply the stored conversion to a decoded value.
+    ///
+    /// If no conversion block is attached the input value is returned
+    /// unchanged.
+    ///
+    /// # Arguments
+    /// * `raw` - The raw decoded value as returned by [`decode_channel_value`].
+    /// * `file_data` - Memory mapped MDF data used to resolve formulas.
+    ///
+    /// # Returns
+    /// The converted value or the original value on failure.
     pub fn apply_conversion_value(
         &self,
         raw: DecodedValue,

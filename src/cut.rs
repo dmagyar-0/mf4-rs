@@ -4,15 +4,20 @@ use crate::parsing::decoder::{decode_channel_value, DecodedValue};
 use crate::blocks::channel_block::ChannelBlock;
 use crate::writer::MdfWriter;
 
-/// Cut a segment of an MDF file given start and end times (in the unit
-/// of the time channel).
+/// Cut a segment of an MDF file based on time stamps.
 ///
-/// This function creates a new MDF file at `output_path` that contains the same
-/// structure as the input but only records whose timestamp lies within the
-/// `[start_time, end_time]` range.
+/// The input file is scanned for a master time channel (channel type `2` and
+/// sync type `1`). Only records whose time value lies in the inclusive range
+/// `[start_time, end_time]` are copied to the new file.
 ///
-/// The implementation looks for the channel marked as master (channel type 2
-/// and sync type 1) to determine the timestamp of each record.
+/// # Arguments
+/// * `input_path` - Path to the source MF4 file
+/// * `output_path` - Destination path for the trimmed file
+/// * `start_time` - Start time of the segment in seconds
+/// * `end_time` - End time of the segment in seconds
+///
+/// # Returns
+/// `Ok(())` on success or an [`MdfError`] if reading or writing fails.
 pub fn cut_mdf_by_time(
     input_path: &str,
     output_path: &str,

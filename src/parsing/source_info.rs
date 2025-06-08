@@ -14,7 +14,15 @@ pub struct SourceInfo {
 }
 
 impl SourceInfo {
-    /// Parse a SourceBlock from the mmap at `address` and read its strings.
+    /// Parse a source information block from the memory mapped file.
+    ///
+    /// # Arguments
+    /// * `mmap` - The memory mapped MDF file
+    /// * `address` - File offset of the SIBLOCK (0 if not present)
+    ///
+    /// # Returns
+    /// `Ok(Some(SourceInfo))` if a block was found, `Ok(None)` if the address
+    /// was zero, or an [`MdfError`] when parsing fails.
     pub fn from_mmap(mmap: &[u8], address: u64) -> Result<Option<Self>, MdfError> {
         // 0 means “no SIBLOCK”
         if address == 0 {

@@ -1,3 +1,9 @@
+//! Minimal utilities for reading and writing ASAM MDF 4 files.
+//!
+//! The crate exposes a high level API under [`api`] to inspect existing
+//! recordings as well as a [`writer::MdfWriter`] to generate new files.  Only a
+//! fraction of the MDF 4 specification is implemented.
+
 pub mod blocks;
 pub mod error;
 pub mod writer;

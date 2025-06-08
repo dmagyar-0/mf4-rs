@@ -3,18 +3,30 @@ use crate::parsing::mdf_file::MdfFile;
 use crate::api::channel_group::ChannelGroup;
 
 #[derive(Debug)]
+/// High level representation of an MDF file.
+///
+/// The struct stores the memory mapped file internally and lazily exposes
+/// [`ChannelGroup`] wrappers for easy inspection.
 pub struct MDF {
     raw: MdfFile,
 }
 
 impl MDF {
-    /// Parse and hold the raw MDF4 file (with mmap, DataGroup & ChannelGroup blocks).
+    /// Parse an MDF4 file from disk.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the `.mf4` file.
+    ///
+    /// # Returns
+    /// A new [`MDF`] on success or [`MdfError`] on failure.
     pub fn from_file(path: &str) -> Result<Self, MdfError> {
         let raw = MdfFile::parse_from_file(path)?;
         Ok(MDF { raw })
     }
 
-    /// One `ChannelGroup<'_>` per RawChannelGroup, all lazy.
+    /// Retrieve channel groups contained in the file.
+    ///
+    /// Each [`ChannelGroup`] is created lazily and does not decode any samples.
     pub fn channel_groups(&self) -> Vec<ChannelGroup<'_>> {
         let mut groups = Vec::new();
 

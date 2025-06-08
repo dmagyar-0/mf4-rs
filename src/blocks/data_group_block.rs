@@ -17,7 +17,14 @@ pub struct DataGroupBlock {
 
 impl BlockParse<'_> for DataGroupBlock {
     const ID: &'static str = "##DG";
-    /// Creates a DataGroupBlock from a 64-byte slice according to the format "<4sI6QB7s".
+    /// Parse a `DataGroupBlock` from a 64 byte slice.
+    ///
+    /// # Arguments
+    /// * `bytes` - Byte slice beginning at the DG block header.
+    ///
+    /// # Returns
+    /// The populated [`DataGroupBlock`] on success or an [`MdfError`] if the
+    /// slice is too small or malformed.
     fn from_bytes(bytes: &[u8]) -> Result<Self, MdfError> {
 
         let header = Self::parse_header(bytes)?;

@@ -23,6 +23,13 @@ pub struct MdfFile {
 
 impl MdfFile {
     /// Parse an MDF file from a given file path.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the `.mf4` file on disk.
+    ///
+    /// # Returns
+    /// An [`MdfFile`] containing all parsed blocks or an [`MdfError`] if the
+    /// file could not be read or decoded.
     pub fn parse_from_file(path: &str) -> Result<Self, MdfError> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };

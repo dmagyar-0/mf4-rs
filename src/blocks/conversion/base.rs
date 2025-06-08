@@ -122,6 +122,10 @@ fn read_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, MdfError> {
 
 impl ConversionBlock {
     /// Serialize this conversion block back to bytes.
+    ///
+    /// # Returns
+    /// A byte vector containing the encoded block or an [`MdfError`] if
+    /// serialization fails.
     pub fn to_bytes(&self) -> Result<Vec<u8>, MdfError> {
         let links = 4 + self.cc_ref.len();
 
