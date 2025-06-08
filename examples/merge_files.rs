@@ -14,29 +14,51 @@ fn main() -> Result<(), MdfError> {
         let _ = std::fs::remove_file(path);
     }
 
-    // Create first file with one channel
+    // Create first file with a time channel and a value channel
     let mut w1 = MdfWriter::new(input1)?;
     w1.init_mdf_file()?;
     let cg1 = w1.add_channel_group(None, |_| {})?;
-    w1.add_channel(&cg1, None, |ch| {
+    let t1 = w1.add_channel(&cg1, None, |ch| {
+        ch.data_type = DataType::FloatLE;
+        ch.name = Some("Time".into());
+        ch.bit_count = 64;
+    })?;
+    w1.set_time_channel(&t1)?;
+    w1.add_channel(&cg1, Some(&t1), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Value".into());
     })?;
     w1.start_data_block_for_cg(&cg1, 0)?;
-    w1.write_record(&cg1, &[DecodedValue::UnsignedInteger(1)])?;
+    for i in 0u64..5 {
+        w1.write_record(
+            &cg1,
+            &[DecodedValue::Float(i as f64 * 0.1), DecodedValue::UnsignedInteger(i)],
+        )?;
+    }
     w1.finish_data_block(&cg1)?;
     w1.finalize()?;
 
-    // Create second file with matching channel
+    // Create second file with the same channels continuing in time
     let mut w2 = MdfWriter::new(input2)?;
     w2.init_mdf_file()?;
     let cg2 = w2.add_channel_group(None, |_| {})?;
-    w2.add_channel(&cg2, None, |ch| {
+    let t2 = w2.add_channel(&cg2, None, |ch| {
+        ch.data_type = DataType::FloatLE;
+        ch.name = Some("Time".into());
+        ch.bit_count = 64;
+    })?;
+    w2.set_time_channel(&t2)?;
+    w2.add_channel(&cg2, Some(&t2), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Value".into());
     })?;
     w2.start_data_block_for_cg(&cg2, 0)?;
-    w2.write_record(&cg2, &[DecodedValue::UnsignedInteger(2)])?;
+    for i in 5u64..10 {
+        w2.write_record(
+            &cg2,
+            &[DecodedValue::Float(i as f64 * 0.1), DecodedValue::UnsignedInteger(i)],
+        )?;
+    }
     w2.finish_data_block(&cg2)?;
     w2.finalize()?;
 
@@ -48,9 +70,8 @@ fn main() -> Result<(), MdfError> {
     println!("Merged file has {} channel group(s)", mdf.channel_groups().len());
     for (g_idx, group) in mdf.channel_groups().iter().enumerate() {
         println!(" Group {}: {} channel(s)", g_idx + 1, group.channels().len());
-        if let Some(ch) = group.channels().first() {
-            let vals = ch.values()?;
-            println!("  Values: {:?}", vals);
+        for ch in group.channels() {
+            println!("  {:?} -> {:?}", ch.name()?, ch.values()?);
         }
     }
 
