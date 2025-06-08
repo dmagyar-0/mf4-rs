@@ -105,3 +105,63 @@ fn writer_block_position() -> Result<(), MdfError> {
     std::fs::remove_file(path)?;
     Ok(())
 }
+
+#[test]
+fn cut_mdf_file_by_time() -> Result<(), MdfError> {
+    let input = std::env::temp_dir().join("cut_input.mf4");
+    let output = std::env::temp_dir().join("cut_output.mf4");
+    if input.exists() { std::fs::remove_file(&input)?; }
+    if output.exists() { std::fs::remove_file(&output)?; }
+
+    // Create source file with a time channel and a value channel
+    let mut writer = MdfWriter::new(input.to_str().unwrap())?;
+    writer.init_mdf_file()?;
+    let cg_id = writer.add_channel_group(None, |_| {})?;
+    let time_id = writer.add_channel(&cg_id, None, |ch| {
+        ch.data_type = DataType::FloatLE;
+        ch.name = Some("Time".into());
+        ch.bit_count = 64;
+    })?;
+    writer.add_channel(&cg_id, Some(&time_id), |ch| {
+        ch.data_type = DataType::UnsignedIntegerLE;
+        ch.bit_count = 32;
+        ch.name = Some("Val".into());
+    })?;
+    writer.start_data_block_for_cg(&cg_id, 0)?;
+    for i in 0..10u64 {
+        writer.write_record(
+            &cg_id,
+            &[
+                DecodedValue::Float(i as f64 * 0.1),
+                DecodedValue::UnsignedInteger(i),
+            ],
+        )?;
+    }
+    writer.finish_data_block(&cg_id)?;
+    writer.finalize()?;
+
+    // Cut between 0.2 and 0.5 seconds
+    mf4_rs::cut::cut_mdf_by_time(
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+        0.2,
+        0.5,
+    )?;
+
+    let mdf = MDF::from_file(output.to_str().unwrap())?;
+    let groups = mdf.channel_groups();
+    assert_eq!(groups.len(), 1);
+    let cg = &groups[0];
+    let chs = cg.channels();
+    assert_eq!(chs.len(), 2);
+    let times = chs[0].values()?;
+    let vals = chs[1].values()?;
+    assert_eq!(times.len(), 4);
+    assert_eq!(vals.len(), 4);
+    if let DecodedValue::Float(t0) = times[0] { assert!((t0 - 0.2).abs() < 1e-6); }
+    if let DecodedValue::Float(t_last) = times[3] { assert!((t_last - 0.5).abs() < 1e-6); }
+
+    std::fs::remove_file(input)?;
+    std::fs::remove_file(output)?;
+    Ok(())
+}
