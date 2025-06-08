@@ -54,7 +54,9 @@ pub struct MdfWriter {
     /// Track current byte offset for each channel group
     cg_offsets: HashMap<String, usize>,
     /// Store channels added to each channel group
-    cg_channels: HashMap<String, Vec<ChannelBlock>>, 
+    cg_channels: HashMap<String, Vec<ChannelBlock>>,
+    /// Map channel IDs to their parent group and index
+    channel_map: HashMap<String, (String, usize)>,
 }
 
 impl MdfWriter {
@@ -71,6 +73,7 @@ impl MdfWriter {
             cg_to_dg: HashMap::new(),
             cg_offsets: HashMap::new(),
             cg_channels: HashMap::new(),
+            channel_map: HashMap::new(),
         })
     }
 
@@ -481,10 +484,12 @@ impl MdfWriter {
         }
 
         // Store channel for later convenience
-        self.cg_channels
+        let entry = self.cg_channels
             .entry(cg_id.to_string())
-            .or_default()
-            .push(ch.clone());
+            .or_default();
+        entry.push(ch.clone());
+        let idx = entry.len() - 1;
+        self.channel_map.insert(cn_id.clone(), (cg_id.to_string(), idx));
         
         // Link from channel group to the first channel
         if prev_cn_id.is_none() {
@@ -499,6 +504,27 @@ impl MdfWriter {
         }
         
         Ok(cn_id)
+    }
+
+    /// Mark an existing channel as the time (master) channel.
+    /// This sets the channel's type and sync type to 1 in the file and updates
+    /// the stored channel metadata.
+    pub fn set_time_channel(&mut self, cn_id: &str) -> Result<(), MdfError> {
+        // Offsets of channel_type and sync_type within the CN block
+        const CHANNEL_TYPE_OFFSET: u64 = 88;
+        const SYNC_TYPE_OFFSET: u64 = 89;
+        self.update_block_u8(cn_id, CHANNEL_TYPE_OFFSET, 1)?;
+        self.update_block_u8(cn_id, SYNC_TYPE_OFFSET, 1)?;
+
+        if let Some((cg, idx)) = self.channel_map.get(cn_id).cloned() {
+            if let Some(chs) = self.cg_channels.get_mut(&cg) {
+                if let Some(ch) = chs.get_mut(idx) {
+                    ch.channel_type = 1;
+                    ch.sync_type = 1;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Start writing a DTBLOCK for the given data group.

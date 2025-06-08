@@ -17,6 +17,7 @@ fn main() -> Result<(), MdfError> {
         ch.name = Some("Time".into());
         ch.bit_count = 64;
     })?;
+    writer.set_time_channel(&time_id)?;
     writer.add_channel(&cg_id, Some(&time_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Val".into());
