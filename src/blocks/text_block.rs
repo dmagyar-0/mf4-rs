@@ -46,8 +46,10 @@ impl TextBlock {
     pub fn new(text: &str) -> Self {
         // Calculate required block size: 24 bytes for header + text length
         // The block size must be a multiple of 8 bytes for alignment
-        let text_bytes = text.as_bytes().len();
-        let unpadded_size = 24 + text_bytes;
+        let text_bytes = text.as_bytes();
+        let needs_null = text_bytes.is_empty() || *text_bytes.last().unwrap() != 0;
+        let text_size = text_bytes.len() + if needs_null { 1 } else { 0 };
+        let unpadded_size = 24 + text_size;
         let padding_bytes = (8 - (unpadded_size % 8)) % 8;
         let block_len = unpadded_size + padding_bytes;
         
@@ -93,10 +95,11 @@ impl TextBlock {
         
         // Get the text as bytes
         let text_bytes = self.text.as_bytes();
-        let text_len = text_bytes.len();
-        
-        // Calculate total size including header, text, and padding
-        let unpadded_size = 24 + text_len;
+        let needs_null = text_bytes.is_empty() || *text_bytes.last().unwrap() != 0;
+        let text_size = text_bytes.len() + if needs_null { 1 } else { 0 };
+
+        // Calculate total size including header, text (with null) and padding
+        let unpadded_size = 24 + text_size;
         let padding_bytes = (8 - (unpadded_size % 8)) % 8;
         let total_size = unpadded_size + padding_bytes;
         
@@ -116,9 +119,9 @@ impl TextBlock {
         
         // 2. Write the text bytes
         buffer.extend_from_slice(text_bytes);
-        
+
         // 3. Add null terminator if not already present
-        if text_len == 0 || text_bytes[text_len - 1] != 0 {
+        if needs_null {
             buffer.push(0);
         }
         
