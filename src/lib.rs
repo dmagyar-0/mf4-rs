@@ -1,6 +1,7 @@
 pub mod blocks;
 pub mod error;
 pub mod writer;
+pub mod cut;
 
 pub mod parsing {
     pub mod decoder;
