@@ -79,6 +79,37 @@ fn writer_data_roundtrip() -> Result<(), MdfError> {
 }
 
 #[test]
+fn writer_write_records() -> Result<(), MdfError> {
+    let path = std::env::temp_dir().join("bulk_test.mf4");
+    if path.exists() { std::fs::remove_file(&path)?; }
+
+    let mut writer = MdfWriter::new(path.to_str().unwrap())?;
+    writer.init_mdf_file()?;
+    let cg_id = writer.add_channel_group(None, |_| {})?;
+    writer.add_channel(&cg_id, None, |ch| { ch.data_type = DataType::UnsignedIntegerLE; })?;
+
+    writer.start_data_block_for_cg(&cg_id, 0)?;
+    let recs = vec![
+        vec![DecodedValue::UnsignedInteger(1)],
+        vec![DecodedValue::UnsignedInteger(2)],
+    ];
+    let slices: Vec<&[DecodedValue]> = recs.iter().map(|r| r.as_slice()).collect();
+    writer.write_records(&cg_id, slices)?;
+    writer.finish_data_block(&cg_id)?;
+    writer.finalize()?;
+
+    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let groups = mdf.channel_groups();
+    let vals = groups[0].channels()[0].values()?;
+    assert_eq!(vals.len(), 2);
+    if let DecodedValue::UnsignedInteger(v) = vals[0] { assert_eq!(v, 1); } else { panic!("wrong type") }
+    if let DecodedValue::UnsignedInteger(v) = vals[1] { assert_eq!(v, 2); } else { panic!("wrong type") }
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
 fn decode_channel_value_integer() {
     let mut ch = ChannelBlock::default();
     ch.data_type = DataType::UnsignedIntegerLE;
