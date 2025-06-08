@@ -57,7 +57,6 @@ impl BlockParse<'_> for DataListBlock {
                 });
             }
             let len = u64::from_le_bytes(bytes[off..off+8].try_into().unwrap());
-            off += 8;
             (Some(len), None)
         } else {
             let mut offs = Vec::with_capacity(data_block_nr as usize);
