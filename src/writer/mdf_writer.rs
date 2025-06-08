@@ -691,6 +691,20 @@ pub fn set_time_channel(&mut self, cn_id: &str) -> Result<(), MdfError> {
         Ok(())
     }
 
+    /// Append multiple records sequentially for the specified channel group.
+    ///
+    /// This is a convenience wrapper around [`write_record`] that iterates over
+    /// the provided records and writes each one.
+    pub fn write_records<'a, I>(&mut self, cg_id: &str, records: I) -> Result<(), MdfError>
+    where
+        I: IntoIterator<Item = &'a [DecodedValue]>,
+    {
+        for record in records {
+            self.write_record(cg_id, record)?;
+        }
+        Ok(())
+    }
+
     /// Finalize the currently open DTBLOCK for a given channel group and patch its size field.
     pub fn finish_data_block(&mut self, cg_id: &str) -> Result<(), MdfError> {
         let mut dt = self.open_dts.remove(cg_id).ok_or_else(|| {
