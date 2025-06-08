@@ -498,7 +498,7 @@ impl MdfWriter {
 
     /// Finalize the currently open DTBLOCK for a given channel group and patch its size field.
     pub fn finish_data_block(&mut self, cg_id: &str) -> Result<(), MdfError> {
-        let mut dt = self.open_dts.remove(cg_id).ok_or_else(|| {
+        let dt = self.open_dts.remove(cg_id).ok_or_else(|| {
             MdfError::BlockSerializationError("no open DT block for this channel group".into())
         })?;
         // finalize the current DT block
