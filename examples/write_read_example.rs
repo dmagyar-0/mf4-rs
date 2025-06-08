@@ -1,5 +1,6 @@
 use mf4_rs::writer::MdfWriter;
 use mf4_rs::blocks::channel_block::ChannelBlock;
+use mf4_rs::blocks::channel_group_block::ChannelGroupBlock;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::parsing::decoder::DecodedValue;
 use mf4_rs::api::mdf::MDF;
@@ -10,13 +11,15 @@ fn main() -> Result<(), MdfError> {
     let mut writer = MdfWriter::new("write_read_example.mf4")?;
     let (_id, _hd) = writer.init_mdf_file()?;
     let dg_id = writer.add_data_group(None)?;
-    let cg_id = writer.add_channel_group(&dg_id, None)?;
+    let cg_block = ChannelGroupBlock::default();
+    let cg_id = writer.add_channel_group(&dg_id, None, &cg_block)?;
 
     let mut ch = ChannelBlock::default();
     ch.byte_offset = 0;
     ch.bit_count = 32;
     ch.data_type = DataType::UnsignedIntegerLE;
-    writer.add_channel(&cg_id, None, Some("Signal"), 0, 32)?;
+    ch.name = Some("Signal".to_string());
+    writer.add_channel(&cg_id, None, &ch)?;
 
     writer.start_data_block(&dg_id, &cg_id, 0, &[ch.clone()])?;
     for i in 0u32..1_000 {

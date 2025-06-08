@@ -4,6 +4,9 @@
 use mf4_rs::error::MdfError;
 use mf4_rs::writer::MdfWriter;
 use mf4_rs::api::mdf::MDF;
+use mf4_rs::blocks::channel_group_block::ChannelGroupBlock;
+use mf4_rs::blocks::channel_block::ChannelBlock;
+use mf4_rs::blocks::common::DataType;
 
 /// Creates a structured MDF file with data groups, channel groups, and channels, then reads it back.
 /// This demonstrates the enhanced MdfWriter API that handles links automatically.
@@ -35,12 +38,13 @@ fn main() -> Result<(), MdfError> {
     
     // Add first channel group to our data group
     // The method automatically links DG → CG
-    let cg1_id = mdf_writer.add_channel_group(&dg1_id, None)?;
+    let cg_block = ChannelGroupBlock::default();
+    let cg1_id = mdf_writer.add_channel_group(&dg1_id, None, &cg_block)?;
     println!("Added Channel Group with ID: {}", cg1_id);
     
     // Add a second channel group (linked after the first one)
     // The method automatically links CG1 → CG2
-    let cg2_id = mdf_writer.add_channel_group(&dg1_id, Some(&cg1_id))?;
+    let cg2_id = mdf_writer.add_channel_group(&dg1_id, Some(&cg1_id), &cg_block)?;
     println!("Added second Channel Group with ID: {}", cg2_id);
     
     // ------- Step 4: Add Channels to the first Channel Group -------
@@ -50,36 +54,33 @@ fn main() -> Result<(), MdfError> {
     
     // First channel - this will be linked from the channel group
     // PITFALL: Byte offsets must be set correctly to avoid data overlap
-    let cn1_id = mdf_writer.add_channel(
-        &cg1_id,               // Parent channel group
-        None,                  // No previous channel (this is the first one)
-        Some("Engine Speed"),  // Channel name
-        0,                     // Byte offset in record
-        32                     // Bit count (32 bits = 4 bytes)
-    )?;
+    let mut ch1 = ChannelBlock::default();
+    ch1.byte_offset = 0;
+    ch1.bit_count = 32;
+    ch1.data_type = DataType::UnsignedIntegerLE;
+    ch1.name = Some("Engine Speed".to_string());
+    let cn1_id = mdf_writer.add_channel(&cg1_id, None, &ch1)?;
     println!("Added Channel 'Engine Speed' with ID: {}", cn1_id);
     
     // Second channel - this will be linked from the first channel
     // Note how the byte offset is 4 to avoid overlapping with the first channel
-    let cn2_id = mdf_writer.add_channel(
-        &cg1_id,               // Parent channel group
-        Some(&cn1_id),         // Previous channel
-        Some("Engine Temp"),   // Channel name
-        4,                     // Byte offset (starts after first channel)
-        32                     // Bit count (32 bits = 4 bytes)
-    )?;
+    let mut ch2 = ChannelBlock::default();
+    ch2.byte_offset = 4;
+    ch2.bit_count = 32;
+    ch2.data_type = DataType::UnsignedIntegerLE;
+    ch2.name = Some("Engine Temp".to_string());
+    let cn2_id = mdf_writer.add_channel(&cg1_id, Some(&cn1_id), &ch2)?;
     println!("Added Channel 'Engine Temp' with ID: {}", cn2_id);
     
     // ------- Step 5: Add Channels to the second Channel Group -------
     
     // Add a channel to the second channel group
-    let cn3_id = mdf_writer.add_channel(
-        &cg2_id,               // Parent is the second channel group
-        None,                  // No previous channel in this group
-        Some("Vehicle Speed"), // Channel name
-        0,                     // Byte offset in record
-        16                     // Bit count (16 bits = 2 bytes)
-    )?;
+    let mut ch3 = ChannelBlock::default();
+    ch3.byte_offset = 0;
+    ch3.bit_count = 16;
+    ch3.data_type = DataType::UnsignedIntegerLE;
+    ch3.name = Some("Vehicle Speed".to_string());
+    let cn3_id = mdf_writer.add_channel(&cg2_id, None, &ch3)?;
     println!("Added Channel 'Vehicle Speed' with ID: {}", cn3_id);
     
     // ------- Step 6: Finalize the file -------
