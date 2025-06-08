@@ -15,6 +15,10 @@ pub struct RawDataGroup {
 }
 impl RawDataGroup {
 
+    /// Collect all data blocks referenced by this data group.
+    ///
+    /// The returned vector contains the `DT` or `DV` blocks in the order they
+    /// appear on disk, transparently following any `DL` list chains.
     pub fn data_blocks<'a>(
         &self,
         mmap: &'a [u8],

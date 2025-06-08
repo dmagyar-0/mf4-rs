@@ -16,6 +16,11 @@ pub struct DataListBlock {
 
 impl BlockParse<'_> for DataListBlock {
     const ID: &'static str = "##DL";
+    /// Parse a DLBLOCK from raw bytes.
+    ///
+    /// The DLBLOCK contains a list of links to data fragments. This function
+    /// validates the minimum size based on the number of links declared in the
+    /// header and reads all additional fields.
     fn from_bytes(bytes: &[u8]) -> Result<Self, MdfError> {
 
         let header = Self::parse_header(bytes)?;

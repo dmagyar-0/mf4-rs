@@ -164,6 +164,8 @@ impl DataType {
         }
     }
     
+    /// Convert a numeric representation to the corresponding `DataType`.
+    /// Values outside the known range yield `DataType::Unknown`.
     pub fn from_u8(value: u8) -> Self {
         match value {
             0 => DataType::UnsignedIntegerLE,
@@ -210,6 +212,8 @@ impl DataType {
     }
 }
 
+/// Read a text or metadata block pointed to by `address` and return its string
+/// content. A zero address yields `Ok(None)`.
 pub fn read_string_block(mmap: &[u8], address: u64) -> Result<Option<String>, MdfError> {
     if address == 0 {
         return Ok(None);
