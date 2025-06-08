@@ -145,12 +145,16 @@ impl IdentificationBlock {
             version_identifier: String::from(str::from_utf8(&bytes[8..16]).unwrap()),
             program_identifier: String::from(str::from_utf8(&bytes[16..24]).unwrap()),
             // Reserved bytes between 24 and 28 are skipped
-            version_number: LittleEndian::read_u16(&bytes[29..31]),
+            // The version number immediately follows at bytes 28..30
+            version_number: LittleEndian::read_u16(&bytes[28..30]),
             // Reserved bytes between 31 and 60 are skipped
             standard_unfinalized_flags: LittleEndian::read_u16(&bytes[60..62]),
             custom_unfinalized_flags: LittleEndian::read_u16(&bytes[62..64]),
         })
     }
+    /// Helper to parse the version string stored in the identification block.
+    ///
+    /// Returns the major and minor version numbers as `(major, minor)`.
     pub fn parse_block_version(bytes: &[u8]) -> Result<(u16,u16), MdfError> {
         // 1) Decode to &str, ignoring invalid UTF-8 (there shouldn’t be any).
         let raw = from_utf8(&bytes)

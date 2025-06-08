@@ -48,4 +48,23 @@ impl ConversionType {
             other => ConversionType::Unknown(other),
         }
     }
+
+    /// Convert the `ConversionType` to its numeric representation.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            ConversionType::Identity => 0,
+            ConversionType::Linear => 1,
+            ConversionType::Rational => 2,
+            ConversionType::Algebraic => 3,
+            ConversionType::TableLookupInterp => 4,
+            ConversionType::TableLookupNoInterp => 5,
+            ConversionType::RangeLookup => 6,
+            ConversionType::ValueToText => 7,
+            ConversionType::RangeToText => 8,
+            ConversionType::TextToValue => 9,
+            ConversionType::TextToText => 10,
+            ConversionType::BitfieldText => 11,
+            ConversionType::Unknown(v) => v,
+        }
+    }
 }

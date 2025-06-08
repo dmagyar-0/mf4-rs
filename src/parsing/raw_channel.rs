@@ -14,6 +14,10 @@ pub struct RawChannel {
 
 impl<'a> RawChannel {
 
+    /// Return an iterator over raw record bytes for this channel.
+    ///
+    /// The iterator yields a `Result` for each record and transparently handles
+    /// both fixed-size and VLSD storage schemes.
     pub fn records(
         &self,
         data_group: &'a RawDataGroup,
@@ -63,23 +67,15 @@ impl<'a> RawChannel {
                         let frag_addr = data_links[link_idx];
                         link_idx += 1;
                         let off = frag_addr as usize;
-                        // SDBLOCK
-                        return Some(
-                            SignalDataBlock::from_bytes(&bytes[off..])
-                                .map(|sdb| {
-                                    // prepare to yield from it next iteration
-                                    current_sdb = Some(sdb);
-                                    sdb_pos = 0;
-                                    // this iteration produces *no* record,
-                                    // but we want to loop again immediately:
-                                    // so we signal "no yield" with None,
-                                    // but map that None → loop continue
-                                    // (we'll handle it below)
-                                    None
-                                })
-                                .map_err(Into::into)
-                                .and_then(|opt| opt.ok_or_else(|| unreachable!()))
-                        );
+                        match SignalDataBlock::from_bytes(&bytes[off..]) {
+                            Ok(sdb) => {
+                                // Prepare to yield from it on the next loop
+                                current_sdb = Some(sdb);
+                                sdb_pos = 0;
+                                continue;
+                            }
+                            Err(e) => return Some(Err(e.into())),
+                        }
                     }
 
                     // 3) If we have a next_addr, peek its ID to decide what it is

@@ -164,6 +164,8 @@ impl DataType {
         }
     }
     
+    /// Convert a numeric representation to the corresponding `DataType`.
+    /// Values outside the known range yield `DataType::Unknown`.
     pub fn from_u8(value: u8) -> Self {
         match value {
             0 => DataType::UnsignedIntegerLE,
@@ -186,8 +188,32 @@ impl DataType {
             _ => DataType::Unknown(()),
         }
     }
+
+    /// Returns a typical bit width for this data type.
+    /// This is used when creating channels without an explicit bit count.
+    pub fn default_bits(&self) -> u32 {
+        match self {
+            DataType::UnsignedIntegerLE
+            | DataType::UnsignedIntegerBE
+            | DataType::SignedIntegerLE
+            | DataType::SignedIntegerBE => 32,
+            DataType::FloatLE | DataType::FloatBE => 32,
+            DataType::StringLatin1
+            | DataType::StringUtf8
+            | DataType::StringUtf16LE
+            | DataType::StringUtf16BE
+            | DataType::ByteArray
+            | DataType::MimeSample
+            | DataType::MimeStream => 8,
+            DataType::CanOpenDate | DataType::CanOpenTime => 64,
+            DataType::ComplexLE | DataType::ComplexBE => 64,
+            DataType::Unknown(_) => 8,
+        }
+    }
 }
 
+/// Read a text or metadata block pointed to by `address` and return its string
+/// content. A zero address yields `Ok(None)`.
 pub fn read_string_block(mmap: &[u8], address: u64) -> Result<Option<String>, MdfError> {
     if address == 0 {
         return Ok(None);

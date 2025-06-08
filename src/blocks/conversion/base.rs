@@ -119,3 +119,48 @@ fn read_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, MdfError> {
     *offset += 8;
     Ok(val)
 }
+
+impl ConversionBlock {
+    /// Serialize this conversion block back to bytes.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, MdfError> {
+        let links = 4 + self.cc_ref.len();
+
+        let mut header = self.header.clone();
+        header.links_nr = links as u64;
+
+        let mut size = 24 + links * 8 + 1 + 1 + 2 + 2 + 2;
+        if self.cc_flags & 0b10 != 0 {
+            size += 16;
+        }
+        size += self.cc_val.len() * 8;
+        header.block_len = size as u64;
+
+        let mut buf = Vec::with_capacity(size);
+        buf.extend_from_slice(&header.to_bytes()?);
+        for link in [self.cc_tx_name, self.cc_md_unit, self.cc_md_comment, self.cc_cc_inverse] {
+            buf.extend_from_slice(&link.unwrap_or(0).to_le_bytes());
+        }
+        for l in &self.cc_ref {
+            buf.extend_from_slice(&l.to_le_bytes());
+        }
+        buf.push(self.cc_type.to_u8());
+        buf.push(self.cc_precision);
+        buf.extend_from_slice(&self.cc_flags.to_le_bytes());
+        buf.extend_from_slice(&(self.cc_ref_count).to_le_bytes());
+        buf.extend_from_slice(&(self.cc_val_count).to_le_bytes());
+        if self.cc_flags & 0b10 != 0 {
+            buf.extend_from_slice(&self.cc_phy_range_min.unwrap_or(0.0).to_le_bytes());
+            buf.extend_from_slice(&self.cc_phy_range_max.unwrap_or(0.0).to_le_bytes());
+        }
+        for v in &self.cc_val {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        if buf.len() != size {
+            return Err(MdfError::BlockSerializationError(format!(
+                "ConversionBlock expected size {size} but wrote {}",
+                buf.len()
+            )));
+        }
+        Ok(buf)
+    }
+}
