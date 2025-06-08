@@ -159,6 +159,42 @@ impl MdfWriter {
         self.update_link(link_pos, target_pos)
     }
 
+    /// Updates a 32-bit value at the given file offset, restoring the current
+    /// position afterwards.
+    fn update_u32(&mut self, offset: u64, value: u32) -> Result<(), MdfError> {
+        let current_pos = self.offset;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_u32::<LittleEndian>(value)?;
+        self.file.seek(SeekFrom::Start(current_pos))?;
+        Ok(())
+    }
+
+    /// Updates an 8-bit value at the given file offset, restoring the current
+    /// position afterwards.
+    fn update_u8(&mut self, offset: u64, value: u8) -> Result<(), MdfError> {
+        let current_pos = self.offset;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_u8(value)?;
+        self.file.seek(SeekFrom::Start(current_pos))?;
+        Ok(())
+    }
+
+    /// Convenience wrapper around [`update_u32`] that updates a field within a
+    /// previously written block identified by `block_id`.
+    fn update_block_u32(&mut self, block_id: &str, field_offset: u64, value: u32) -> Result<(), MdfError> {
+        let block_pos = self.get_block_position(block_id)
+            .ok_or_else(|| MdfError::BlockLinkError(format!("Block '{}' not found", block_id)))?;
+        self.update_u32(block_pos + field_offset, value)
+    }
+
+    /// Convenience wrapper around [`update_u8`] that updates a field within a
+    /// previously written block identified by `block_id`.
+    fn update_block_u8(&mut self, block_id: &str, field_offset: u64, value: u8) -> Result<(), MdfError> {
+        let block_pos = self.get_block_position(block_id)
+            .ok_or_else(|| MdfError::BlockLinkError(format!("Block '{}' not found", block_id)))?;
+        self.update_u8(block_pos + field_offset, value)
+    }
+
     /// Returns the current file offset (for block address calculation).
     pub fn offset(&self) -> u64 {
         self.offset
@@ -232,13 +268,15 @@ impl MdfWriter {
     /// # Arguments
     /// * `dg_id` - ID of the parent data group
     /// * `prev_cg_id` - ID of the previous channel group in this DG (if any, None for the first CG)
+    /// * `cg_block` - Fully configured ChannelGroupBlock to write
     /// 
     /// # Returns
     /// The ID assigned to the new channel group block (for future reference)
     pub fn add_channel_group(
-        &mut self, 
-        dg_id: &str, 
-        prev_cg_id: Option<&str>
+        &mut self,
+        dg_id: &str,
+        prev_cg_id: Option<&str>,
+        cg_block: &ChannelGroupBlock,
     ) -> Result<String, MdfError> {
         // Generate a unique ID for this channel group
         let cg_count = self.block_positions.keys()
@@ -246,8 +284,7 @@ impl MdfWriter {
             .count();
         let cg_id = format!("cg_{}", cg_count);
         
-        // Create a new channel group block
-        let cg_block = ChannelGroupBlock::default();
+        // Serialize the provided channel group block
         let cg_bytes = cg_block.to_bytes()?;
         let _cg_pos = self.write_block_with_id(&cg_bytes, &cg_id)?;
         
@@ -272,9 +309,7 @@ impl MdfWriter {
     /// # Arguments
     /// * `cg_id` - ID of the parent channel group
     /// * `prev_cn_id` - ID of the previous channel in this CG (if any, None for the first CN)
-    /// * `name` - Optional name for this channel
-    /// * `byte_offset` - Byte offset within the record for this channel's data
-    /// * `bit_count` - Number of bits used by this channel's data
+    /// * `channel` - Fully configured ChannelBlock describing the new channel
     /// 
     /// # Returns
     /// The ID assigned to the new channel block (for future reference)
@@ -282,9 +317,7 @@ impl MdfWriter {
         &mut self,
         cg_id: &str,
         prev_cn_id: Option<&str>,
-        name: Option<&str>,
-        byte_offset: u32,
-        bit_count: u32
+        channel: &ChannelBlock,
     ) -> Result<String, MdfError> {
         // Generate a unique ID for this channel
         let cn_count = self.block_positions.keys()
@@ -292,30 +325,16 @@ impl MdfWriter {
             .count();
         let cn_id = format!("cn_{}", cn_count);
         
-        // Create a new channel block with custom settings
-        let mut cn_block = ChannelBlock::default();
-        
-        // Set the provided parameters
-        cn_block.byte_offset = byte_offset;
-        cn_block.bit_count = bit_count;
-        
-        // Write the channel block first to get its position
-        let cn_bytes = cn_block.to_bytes()?;
+        // Serialize the provided channel block
+        let cn_bytes = channel.to_bytes()?;
         let cn_pos = self.write_block_with_id(&cn_bytes, &cn_id)?;
-        
-        // If a name is provided, create a TextBlock for it
-        if let Some(channel_name) = name {
-            // Generate ID for the text block
+        // If a channel name is provided, create a TextBlock for it
+        if let Some(channel_name) = &channel.name {
             let tx_id = format!("tx_name_{}", cn_id);
-            
-            // Create and write the text block
             let tx_block = TextBlock::new(channel_name);
             let tx_bytes = tx_block.to_bytes()?;
             let tx_pos = self.write_block_with_id(&tx_bytes, &tx_id)?;
-            
-            // Update the name_addr link in the channel block
-            // The name_addr field is at offset 40 within the channel block
-            let name_link_offset = 40; 
+            let name_link_offset = 40; // name_addr field offset
             self.update_link(cn_pos + name_link_offset, tx_pos)?;
         }
         
@@ -370,6 +389,12 @@ impl MdfWriter {
         // Patch DG's data pointer to this DT block
         let dg_data_link_offset = 40; // data_block_addr field within DG
         self.update_block_link(dg_id, dg_data_link_offset, &dt_id)?;
+
+        // Update metadata in DG and CG blocks
+        // record_id_len field resides at offset 56 within the DG block
+        self.update_block_u8(dg_id, 56, record_id_len)?;
+        // samples_byte_nr field resides at offset 96 within the CG block
+        self.update_block_u32(cg_id, 96, record_bytes as u32)?;
 
         self.open_dts.insert(
             cg_id.to_string(),
@@ -519,11 +544,22 @@ impl MdfWriter {
         let dg_id = writer.add_data_group(None)?;
         
         // Add a channel group to the data group
-        let cg_id = writer.add_channel_group(&dg_id, None)?;
-        
+        let cg_block = ChannelGroupBlock::default();
+        let cg_id = writer.add_channel_group(&dg_id, None, &cg_block)?;
+
         // Add two channels to the channel group
-        let cn1_id = writer.add_channel(&cg_id, None, Some("Channel 1"), 0, 32)?;
-        let _cn2_id = writer.add_channel(&cg_id, Some(&cn1_id), Some("Channel 2"), 4, 32)?;
+        let mut ch1 = ChannelBlock::default();
+        ch1.byte_offset = 0;
+        ch1.bit_count = 32;
+        ch1.data_type = DataType::UnsignedIntegerLE;
+        ch1.name = Some("Channel 1".to_string());
+        let cn1_id = writer.add_channel(&cg_id, None, &ch1)?;
+        let mut ch2 = ChannelBlock::default();
+        ch2.byte_offset = 4;
+        ch2.bit_count = 32;
+        ch2.data_type = DataType::UnsignedIntegerLE;
+        ch2.name = Some("Channel 2".to_string());
+        let _cn2_id = writer.add_channel(&cg_id, Some(&cn1_id), &ch2)?;
         
         // Finalize the file
         writer.finalize()
