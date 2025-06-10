@@ -1,20 +1,17 @@
 use mf4_rs::writer::MdfWriter;
 use mf4_rs::blocks::common::DataType;
-use mf4_rs::parsing::decoder::{DecodedValue};
+use mf4_rs::parsing::decoder::DecodedValue;
 use mf4_rs::api::mdf::MDF;
 use mf4_rs::error::MdfError;
+
+#[path = "python_equivalent/const_sigs.rs"]
+mod const_sigs;
+use const_sigs::{SIG_LIST, RAW_MSG};
 
 use std::env;
 use std::time::Instant;
 
 const NUM_SAMPLES: usize = 10_000_000;
-
-struct ConstSig {
-    name: &'static str,
-    data_type: DataType,
-    bit_count: u32,
-    value: DecodedValue,
-}
 
 fn dump_sig_list(fname: &str) -> Result<(), MdfError> {
     let mdf = MDF::from_file(fname)?;
@@ -77,22 +74,7 @@ fn write_test() -> Result<(), MdfError> {
     Ok(())
 }
 
-fn sample_signals() -> Vec<ConstSig> {
-    vec![
-        ConstSig {
-            name: "U16Const",
-            data_type: DataType::UnsignedIntegerLE,
-            bit_count: 16,
-            value: DecodedValue::UnsignedInteger(42),
-        },
-        ConstSig {
-            name: "F32Const",
-            data_type: DataType::FloatLE,
-            bit_count: 32,
-            value: DecodedValue::Float(3.14),
-        },
-    ]
-}
+
 
 fn write_test_signals() -> Result<(), MdfError> {
     let mut writer = MdfWriter::new("asammdf_write_test_signals.tmp.mf4")?;
@@ -105,21 +87,28 @@ fn write_test_signals() -> Result<(), MdfError> {
     })?;
     writer.set_time_channel(&t_id)?;
 
-    let sigs = sample_signals();
-    for prev in &sigs {
+    for sig in SIG_LIST {
         writer.add_channel(&cg, Some(&t_id), |ch| {
-            ch.data_type = prev.data_type.clone();
-            ch.bit_count = prev.bit_count;
-            ch.name = Some(prev.name.into());
+            ch.data_type = sig.data_type.clone();
+            ch.bit_count = sig.bit_count;
+            ch.name = Some(sig.name.into());
         })?;
     }
 
     writer.start_data_block_for_cg(&cg, 0)?;
     for i in 0..NUM_SAMPLES {
         let ts = 100_000_000.0 + i as f64 * 1000.0;
-        let mut rec = vec![DecodedValue::Float(ts)];
-        for s in &sigs {
-            rec.push(s.value.clone());
+        let mut rec = Vec::with_capacity(SIG_LIST.len() + 1);
+        rec.push(DecodedValue::Float(ts));
+        for s in SIG_LIST {
+            match s.data_type {
+                DataType::FloatLE | DataType::FloatBE => {
+                    rec.push(DecodedValue::Float(s.float_val as f64));
+                }
+                _ => {
+                    rec.push(DecodedValue::UnsignedInteger(s.int_val as u64));
+                }
+            }
         }
         writer.write_record(&cg, &rec)?;
     }
@@ -128,8 +117,6 @@ fn write_test_signals() -> Result<(), MdfError> {
     println!("Done!");
     Ok(())
 }
-
-const RAW_MSG: [u8; 64] = [0xAA; 64];
 
 fn write_test_bytes() -> Result<(), MdfError> {
     let mut writer = MdfWriter::new("asammdf_write_test_frame.tmp.mf4")?;
