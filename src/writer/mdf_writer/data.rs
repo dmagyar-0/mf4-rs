@@ -128,6 +128,14 @@ impl MdfWriter {
                         buf[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
                     }
                 }
+                (DataType::ByteArray, DecodedValue::ByteArray(bytes))
+                | (DataType::MimeSample, DecodedValue::MimeSample(bytes))
+                | (DataType::MimeStream, DecodedValue::MimeStream(bytes)) => {
+                    let n = ((ch.bit_count + 7) / 8) as usize;
+                    for (i, b) in bytes.iter().take(n).enumerate() {
+                        buf[offset + i] = *b;
+                    }
+                }
                 _ => {}
             }
         }
