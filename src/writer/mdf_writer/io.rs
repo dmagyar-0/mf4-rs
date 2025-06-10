@@ -15,6 +15,7 @@ impl MdfWriter {
             offset: 0,
             block_positions: HashMap::new(),
             open_dts: HashMap::new(),
+            dt_counter: 0,
             last_dg: None,
             cg_to_dg: HashMap::new(),
             cg_offsets: HashMap::new(),

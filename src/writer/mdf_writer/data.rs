@@ -29,8 +29,8 @@ impl MdfWriter {
 
         let header = BlockHeader { id: "##DT".to_string(), reserved0: 0, block_len: 24, links_nr: 0 };
         let header_bytes = header.to_bytes()?;
-        let dt_count = self.block_positions.keys().filter(|k| k.starts_with("dt_")).count();
-        let dt_id = format!("dt_{}", dt_count);
+        let dt_id = format!("dt_{}", self.dt_counter);
+        self.dt_counter += 1;
         let dt_pos = self.write_block_with_id(&header_bytes, &dt_id)?;
 
         let dg_data_link_offset = 40;
@@ -90,8 +90,8 @@ impl MdfWriter {
             }
             let header = BlockHeader { id: "##DT".to_string(), reserved0: 0, block_len: 24, links_nr: 0 };
             let header_bytes = header.to_bytes()?;
-            let dt_count = self.block_positions.keys().filter(|k| k.starts_with("dt_")).count();
-            let new_dt_id = format!("dt_{}", dt_count);
+            let new_dt_id = format!("dt_{}", self.dt_counter);
+            self.dt_counter += 1;
             let new_dt_pos = self.write_block_with_id(&header_bytes, &new_dt_id)?;
 
             let dt = self.open_dts.get_mut(cg_id).unwrap();
