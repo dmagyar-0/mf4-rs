@@ -4,6 +4,27 @@ use crate::parsing::decoder::{decode_channel_value, DecodedValue};
 use crate::blocks::channel_block::ChannelBlock;
 use crate::writer::MdfWriter;
 
+// Helper to fetch the next set of raw records from parallel iterators.
+// Returns `Ok(Some(records))` when a full set was read,
+// `Ok(None)` if any iterator was exhausted, or an error propagated from
+// the iterators.
+fn next_record_set<'a, I>(
+    iters: &mut [I],
+) -> Result<Option<Vec<&'a [u8]>>, MdfError>
+where
+    I: Iterator<Item = Result<&'a [u8], MdfError>>,
+{
+    let mut rec = Vec::with_capacity(iters.len());
+    for it in iters.iter_mut() {
+        match it.next() {
+            Some(Ok(r)) => rec.push(r),
+            Some(Err(e)) => return Err(e),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(rec))
+}
+
 /// Cut a segment of an MDF file based on time stamps.
 ///
 /// The input file is scanned for a master time channel (channel type `2` and
@@ -66,15 +87,10 @@ pub fn cut_mdf_by_time(
                     // No time channel found; copy all records
                     writer.start_data_block_for_cg(&cg_id, dg.block.record_id_len)?;
                     loop {
-                        let mut rec = Vec::with_capacity(iters.len());
-                        for it in iters.iter_mut() {
-                            match it.next() {
-                                Some(Ok(r)) => rec.push(r),
-                                Some(Err(e)) => return Err(e),
-                                None => { rec.clear(); break; }
-                            }
-                        }
-                        if rec.is_empty() { break; }
+                        let rec = match next_record_set(&mut iters)? {
+                            Some(r) => r,
+                            None => break,
+                        };
                         let mut vals = Vec::new();
                         for (slice, ch) in rec.into_iter().zip(channel_blocks.iter()) {
                             let dv = decode_channel_value(slice, dg.block.record_id_len as usize, ch)
@@ -91,15 +107,10 @@ pub fn cut_mdf_by_time(
             writer.start_data_block_for_cg(&cg_id, dg.block.record_id_len)?;
 
             loop {
-                let mut rec = Vec::with_capacity(iters.len());
-                for it in iters.iter_mut() {
-                    match it.next() {
-                        Some(Ok(r)) => rec.push(r),
-                        Some(Err(e)) => return Err(e),
-                        None => { rec.clear(); break; }
-                    }
-                }
-                if rec.is_empty() { break; }
+                let rec = match next_record_set(&mut iters)? {
+                    Some(r) => r,
+                    None => break,
+                };
 
                 // Decode time value
                 let time_val = {
