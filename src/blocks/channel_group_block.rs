@@ -60,37 +60,6 @@ impl BlockParse<'_> for ChannelGroupBlock {
     }
 }
 impl ChannelGroupBlock {
-    /// Returns a ChannelGroupBlock with default values and automatically creates the header.
-    /// 
-    /// # Returns
-    /// A new ChannelGroupBlock instance with a properly initialized header (id="##CG", block_len=104)
-    /// and all other fields set to default values.
-    pub fn default() -> Self {
-        // Create a header with the correct ID and block length
-        let header = BlockHeader {
-            id: String::from("##CG"),
-            reserved0: 0,
-            block_len: 104,
-            links_nr: 6,  // ChannelGroupBlock has 6 links
-        };
-        
-        ChannelGroupBlock {
-            header,
-            next_cg_addr: 0,
-            first_ch_addr: 0,
-            acq_name_addr: 0,
-            acq_source_addr: 0,
-            first_sample_reduction_addr: 0,
-            comment_addr: 0,
-            record_id: 0,
-            cycles_nr: 0,
-            flags: 0,
-            path_separator: 0,
-            reserved1: 0,
-            samples_byte_nr: 0,
-            invalidation_bytes_nr: 0,
-        }
-    }
     
     /// Serializes the ChannelGroupBlock to bytes according to MDF 4.1 specification.
     /// 
@@ -186,5 +155,33 @@ impl ChannelGroupBlock {
         }
 
         Ok(channels)
+    }
+}
+
+impl Default for ChannelGroupBlock {
+    fn default() -> Self {
+        let header = BlockHeader {
+            id: String::from("##CG"),
+            reserved0: 0,
+            block_len: 104,
+            links_nr: 6,
+        };
+
+        ChannelGroupBlock {
+            header,
+            next_cg_addr: 0,
+            first_ch_addr: 0,
+            acq_name_addr: 0,
+            acq_source_addr: 0,
+            first_sample_reduction_addr: 0,
+            comment_addr: 0,
+            record_id: 0,
+            cycles_nr: 0,
+            flags: 0,
+            path_separator: 0,
+            reserved1: 0,
+            samples_byte_nr: 0,
+            invalidation_bytes_nr: 0,
+        }
     }
 }

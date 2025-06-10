@@ -68,11 +68,11 @@ impl TextBlock {
     }
     
     /// Creates an empty TextBlock with a minimal valid size.
-    /// 
+    ///
     /// # Returns
     /// A new TextBlock with an empty text string
-    pub fn default() -> Self {
-        Self::new("") // Create an empty text block
+    pub fn new_empty() -> Self {
+        Self::new("")
     }
     
     /// Serializes the TextBlock to bytes according to MDF 4.1 specification.
@@ -143,5 +143,11 @@ impl TextBlock {
         debug_assert_eq!(buffer.len() % 8, 0, "TextBlock size is not 8-byte aligned");
         
         Ok(buffer)
+    }
+}
+
+impl Default for TextBlock {
+    fn default() -> Self {
+        Self::new("")
     }
 }

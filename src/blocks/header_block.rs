@@ -26,42 +26,6 @@ pub struct HeaderBlock {
 }
 
 impl HeaderBlock {
-    /// Returns a HeaderBlock with default values and automatically creates the header.
-    /// 
-    /// # Returns
-    /// A new HeaderBlock instance with a properly initialized header (id="##HD", block_len=104)
-    /// and all other fields set to default values.
-    pub fn default() -> Self {
-        // Create a header with the correct ID and block length
-        let header = BlockHeader {
-            id: String::from("##HD"),
-            reserved0: 0,
-            block_len: 104,
-            links_nr: 6,  // HeaderBlock has 6 links
-        };
-        
-        HeaderBlock {
-            header,
-            first_dg_addr: 0,
-            file_history_addr: 0,
-            channel_tree_addr: 0,
-            first_attachment_addr: 0,
-            first_event_addr: 0,
-            comment_addr: 0,
-            abs_time: 2 * 3600 * 1000000000,  // Preserving the default time value
-            tz_offset: 0,
-            daylight_save_time: 0,
-            time_flags: 0,
-            time_quality: 0,
-            flags: 0,
-            reserved1: 0,
-            start_angle: 0,
-            start_distance: 0,
-        }
-    }
-}
-
-impl HeaderBlock {
     /// Serializes the HeaderBlock to bytes according to MDF 4.1 specification.
     ///
     /// # Structure (104 bytes total):
@@ -174,5 +138,35 @@ impl BlockParse<'_> for HeaderBlock {
             start_angle: LittleEndian::read_u64(&bytes[88..96]),
             start_distance: LittleEndian::read_u64(&bytes[96..104]),
         })
+    }
+}
+
+impl Default for HeaderBlock {
+    fn default() -> Self {
+        let header = BlockHeader {
+            id: String::from("##HD"),
+            reserved0: 0,
+            block_len: 104,
+            links_nr: 6,
+        };
+
+        HeaderBlock {
+            header,
+            first_dg_addr: 0,
+            file_history_addr: 0,
+            channel_tree_addr: 0,
+            first_attachment_addr: 0,
+            first_event_addr: 0,
+            comment_addr: 0,
+            abs_time: 2 * 3600 * 1000000000,
+            tz_offset: 0,
+            daylight_save_time: 0,
+            time_flags: 0,
+            time_quality: 0,
+            flags: 0,
+            reserved1: 0,
+            start_angle: 0,
+            start_distance: 0,
+        }
     }
 }

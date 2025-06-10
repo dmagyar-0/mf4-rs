@@ -93,51 +93,6 @@ impl BlockParse<'_> for ChannelBlock {
 }
 
 impl ChannelBlock {
-    /// Returns a ChannelBlock with default values and automatically creates the header.
-    /// 
-    /// # Returns
-    /// A new ChannelBlock instance with a properly initialized header (id="##CN", block_len=160)
-    /// and all other fields set to default values.
-    pub fn default() -> Self {
-        // Create a header with the correct ID and block length
-        let header = BlockHeader {
-            id: String::from("##CN"),
-            reserved0: 0,
-            block_len: 160,
-            links_nr: 8,
-        };
-        
-        ChannelBlock {
-            header,
-            next_ch_addr: 0,
-            component_addr: 0,
-            name_addr: 0,
-            source_addr: 0,
-            conversion_addr: 0,
-            data: 0,
-            unit_addr: 0,
-            comment_addr: 0,
-            channel_type: 0,
-            sync_type: 0,
-            data_type: DataType::UnsignedIntegerLE, // Default data type
-            bit_offset: 0,
-            byte_offset: 0,
-            bit_count: 0,
-            flags: 0,
-            pos_invalidation_bit: 0,
-            precision: 0,
-            reserved1: 0,
-            attachment_nr: 0,
-            min_raw_value: 0.0,
-            max_raw_value: 0.0,
-            lower_limit: 0.0,
-            upper_limit: 0.0,
-            lower_ext_limit: 0.0,
-            upper_ext_limit: 0.0,
-            name: None,
-            conversion: None,
-        }
-    }
     
     /// Serializes the ChannelBlock to bytes according to MDF 4.1 specification.
     /// 
@@ -318,5 +273,47 @@ impl ChannelBlock {
             raw
         };
         Ok(decoded)
+    }
+}
+
+impl Default for ChannelBlock {
+    fn default() -> Self {
+        let header = BlockHeader {
+            id: String::from("##CN"),
+            reserved0: 0,
+            block_len: 160,
+            links_nr: 8,
+        };
+
+        ChannelBlock {
+            header,
+            next_ch_addr: 0,
+            component_addr: 0,
+            name_addr: 0,
+            source_addr: 0,
+            conversion_addr: 0,
+            data: 0,
+            unit_addr: 0,
+            comment_addr: 0,
+            channel_type: 0,
+            sync_type: 0,
+            data_type: DataType::UnsignedIntegerLE,
+            bit_offset: 0,
+            byte_offset: 0,
+            bit_count: 0,
+            flags: 0,
+            pos_invalidation_bit: 0,
+            precision: 0,
+            reserved1: 0,
+            attachment_nr: 0,
+            min_raw_value: 0.0,
+            max_raw_value: 0.0,
+            lower_limit: 0.0,
+            upper_limit: 0.0,
+            lower_ext_limit: 0.0,
+            upper_ext_limit: 0.0,
+            name: None,
+            conversion: None,
+        }
     }
 }

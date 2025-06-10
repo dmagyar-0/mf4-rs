@@ -52,30 +52,6 @@ impl BlockParse<'_> for DataGroupBlock {
 }
 
 impl DataGroupBlock {
-    /// Returns a DataGroupBlock with default values and automatically creates the header.
-    /// 
-    /// # Returns
-    /// A new DataGroupBlock instance with a properly initialized header (id="##DG", block_len=64)
-    /// and all other fields set to default values.
-    pub fn default() -> Self {
-        // Create a header with the correct ID and block length
-        let header = BlockHeader {
-            id: String::from("##DG"),
-            reserved0: 0,
-            block_len: 64,
-            links_nr: 4,  // DataGroupBlock has 4 links
-        };
-        
-        DataGroupBlock {
-            header,
-            next_dg_addr: 0,
-            first_cg_addr: 0,
-            data_block_addr: 0,
-            comment_addr: 0,
-            record_id_len: 0,
-            reserved1: String::new(),
-        }
-    }
     
     /// Serializes the DataGroupBlock to bytes according to MDF 4.1 specification.
     /// 
@@ -136,5 +112,26 @@ impl DataGroupBlock {
         debug_assert_eq!(buffer.len() % 8, 0, "DataGroupBlock size is not 8-byte aligned");
         
         Ok(buffer)
+    }
+}
+
+impl Default for DataGroupBlock {
+    fn default() -> Self {
+        let header = BlockHeader {
+            id: String::from("##DG"),
+            reserved0: 0,
+            block_len: 64,
+            links_nr: 4,
+        };
+
+        DataGroupBlock {
+            header,
+            next_dg_addr: 0,
+            first_cg_addr: 0,
+            data_block_addr: 0,
+            comment_addr: 0,
+            record_id_len: 0,
+            reserved1: String::new(),
+        }
     }
 }
