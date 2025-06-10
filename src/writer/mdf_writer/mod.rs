@@ -31,6 +31,7 @@ pub struct MdfWriter {
     offset: u64,
     block_positions: HashMap<String, u64>,
     open_dts: HashMap<String, OpenDataBlock>,
+    dt_counter: usize,
     last_dg: Option<String>,
     cg_to_dg: HashMap<String, String>,
     cg_offsets: HashMap<String, usize>,
