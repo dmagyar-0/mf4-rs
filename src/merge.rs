@@ -4,7 +4,7 @@ use crate::parsing::mdf_file::MdfFile;
 use crate::parsing::decoder::{decode_channel_value, DecodedValue};
 use crate::blocks::common::{DataType, read_string_block};
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct ChannelMeta {
     name: Option<String>,
     data_type: DataType,
@@ -14,7 +14,7 @@ struct ChannelMeta {
     channel_type: u8,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct GroupMeta {
     record_id_len: u8,
     channels: Vec<ChannelMeta>,
@@ -59,22 +59,6 @@ fn collect_groups(file: &MdfFile) -> Result<Vec<MergedGroup>, MdfError> {
     Ok(groups)
 }
 
-fn metas_equal(a: &GroupMeta, b: &GroupMeta) -> bool {
-    if a.channels.len() != b.channels.len() {
-        return false;
-    }
-    for (ca, cb) in a.channels.iter().zip(&b.channels) {
-        if ca.name != cb.name ||
-           ca.data_type != cb.data_type ||
-           ca.bit_offset != cb.bit_offset ||
-           ca.byte_offset != cb.byte_offset ||
-           ca.bit_count != cb.bit_count ||
-           ca.channel_type != cb.channel_type {
-            return false;
-        }
-    }
-    true
-}
 
 /// Merge two MDF files into a new file.
 ///
@@ -97,7 +81,7 @@ pub fn merge_files(output: &str, first: &str, second: &str) -> Result<(), MdfErr
     let other_groups = collect_groups(&mdf2)?;
 
     for og in other_groups {
-        if let Some(g1) = groups.iter_mut().find(|g| metas_equal(&g.meta, &og.meta)) {
+        if let Some(g1) = groups.iter_mut().find(|g| g.meta == og.meta) {
             for (vals1, vals2) in g1.data.iter_mut().zip(og.data.into_iter()) {
                 vals1.extend(vals2);
             }
