@@ -26,6 +26,16 @@ def dump_sig_list(fname):
                     print(channel.name)
 
 @timed
+def verify_signals(fname):
+    """Read each non-time signal and print its sample count."""
+    with MDF(fname) as mdf_file:
+        for group in mdf_file.groups:
+            for channel in group.channels:
+                if channel.name != "t":
+                    sig = mdf_file.get(channel.name)
+                    print(f"{channel.name}: {len(sig.samples)} samples")
+
+@timed
 def read_test_signal(fname, signame):
     with MDF(fname, channels=[signame]) as mdf_file:
         sig = mdf_file.get(signame)
@@ -95,5 +105,7 @@ if __name__ == "__main__":
         write_test_bytes()
     elif cmd == "asammdf_dump_signals":
         dump_sig_list(sys.argv[2])
+    elif cmd == "asammdf_verify_signals":
+        verify_signals(sys.argv[2])
     else:
         print(f"Unknown command: {cmd}")
