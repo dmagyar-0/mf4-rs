@@ -49,17 +49,6 @@ impl ChannelEncoder {
         }
     }
 
-    fn encode_f64(&self, buf: &mut [u8], value: f64) {
-        match self {
-            ChannelEncoder::F64 { offset } => {
-                buf[*offset..*offset + 8].copy_from_slice(&value.to_le_bytes());
-            }
-            ChannelEncoder::F32 { offset } => {
-                buf[*offset..*offset + 4].copy_from_slice(&(value as f32).to_le_bytes());
-            }
-            _ => {}
-        }
-    }
 }
 
 const MAX_DT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
@@ -133,7 +122,6 @@ impl MdfWriter {
                 record_size,
                 record_count: 0,
                 total_record_count: 0,
-                record_id_len: record_id_len as usize,
                 channels: channels.to_vec(),
                 dt_ids: vec![dt_id],
                 dt_positions: vec![dt_pos],

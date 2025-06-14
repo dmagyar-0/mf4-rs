@@ -1,6 +1,5 @@
 //! Implementation of the MdfWriter struct split across several submodules
 
-use std::fs::File;
 use std::io::{Write, Seek};
 
 trait WriteSeek: Write + Seek {}
@@ -24,7 +23,6 @@ struct OpenDataBlock {
     record_count: u64,
     /// Total number of records written across all DT blocks for this group
     total_record_count: u64,
-    record_id_len: usize,
     channels: Vec<ChannelBlock>,
     dt_ids: Vec<String>,
     dt_positions: Vec<u64>,
