@@ -27,6 +27,8 @@ struct OpenDataBlock {
     dt_sizes: Vec<u64>,
     /// Scratch buffer reused for record encoding
     record_buf: Vec<u8>,
+    /// Template filled with constant values used to initialise each record
+    record_template: Vec<u8>,
 }
 
 /// Writer for MDF blocks, ensuring 8-byte alignment and zero padding.
