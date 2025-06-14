@@ -5,45 +5,69 @@ use crate::blocks::common::{BlockHeader, DataType};
 use crate::blocks::data_list_block::DataListBlock;
 use crate::parsing::decoder::DecodedValue;
 
-const MAX_DT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+pub(super) enum ChannelEncoder {
+    UInt { offset: usize, bytes: usize },
+    Int { offset: usize, bytes: usize },
+    F32 { offset: usize },
+    F64 { offset: usize },
+    Bytes { offset: usize, bytes: usize },
+    Skip,
+}
 
-fn encode_values_to_buf(
-    buf: &mut [u8],
-    record_id_len: usize,
-    channels: &[ChannelBlock],
-    values: &[DecodedValue],
-) {
-    for (ch, val) in channels.iter().zip(values.iter()) {
-        let offset = record_id_len + ch.byte_offset as usize;
-        match (&ch.data_type, val) {
-            (DataType::UnsignedIntegerLE, DecodedValue::UnsignedInteger(v)) => {
-                let bytes = (*v).to_le_bytes();
-                let n = ((ch.bit_count + 7) / 8) as usize;
-                buf[offset..offset + n].copy_from_slice(&bytes[..n]);
+impl ChannelEncoder {
+    fn encode(&self, buf: &mut [u8], value: &DecodedValue) {
+        match (self, value) {
+            (ChannelEncoder::UInt { offset, bytes }, DecodedValue::UnsignedInteger(v)) => {
+                let b = v.to_le_bytes();
+                buf[*offset..*offset + *bytes].copy_from_slice(&b[..*bytes]);
             }
-            (DataType::SignedIntegerLE, DecodedValue::SignedInteger(v)) => {
-                let bytes = (*v as i64).to_le_bytes();
-                let n = ((ch.bit_count + 7) / 8) as usize;
-                buf[offset..offset + n].copy_from_slice(&bytes[..n]);
+            (ChannelEncoder::Int { offset, bytes }, DecodedValue::SignedInteger(v)) => {
+                let b = (*v as i64).to_le_bytes();
+                buf[*offset..*offset + *bytes].copy_from_slice(&b[..*bytes]);
             }
-            (DataType::FloatLE, DecodedValue::Float(v)) => {
-                if ch.bit_count == 32 {
-                    buf[offset..offset + 4].copy_from_slice(&(*v as f32).to_le_bytes());
-                } else if ch.bit_count == 64 {
-                    buf[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
-                }
+            (ChannelEncoder::F32 { offset }, DecodedValue::Float(v)) => {
+                buf[*offset..*offset + 4].copy_from_slice(&(*v as f32).to_le_bytes());
             }
-            (DataType::ByteArray, DecodedValue::ByteArray(bytes))
-            | (DataType::MimeSample, DecodedValue::MimeSample(bytes))
-            | (DataType::MimeStream, DecodedValue::MimeStream(bytes)) => {
-                let n = ((ch.bit_count + 7) / 8) as usize;
-                buf[offset..offset + n].fill(0);
-                for (i, b) in bytes.iter().take(n).enumerate() {
-                    buf[offset + i] = *b;
-                }
+            (ChannelEncoder::F64 { offset }, DecodedValue::Float(v)) => {
+                buf[*offset..*offset + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            (ChannelEncoder::Bytes { offset, bytes }, DecodedValue::ByteArray(data))
+            | (ChannelEncoder::Bytes { offset, bytes }, DecodedValue::MimeSample(data))
+            | (ChannelEncoder::Bytes { offset, bytes }, DecodedValue::MimeStream(data)) => {
+                buf[*offset..*offset + *bytes].fill(0);
+                let n = data.len().min(*bytes);
+                buf[*offset..*offset + n].copy_from_slice(&data[..n]);
             }
             _ => {}
         }
+    }
+
+    fn encode_u64(&self, buf: &mut [u8], value: u64) {
+        if let ChannelEncoder::UInt { offset, bytes } = self {
+            let b = value.to_le_bytes();
+            buf[*offset..*offset + *bytes].copy_from_slice(&b[..*bytes]);
+        }
+    }
+
+    fn encode_f64(&self, buf: &mut [u8], value: f64) {
+        match self {
+            ChannelEncoder::F64 { offset } => {
+                buf[*offset..*offset + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            ChannelEncoder::F32 { offset } => {
+                buf[*offset..*offset + 4].copy_from_slice(&(value as f32).to_le_bytes());
+            }
+            _ => {}
+        }
+    }
+}
+
+const MAX_DT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+
+
+fn encode_values(encoders: &[ChannelEncoder], buf: &mut [u8], values: &[DecodedValue]) {
+    for (enc, val) in encoders.iter().zip(values.iter()) {
+        enc.encode(buf, val);
     }
 }
 
@@ -78,6 +102,28 @@ impl MdfWriter {
         self.update_block_u8(dg_id, 56, record_id_len)?;
         self.update_block_u32(cg_id, 96, record_bytes as u32)?;
 
+        let mut encoders = Vec::new();
+        for ch in channels {
+            let offset = record_id_len as usize + ch.byte_offset as usize;
+            let bytes = ((ch.bit_count + 7) / 8) as usize;
+            let enc = match ch.data_type {
+                DataType::UnsignedIntegerLE => ChannelEncoder::UInt { offset, bytes },
+                DataType::SignedIntegerLE => ChannelEncoder::Int { offset, bytes },
+                DataType::FloatLE => {
+                    if ch.bit_count == 32 {
+                        ChannelEncoder::F32 { offset }
+                    } else {
+                        ChannelEncoder::F64 { offset }
+                    }
+                }
+                DataType::ByteArray | DataType::MimeSample | DataType::MimeStream => {
+                    ChannelEncoder::Bytes { offset, bytes }
+                }
+                _ => ChannelEncoder::Skip,
+            };
+            encoders.push(enc);
+        }
+
         self.open_dts.insert(
             cg_id.to_string(),
             OpenDataBlock {
@@ -94,6 +140,7 @@ impl MdfWriter {
                 dt_sizes: Vec::new(),
                 record_buf: vec![0u8; record_size],
                 record_template: vec![0u8; record_size],
+                encoders,
             },
         );
         Ok(())
@@ -125,7 +172,7 @@ impl MdfWriter {
             return Err(MdfError::BlockSerializationError("value count mismatch".into()));
         }
         dt.record_template.fill(0);
-        encode_values_to_buf(&mut dt.record_template, dt.record_id_len, &dt.channels, values);
+        encode_values(&dt.encoders, &mut dt.record_template, values);
         Ok(())
     }
 
@@ -171,8 +218,29 @@ impl MdfWriter {
         }
 
         dt.record_buf.copy_from_slice(&dt.record_template);
-        encode_values_to_buf(&mut dt.record_buf, dt.record_id_len, &dt.channels, values);
+        encode_values(&dt.encoders, &mut dt.record_buf, values);
 
+        self.file.write_all(&dt.record_buf)?;
+        dt.record_count += 1;
+        self.offset += dt.record_buf.len() as u64;
+        Ok(())
+    }
+
+    /// Fast path for uniform unsigned integer channel groups.
+    pub fn write_record_u64(&mut self, cg_id: &str, values: &[u64]) -> Result<(), MdfError> {
+        let dt = self.open_dts.get_mut(cg_id).ok_or_else(|| {
+            MdfError::BlockSerializationError("no open DT block for this channel group".into())
+        })?;
+        if values.len() != dt.encoders.len() {
+            return Err(MdfError::BlockSerializationError("value count mismatch".into()));
+        }
+        if !dt.encoders.iter().all(|e| matches!(e, ChannelEncoder::UInt { .. })) {
+            return Err(MdfError::BlockSerializationError("channel types not unsigned".into()));
+        }
+        dt.record_buf.copy_from_slice(&dt.record_template);
+        for (enc, &v) in dt.encoders.iter().zip(values.iter()) {
+            enc.encode_u64(&mut dt.record_buf, v);
+        }
         self.file.write_all(&dt.record_buf)?;
         dt.record_count += 1;
         self.offset += dt.record_buf.len() as u64;
@@ -186,7 +254,14 @@ impl MdfWriter {
     where
         I: IntoIterator<Item = &'a [DecodedValue]>,
     {
-        let mut buffer = Vec::new();
+        let record_size = {
+            let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+                MdfError::BlockSerializationError("no open DT block for this channel group".into())
+            })?.record_size;
+            dt
+        };
+        let max_records = (MAX_DT_BLOCK_SIZE - 24) / record_size;
+        let mut buffer = Vec::with_capacity(record_size * max_records);
         for record in records {
             let potential_new_block = {
                 let dt = self.open_dts.get(cg_id).ok_or_else(|| {
@@ -230,7 +305,80 @@ impl MdfWriter {
 
             let dt = self.open_dts.get_mut(cg_id).unwrap();
             dt.record_buf.copy_from_slice(&dt.record_template);
-            encode_values_to_buf(&mut dt.record_buf, dt.record_id_len, &dt.channels, record);
+            encode_values(&dt.encoders, &mut dt.record_buf, record);
+            buffer.extend_from_slice(&dt.record_buf);
+            dt.record_count += 1;
+        }
+
+        if !buffer.is_empty() {
+            self.file.write_all(&buffer)?;
+            self.offset += buffer.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Batch write for uniform unsigned integer channel groups.
+    pub fn write_records_u64<'a, I>(&mut self, cg_id: &str, records: I) -> Result<(), MdfError>
+    where
+        I: IntoIterator<Item = &'a [u64]>,
+    {
+        let record_size = {
+            let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+                MdfError::BlockSerializationError("no open DT block for this channel group".into())
+            })?.record_size;
+            dt
+        };
+        let max_records = (MAX_DT_BLOCK_SIZE - 24) / record_size;
+        let mut buffer = Vec::with_capacity(record_size * max_records);
+        for rec in records {
+            let potential_new_block = {
+                let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+                    MdfError::BlockSerializationError("no open DT block for this channel group".into())
+                })?;
+                if rec.len() != dt.encoders.len() {
+                    return Err(MdfError::BlockSerializationError("value count mismatch".into()));
+                }
+                if !dt.encoders.iter().all(|e| matches!(e, ChannelEncoder::UInt { .. })) {
+                    return Err(MdfError::BlockSerializationError("channel types not unsigned".into()));
+                }
+                24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
+            };
+
+            if potential_new_block {
+                self.file.write_all(&buffer)?;
+                self.offset += buffer.len() as u64;
+                buffer.clear();
+
+                let (start_pos, record_count, record_size) = {
+                    let dt = self.open_dts.get(cg_id).unwrap();
+                    (dt.start_pos, dt.record_count, dt.record_size)
+                };
+                let size = 24 + record_size * record_count as usize;
+                self.update_link(start_pos + 8, size as u64)?;
+                {
+                    let dt = self.open_dts.get_mut(cg_id).unwrap();
+                    dt.total_record_count += record_count;
+                    dt.dt_sizes.push(size as u64);
+                }
+                let header = BlockHeader { id: "##DT".to_string(), reserved0: 0, block_len: 24, links_nr: 0 };
+                let header_bytes = header.to_bytes()?;
+                let new_dt_id = format!("dt_{}", self.dt_counter);
+                self.dt_counter += 1;
+                let new_dt_pos = self.write_block_with_id(&header_bytes, &new_dt_id)?;
+
+                let dt = self.open_dts.get_mut(cg_id).unwrap();
+                dt.dt_id = new_dt_id.clone();
+                dt.start_pos = new_dt_pos;
+                dt.record_count = 0;
+                dt.dt_ids.push(new_dt_id);
+                dt.dt_positions.push(new_dt_pos);
+            }
+
+            let dt = self.open_dts.get_mut(cg_id).unwrap();
+            dt.record_buf.copy_from_slice(&dt.record_template);
+            for (enc, &v) in dt.encoders.iter().zip(rec.iter()) {
+                enc.encode_u64(&mut dt.record_buf, v);
+            }
             buffer.extend_from_slice(&dt.record_buf);
             dt.record_count += 1;
         }

@@ -3,7 +3,53 @@ use super::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write, BufWriter};
+use memmap2::MmapMut;
 use byteorder::{LittleEndian, WriteBytesExt};
+
+struct MmapWriter {
+    mmap: MmapMut,
+    pos: usize,
+}
+
+impl MmapWriter {
+    fn new(path: &str, size: usize) -> Result<Self, MdfError> {
+        use std::fs::OpenOptions;
+        let file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
+        file.set_len(size as u64)?;
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        Ok(MmapWriter { mmap, pos: 0 })
+    }
+}
+
+impl Write for MmapWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let end = self.pos + buf.len();
+        if end > self.mmap.len() {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "mmap overflow"));
+        }
+        self.mmap[self.pos..end].copy_from_slice(buf);
+        self.pos = end;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.mmap.flush()
+    }
+}
+
+impl Seek for MmapWriter {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos: i64 = match pos {
+            SeekFrom::Start(x) => x as i64,
+            SeekFrom::End(x) => self.mmap.len() as i64 + x,
+            SeekFrom::Current(x) => self.pos as i64 + x,
+        };
+        if new_pos < 0 || new_pos as usize > self.mmap.len() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "invalid seek"));
+        }
+        self.pos = new_pos as usize;
+        Ok(self.pos as u64)
+    }
+}
 
 impl MdfWriter {
     /// Creates a new MdfWriter for the given file path using a 1 MB internal
@@ -17,7 +63,24 @@ impl MdfWriter {
         let file = File::create(path)?;
         let file = BufWriter::with_capacity(capacity, file);
         Ok(MdfWriter {
-            file,
+            file: Box::new(file),
+            offset: 0,
+            block_positions: HashMap::new(),
+            open_dts: HashMap::new(),
+            dt_counter: 0,
+            last_dg: None,
+            cg_to_dg: HashMap::new(),
+            cg_offsets: HashMap::new(),
+            cg_channels: HashMap::new(),
+            channel_map: HashMap::new(),
+        })
+    }
+
+    /// Creates a new MdfWriter backed by a memory-mapped file of the given size.
+    pub fn new_mmap(path: &str, size: usize) -> Result<Self, MdfError> {
+        let writer = MmapWriter::new(path, size)?;
+        Ok(MdfWriter {
+            file: Box::new(writer),
             offset: 0,
             block_positions: HashMap::new(),
             open_dts: HashMap::new(),
