@@ -1,6 +1,7 @@
 //! Implementation of the MdfWriter struct split across several submodules
 
 use std::fs::File;
+use std::io::BufWriter;
 use std::collections::HashMap;
 
 use crate::blocks::channel_block::ChannelBlock;
@@ -24,12 +25,14 @@ struct OpenDataBlock {
     dt_ids: Vec<String>,
     dt_positions: Vec<u64>,
     dt_sizes: Vec<u64>,
+    /// Scratch buffer reused for record encoding
+    record_buf: Vec<u8>,
 }
 
 /// Writer for MDF blocks, ensuring 8-byte alignment and zero padding.
 /// Tracks block positions and supports updating links at a later stage.
 pub struct MdfWriter {
-    file: File,
+    file: BufWriter<File>,
     offset: u64,
     block_positions: HashMap<String, u64>,
     open_dts: HashMap<String, OpenDataBlock>,

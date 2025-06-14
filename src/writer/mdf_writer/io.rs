@@ -2,7 +2,7 @@
 use super::*;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write, BufWriter};
 use byteorder::{LittleEndian, WriteBytesExt};
 
 impl MdfWriter {
@@ -10,6 +10,7 @@ impl MdfWriter {
     /// Initializes with an empty block position tracker.
     pub fn new(path: &str) -> Result<Self, MdfError> {
         let file = File::create(path)?;
+        let file = BufWriter::new(file);
         Ok(MdfWriter {
             file,
             offset: 0,
