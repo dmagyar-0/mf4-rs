@@ -1,5 +1,6 @@
 from asammdf import MDF, Signal
 import numpy as np
+import pandas as pd
 import sys
 import const_sigs
 import time
@@ -25,6 +26,16 @@ def dump_sig_list(fname):
                     print(channel.name)
 
 @timed
+def verify_signals(fname):
+    """Read each non-time signal and print its sample count."""
+    with MDF(fname) as mdf_file:
+        for group in mdf_file.groups:
+            for channel in group.channels:
+                if channel.name != "t":
+                    sig = mdf_file.get(channel.name)
+                    print(f"{channel.name}: {len(sig.samples)} samples")
+
+@timed
 def read_test_signal(fname, signame):
     with MDF(fname, channels=[signame]) as mdf_file:
         sig = mdf_file.get(signame)
@@ -46,18 +57,25 @@ def write_test():
 @timed
 def write_test_signals():
     with MDF(version='4.20') as mdf_file:
-        data_list = []
-        for sig in const_sigs.SIG_LIST:
-            name, bit_count, typ, float_val, int_val = sig
+        signals = []
+        timestamps = 100_000_000 + np.arange(10_000_000, dtype=np.float64) * 1_000
+        for name, bit_count, typ, float_val, int_val in const_sigs.SIG_LIST:
             if typ is int:
-                dtype = np.min_scalar_type(2 ** bit_count)
+                byte_width = ((bit_count - 1) // 8 + 1) * 8
+                dtype = np.dtype(f"uint{byte_width}")
                 samples = np.full(10_000_000, int_val, dtype=dtype)
             else:
-                samples = np.full(10_000_000, float_val, dtype=np.single)
-            timestamps = 100_000_000 + np.arange(10_000_000, dtype=np.single) * 1_000
-            data_list.append(Signal(samples=samples, timestamps=timestamps,
-                                     name=name, bit_count=bit_count))
-        mdf_file.append(data_list)
+                if bit_count == 16:
+                    dtype = np.float16
+                else:
+                    dtype = np.float32
+                samples = np.full(10_000_000, float_val, dtype=dtype)
+            sig = Signal(samples=samples, timestamps=timestamps,
+                         name=name, bit_count=bit_count)
+            signals.append(sig)
+
+        # Provide the common_timebase to place all channels in one group
+        mdf_file.append(signals, comment="Example", common_timebase=True)
         mdf_file.save('asammdf_write_test_signals.tmp.mf4')
     print("Done!")
 
@@ -92,5 +110,7 @@ if __name__ == "__main__":
         write_test_bytes()
     elif cmd == "asammdf_dump_signals":
         dump_sig_list(sys.argv[2])
+    elif cmd == "asammdf_verify_signals":
+        verify_signals(sys.argv[2])
     else:
         print(f"Unknown command: {cmd}")

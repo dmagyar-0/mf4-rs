@@ -46,11 +46,13 @@ impl MdfWriter {
                 start_pos: dt_pos,
                 record_size,
                 record_count: 0,
+                total_record_count: 0,
                 record_id_len: record_id_len as usize,
                 channels: channels.to_vec(),
                 dt_ids: vec![dt_id],
                 dt_positions: vec![dt_pos],
                 dt_sizes: Vec::new(),
+                record_buf: vec![0u8; record_size],
             },
         );
         Ok(())
@@ -86,6 +88,7 @@ impl MdfWriter {
             self.update_link(start_pos + 8, size as u64)?;
             {
                 let dt = self.open_dts.get_mut(cg_id).unwrap();
+                dt.total_record_count += record_count;
                 dt.dt_sizes.push(size as u64);
             }
             let header = BlockHeader { id: "##DT".to_string(), reserved0: 0, block_len: 24, links_nr: 0 };
@@ -107,25 +110,25 @@ impl MdfWriter {
             return Err(MdfError::BlockSerializationError("value count mismatch".into()));
         }
 
-        let mut buf = vec![0u8; dt.record_size];
+        dt.record_buf.fill(0);
         for (ch, val) in dt.channels.iter().zip(values.iter()) {
             let offset = dt.record_id_len + ch.byte_offset as usize;
             match (&ch.data_type, val) {
                 (DataType::UnsignedIntegerLE, DecodedValue::UnsignedInteger(v)) => {
                     let bytes = (*v).to_le_bytes();
                     let n = ((ch.bit_count + 7) / 8) as usize;
-                    buf[offset..offset + n].copy_from_slice(&bytes[..n]);
+                    dt.record_buf[offset..offset + n].copy_from_slice(&bytes[..n]);
                 }
                 (DataType::SignedIntegerLE, DecodedValue::SignedInteger(v)) => {
                     let bytes = (*v as i64).to_le_bytes();
                     let n = ((ch.bit_count + 7) / 8) as usize;
-                    buf[offset..offset + n].copy_from_slice(&bytes[..n]);
+                    dt.record_buf[offset..offset + n].copy_from_slice(&bytes[..n]);
                 }
                 (DataType::FloatLE, DecodedValue::Float(v)) => {
                     if ch.bit_count == 32 {
-                        buf[offset..offset + 4].copy_from_slice(&(*v as f32).to_le_bytes());
+                        dt.record_buf[offset..offset + 4].copy_from_slice(&(*v as f32).to_le_bytes());
                     } else if ch.bit_count == 64 {
-                        buf[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
+                        dt.record_buf[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
                     }
                 }
                 (DataType::ByteArray, DecodedValue::ByteArray(bytes))
@@ -133,16 +136,16 @@ impl MdfWriter {
                 | (DataType::MimeStream, DecodedValue::MimeStream(bytes)) => {
                     let n = ((ch.bit_count + 7) / 8) as usize;
                     for (i, b) in bytes.iter().take(n).enumerate() {
-                        buf[offset + i] = *b;
+                        dt.record_buf[offset + i] = *b;
                     }
                 }
                 _ => {}
             }
         }
 
-        self.file.write_all(&buf)?;
+        self.file.write_all(&dt.record_buf)?;
         dt.record_count += 1;
-        self.offset += buf.len() as u64;
+        self.offset += dt.record_buf.len() as u64;
         Ok(())
     }
 
@@ -163,7 +166,8 @@ impl MdfWriter {
         let size = 24 + dt.record_size as u64 * dt.record_count;
         self.update_link(dt.start_pos + 8, size)?;
         dt.dt_sizes.push(size);
-        self.update_block_u64(cg_id, 80, dt.record_count)?;
+        dt.total_record_count += dt.record_count;
+        self.update_block_u64(cg_id, 80, dt.total_record_count)?;
 
         if dt.dt_ids.len() > 1 {
             let dl_count = self.block_positions.keys().filter(|k| k.starts_with("dl_")).count();

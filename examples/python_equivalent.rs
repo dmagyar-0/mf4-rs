@@ -87,12 +87,14 @@ fn write_test_signals() -> Result<(), MdfError> {
     })?;
     writer.set_time_channel(&t_id)?;
 
+    let mut prev_cn = t_id.clone();
     for sig in SIG_LIST {
-        writer.add_channel(&cg, Some(&t_id), |ch| {
+        let cn_id = writer.add_channel(&cg, Some(&prev_cn), |ch| {
             ch.data_type = sig.data_type.clone();
             ch.bit_count = sig.bit_count;
             ch.name = Some(sig.name.into());
         })?;
+        prev_cn = cn_id;
     }
 
     writer.start_data_block_for_cg(&cg, 0)?;
