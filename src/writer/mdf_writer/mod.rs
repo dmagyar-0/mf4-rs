@@ -17,6 +17,8 @@ struct OpenDataBlock {
     start_pos: u64,
     record_size: usize,
     record_count: u64,
+    /// Total number of records written across all DT blocks for this group
+    total_record_count: u64,
     record_id_len: usize,
     channels: Vec<ChannelBlock>,
     dt_ids: Vec<String>,

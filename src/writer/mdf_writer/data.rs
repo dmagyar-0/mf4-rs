@@ -46,6 +46,7 @@ impl MdfWriter {
                 start_pos: dt_pos,
                 record_size,
                 record_count: 0,
+                total_record_count: 0,
                 record_id_len: record_id_len as usize,
                 channels: channels.to_vec(),
                 dt_ids: vec![dt_id],
@@ -86,6 +87,7 @@ impl MdfWriter {
             self.update_link(start_pos + 8, size as u64)?;
             {
                 let dt = self.open_dts.get_mut(cg_id).unwrap();
+                dt.total_record_count += record_count;
                 dt.dt_sizes.push(size as u64);
             }
             let header = BlockHeader { id: "##DT".to_string(), reserved0: 0, block_len: 24, links_nr: 0 };
@@ -163,7 +165,8 @@ impl MdfWriter {
         let size = 24 + dt.record_size as u64 * dt.record_count;
         self.update_link(dt.start_pos + 8, size)?;
         dt.dt_sizes.push(size);
-        self.update_block_u64(cg_id, 80, dt.record_count)?;
+        dt.total_record_count += dt.record_count;
+        self.update_block_u64(cg_id, 80, dt.total_record_count)?;
 
         if dt.dt_ids.len() > 1 {
             let dl_count = self.block_positions.keys().filter(|k| k.starts_with("dl_")).count();
