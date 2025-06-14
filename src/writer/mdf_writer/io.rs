@@ -6,11 +6,16 @@ use std::io::{Seek, SeekFrom, Write, BufWriter};
 use byteorder::{LittleEndian, WriteBytesExt};
 
 impl MdfWriter {
-    /// Creates a new MdfWriter for the given file path (overwrites existing).
+    /// Creates a new `MdfWriter` for the given file path (overwrites existing).
     /// Initializes with an empty block position tracker.
     pub fn new(path: &str) -> Result<Self, MdfError> {
+        Self::new_with_capacity(path, 8192)
+    }
+
+    /// Creates a new `MdfWriter` with a custom internal buffer size.
+    pub fn new_with_capacity(path: &str, capacity: usize) -> Result<Self, MdfError> {
         let file = File::create(path)?;
-        let file = BufWriter::new(file);
+        let file = BufWriter::with_capacity(capacity, file);
         Ok(MdfWriter {
             file,
             offset: 0,
