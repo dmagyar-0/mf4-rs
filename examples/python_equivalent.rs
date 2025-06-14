@@ -45,7 +45,7 @@ fn read_test_signal(fname: &str, signame: &str) -> Result<(), MdfError> {
 
 fn write_test() -> Result<(), MdfError> {
     println!("Writing test mdf4...");
-    let mut writer = MdfWriter::new("asammdf_test.mf4")?;
+    let mut writer = MdfWriter::new_with_capacity("asammdf_test.mf4", 4 * 1024 * 1024)?;
     writer.init_mdf_file()?;
     let cg = writer.add_channel_group(None, |_| {})?;
     let t_id = writer.add_channel(&cg, None, |ch| {
@@ -77,7 +77,8 @@ fn write_test() -> Result<(), MdfError> {
 
 
 fn write_test_signals() -> Result<(), MdfError> {
-    let mut writer = MdfWriter::new("asammdf_write_test_signals.tmp.mf4")?;
+    let mut writer =
+        MdfWriter::new_with_capacity("asammdf_write_test_signals.tmp.mf4", 4 * 1024 * 1024)?;
     writer.init_mdf_file()?;
     let cg = writer.add_channel_group(None, |_| {})?;
     let t_id = writer.add_channel(&cg, None, |ch| {
@@ -98,9 +99,10 @@ fn write_test_signals() -> Result<(), MdfError> {
     }
 
     writer.start_data_block_for_cg(&cg, 0)?;
+    let mut rec = Vec::with_capacity(SIG_LIST.len() + 1);
     for i in 0..NUM_SAMPLES {
         let ts = 100_000_000.0 + i as f64 * 1000.0;
-        let mut rec = Vec::with_capacity(SIG_LIST.len() + 1);
+        rec.clear();
         rec.push(DecodedValue::Float(ts));
         for s in SIG_LIST {
             match s.data_type {
@@ -121,7 +123,8 @@ fn write_test_signals() -> Result<(), MdfError> {
 }
 
 fn write_test_bytes() -> Result<(), MdfError> {
-    let mut writer = MdfWriter::new("asammdf_write_test_frame.tmp.mf4")?;
+    let mut writer =
+        MdfWriter::new_with_capacity("asammdf_write_test_frame.tmp.mf4", 4 * 1024 * 1024)?;
     writer.init_mdf_file()?;
     let cg = writer.add_channel_group(None, |_| {})?;
     let t_id = writer.add_channel(&cg, None, |ch| {
