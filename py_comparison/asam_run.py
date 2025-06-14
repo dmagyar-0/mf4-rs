@@ -57,7 +57,7 @@ def write_test_signals():
             timestamps = 100_000_000 + np.arange(10_000_000, dtype=np.single) * 1_000
             data_list.append(Signal(samples=samples, timestamps=timestamps,
                                      name=name, bit_count=bit_count))
-        mdf_file.append(data_list)
+        mdf_file.append(data_list, common_timebase=True)
         mdf_file.save('asammdf_write_test_signals.tmp.mf4')
     print("Done!")
 
