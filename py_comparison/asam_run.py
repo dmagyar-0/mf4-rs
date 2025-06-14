@@ -1,5 +1,6 @@
 from asammdf import MDF, Signal
 import numpy as np
+import pandas as pd
 import sys
 import const_sigs
 import time
@@ -46,19 +47,20 @@ def write_test():
 @timed
 def write_test_signals():
     with MDF(version='4.20') as mdf_file:
-        data_list = []
-        for sig in const_sigs.SIG_LIST:
-            name, bit_count, typ, float_val, int_val = sig
+        data_dict = {}
+        timestamps = 100_000_000 + np.arange(10_000_000, dtype=np.single) * 1_000
+        for name, bit_count, typ, float_val, int_val in const_sigs.SIG_LIST:
             if typ is int:
                 dtype = np.min_scalar_type(2 ** bit_count)
-                samples = np.full(10_000_000, int_val, dtype=dtype)
+                data_dict[name] = np.full(10_000_000, int_val, dtype=dtype)
             else:
-                samples = np.full(10_000_000, float_val, dtype=np.single)
-            timestamps = 100_000_000 + np.arange(10_000_000, dtype=np.single) * 1_000
-            data_list.append(Signal(samples=samples, timestamps=timestamps,
-                                     name=name, bit_count=bit_count))
-        # use a shared time base so all signals reside in a single channel group
-        mdf_file.append(data_list, common_timebase=True)
+                data_dict[name] = np.full(10_000_000, float_val, dtype=np.single)
+
+        df = pd.DataFrame(data_dict, index=timestamps)
+        df.index.name = 'time'
+
+        # appending a DataFrame ensures all channels share one group
+        mdf_file.append(df, comment="Example", common_timebase=True)
         mdf_file.save('asammdf_write_test_signals.tmp.mf4')
     print("Done!")
 
