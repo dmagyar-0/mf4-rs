@@ -82,4 +82,9 @@ impl<'a> Channel<'a> {
         }
         Ok(out)
     }
+
+    /// Get the channel block (for internal use)
+    pub fn block(&self) -> &ChannelBlock {
+        self.block
+    }
 }

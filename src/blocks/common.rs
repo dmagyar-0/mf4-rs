@@ -5,7 +5,7 @@ use crate::blocks::text_block::TextBlock;
 use crate::blocks::metadata_block::MetadataBlock;
 use crate::error::MdfError;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockHeader {
     pub id: String,       // 4-byte string
     pub reserved0: u32,   // 4 bytes
@@ -116,7 +116,7 @@ pub trait BlockParse<'a>: Sized {
     fn from_bytes(bytes: &'a [u8]) -> Result<Self, MdfError>;
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DataType {
     UnsignedIntegerLE,
     UnsignedIntegerBE,
