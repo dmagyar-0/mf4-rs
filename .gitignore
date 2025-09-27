@@ -23,6 +23,9 @@ target/
 # PDF
 *.pdf
 
+# json
+*.json
+
 # MF4
 #  The MF4 file format is used for storing measurement data.
 *.mf4
