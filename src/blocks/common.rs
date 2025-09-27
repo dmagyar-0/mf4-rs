@@ -72,7 +72,14 @@ impl BlockHeader {
         Ok(buffer)
     }
 
-    /// Parses the first 24 bytes according to "<4sI2Q"
+    /// Parse a block header from the first 24 bytes of `bytes`.
+    ///
+    /// # Arguments
+    /// * `bytes` - Slice containing at least 24 bytes from the MDF file.
+    ///
+    /// # Returns
+    /// A [`BlockHeader`] on success or [`MdfError::TooShortBuffer`] when the
+    /// slice is smaller than 24 bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MdfError> {
         let expected_bytes = 24;
         if bytes.len() < expected_bytes {
@@ -109,7 +116,7 @@ pub trait BlockParse<'a>: Sized {
     fn from_bytes(bytes: &'a [u8]) -> Result<Self, MdfError>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DataType {
     UnsignedIntegerLE,
     UnsignedIntegerBE,
@@ -212,8 +219,15 @@ impl DataType {
     }
 }
 
-/// Read a text or metadata block pointed to by `address` and return its string
-/// content. A zero address yields `Ok(None)`.
+/// Read a text or metadata block at `address` and return its contents.
+///
+/// # Arguments
+/// * `mmap` - The full memory mapped MDF file.
+/// * `address` - Offset of the target block; use `0` for no block.
+///
+/// # Returns
+/// The block's string contents if present or `Ok(None)` if `address` is zero or
+/// the block type is not text or metadata.
 pub fn read_string_block(mmap: &[u8], address: u64) -> Result<Option<String>, MdfError> {
     if address == 0 {
         return Ok(None);

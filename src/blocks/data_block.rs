@@ -36,6 +36,12 @@ impl<'a> BlockParse<'a> for DataBlock<'a> {
 impl<'a> DataBlock<'a> {
     /// Iterate over raw records of fixed size.
     /// If the data block contains padding at the end, it’s your caller’s responsibility to trim that.
+    ///
+    /// # Arguments
+    /// * `record_size` - Size in bytes of one record (including record ID)
+    ///
+    /// # Returns
+    /// An iterator yielding each raw record slice.
     pub fn records(&self, record_size: usize) -> impl Iterator<Item = &'a [u8]> {
         self.data.chunks_exact(record_size)
     }

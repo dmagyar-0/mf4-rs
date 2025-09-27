@@ -3,7 +3,7 @@ use crate::blocks::common::DataType;
 use byteorder::{LittleEndian, BigEndian, ByteOrder};
 
 /// An enum representing the decoded value of a channel sample.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DecodedValue {
     UnsignedInteger(u64),
     SignedInteger(i64),
@@ -41,7 +41,7 @@ pub fn decode_channel_value(
     let bit_offset = channel.bit_offset as usize;
     let bit_count = channel.bit_count as usize;
 
-    let slice: &[u8] = if channel.channel_type == 1 {
+    let slice: &[u8] = if channel.channel_type == 1 && channel.data != 0 {
         // VLSD: the entire record *is* the payload
         record
     } else {

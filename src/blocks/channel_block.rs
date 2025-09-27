@@ -93,51 +93,6 @@ impl BlockParse<'_> for ChannelBlock {
 }
 
 impl ChannelBlock {
-    /// Returns a ChannelBlock with default values and automatically creates the header.
-    /// 
-    /// # Returns
-    /// A new ChannelBlock instance with a properly initialized header (id="##CN", block_len=160)
-    /// and all other fields set to default values.
-    pub fn default() -> Self {
-        // Create a header with the correct ID and block length
-        let header = BlockHeader {
-            id: String::from("##CN"),
-            reserved0: 0,
-            block_len: 160,
-            links_nr: 8,
-        };
-        
-        ChannelBlock {
-            header,
-            next_ch_addr: 0,
-            component_addr: 0,
-            name_addr: 0,
-            source_addr: 0,
-            conversion_addr: 0,
-            data: 0,
-            unit_addr: 0,
-            comment_addr: 0,
-            channel_type: 0,
-            sync_type: 0,
-            data_type: DataType::UnsignedIntegerLE, // Default data type
-            bit_offset: 0,
-            byte_offset: 0,
-            bit_count: 0,
-            flags: 0,
-            pos_invalidation_bit: 0,
-            precision: 0,
-            reserved1: 0,
-            attachment_nr: 0,
-            min_raw_value: 0.0,
-            max_raw_value: 0.0,
-            lower_limit: 0.0,
-            upper_limit: 0.0,
-            lower_ext_limit: 0.0,
-            upper_ext_limit: 0.0,
-            name: None,
-            conversion: None,
-        }
-    }
     
     /// Serializes the ChannelBlock to bytes according to MDF 4.1 specification.
     /// 
@@ -244,8 +199,14 @@ impl ChannelBlock {
         Ok(buffer)
     }
     
-    /// Resolves the channel name from the file data (typically the entire mmap slice)
-    /// using the `name_addr` field. This function must be explicitly called.
+    /// Load the channel name from the file using the stored `name_addr`.
+    ///
+    /// # Arguments
+    /// * `file_data` - Memory mapped bytes of the entire MDF file.
+    ///
+    /// # Returns
+    /// `Ok(())` on success or an [`MdfError`] if the referenced block is
+    /// incomplete.
     pub fn resolve_name(&mut self, file_data: &[u8]) -> Result<(), MdfError> {
         if self.name.is_none() && self.name_addr != 0 {
             let offset = self.name_addr as usize;
@@ -258,9 +219,14 @@ impl ChannelBlock {
         Ok(())
     }
 
-    /// Resolves the conversion block from the file data (typically the entire file's memory map)
-    /// using the `conversion_addr` field. If the conversion block is present and can be parsed,
-    /// it is stored in the channel's `conversion` field.
+    /// Resolve and store the conversion block pointed to by `conversion_addr`.
+    ///
+    /// # Arguments
+    /// * `bytes` - Memory mapped MDF file bytes.
+    ///
+    /// # Returns
+    /// `Ok(())` on success or an [`MdfError`] if the conversion block cannot be
+    /// read or parsed.
     pub fn resolve_conversion(&mut self, bytes: &[u8]) -> Result<(), MdfError> {
         if self.conversion.is_none() && self.conversion_addr != 0 {
             let offset = self.conversion_addr as usize;
@@ -285,8 +251,17 @@ impl ChannelBlock {
         Ok(())
     }
 
-    /// Applies the conversion directly to a DecodedValue using the associated conversion block.
-    /// If no conversion block is attached, returns the DecodedValue unchanged.
+    /// Apply the stored conversion to a decoded value.
+    ///
+    /// If no conversion block is attached the input value is returned
+    /// unchanged.
+    ///
+    /// # Arguments
+    /// * `raw` - The raw decoded value as returned by [`decode_channel_value`].
+    /// * `file_data` - Memory mapped MDF data used to resolve formulas.
+    ///
+    /// # Returns
+    /// The converted value or the original value on failure.
     pub fn apply_conversion_value(
         &self,
         raw: DecodedValue,
@@ -298,5 +273,47 @@ impl ChannelBlock {
             raw
         };
         Ok(decoded)
+    }
+}
+
+impl Default for ChannelBlock {
+    fn default() -> Self {
+        let header = BlockHeader {
+            id: String::from("##CN"),
+            reserved0: 0,
+            block_len: 160,
+            links_nr: 8,
+        };
+
+        ChannelBlock {
+            header,
+            next_ch_addr: 0,
+            component_addr: 0,
+            name_addr: 0,
+            source_addr: 0,
+            conversion_addr: 0,
+            data: 0,
+            unit_addr: 0,
+            comment_addr: 0,
+            channel_type: 0,
+            sync_type: 0,
+            data_type: DataType::UnsignedIntegerLE,
+            bit_offset: 0,
+            byte_offset: 0,
+            bit_count: 0,
+            flags: 0,
+            pos_invalidation_bit: 0,
+            precision: 0,
+            reserved1: 0,
+            attachment_nr: 0,
+            min_raw_value: 0.0,
+            max_raw_value: 0.0,
+            lower_limit: 0.0,
+            upper_limit: 0.0,
+            lower_ext_limit: 0.0,
+            upper_ext_limit: 0.0,
+            name: None,
+            conversion: None,
+        }
     }
 }

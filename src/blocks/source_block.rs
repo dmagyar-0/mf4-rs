@@ -83,8 +83,14 @@ impl BlockParse<'_> for SourceBlock {
     }
 }
 
-/// Helper to read a SourceBlock from a memory map at `address`,
-/// returning `None` if `address == 0`.
+/// Read an [`SIBLOCK`](SourceBlock) from the memory mapped file.
+///
+/// # Arguments
+/// * `mmap` - The entire MDF file mapped into memory.
+/// * `address` - File offset of the `##SI` block.
+///
+/// # Returns
+/// The parsed [`SourceBlock`] or an [`MdfError`] if decoding fails.
 pub fn read_source_block(mmap: &[u8], address: u64) -> Result<SourceBlock, MdfError> {
 
     let start = address as usize;
