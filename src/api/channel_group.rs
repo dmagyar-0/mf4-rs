@@ -69,4 +69,19 @@ impl<'a> ChannelGroup<'a> {
 
         channels
     }
+
+    /// Get the raw data group (for internal use)
+    pub fn raw_data_group(&self) -> &RawDataGroup {
+        self.raw_data_group
+    }
+
+    /// Get the raw channel group (for internal use) 
+    pub fn raw_channel_group(&self) -> &RawChannelGroup {
+        self.raw_channel_group
+    }
+
+    /// Get the memory mapped data (for internal use)
+    pub fn mmap(&self) -> &[u8] {
+        self.mmap
+    }
 }

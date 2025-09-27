@@ -8,8 +8,8 @@ pub mod blocks;
 pub mod error;
 pub mod writer;
 pub mod cut;
-
 pub mod merge;
+pub mod index;
 
 pub mod parsing {
     pub mod decoder;

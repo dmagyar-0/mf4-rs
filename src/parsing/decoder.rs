@@ -3,7 +3,7 @@ use crate::blocks::common::DataType;
 use byteorder::{LittleEndian, BigEndian, ByteOrder};
 
 /// An enum representing the decoded value of a channel sample.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DecodedValue {
     UnsignedInteger(u64),
     SignedInteger(i64),

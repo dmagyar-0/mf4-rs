@@ -3,7 +3,7 @@ use crate::blocks::common::{BlockHeader, BlockParse};
 use crate::error::MdfError;
 use super::types::ConversionType;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConversionBlock {
     pub header: BlockHeader,
 
