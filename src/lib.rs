@@ -25,3 +25,17 @@ pub mod api {
     pub mod channel_group;
     pub mod channel;
 }
+
+// Python bindings module
+#[cfg(feature = "pyo3")]
+pub mod python;
+
+// Re-export the Python module when building as an extension
+#[cfg(feature = "pyo3")]
+use pyo3::prelude::*;
+
+#[cfg(feature = "pyo3")]
+#[pymodule]
+fn mf4_rs(_py: Python, m: &PyModule) -> PyResult<()> {
+    python::mf4_rs(_py, m)
+}
