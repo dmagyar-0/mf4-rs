@@ -19,6 +19,19 @@ pub fn apply_bitfield_text(block: &ConversionBlock, value: DecodedValue, file_da
         let mask = masks[i].to_bits();
         let masked = raw & mask;
         if link_addr == 0 { continue; }
+        
+        // First try to use resolved conversions if available
+        if let Some(resolved_conversion) = block.get_resolved_conversion(i) {
+            let decoded_masked = resolved_conversion.apply_decoded(DecodedValue::UnsignedInteger(masked), &[])?;
+            if let DecodedValue::String(s) = decoded_masked {
+                // TODO: For bitfield conversions, we may need to store resolved names separately
+                // For now, just use the string without the name prefix
+                parts.push(s);
+            }
+            continue;
+        }
+        
+        // Fallback to legacy behavior if no resolved data (for backward compatibility)
         let off = link_addr as usize;
         if off + 24 > file_data.len() { continue; }
         let hdr = BlockHeader::from_bytes(&file_data[off..off+24])?;

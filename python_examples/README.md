@@ -128,6 +128,68 @@ values = index.read_channel_values_by_name("Temperature", "data.mf4")
 ranges = index.get_channel_byte_ranges(0, 1)  # group 0, channel 1
 ```
 
+### 4. Enhanced Index with Resolved Conversions
+
+**NEW!** The enhanced index system pre-resolves all conversion dependencies:
+- All text conversions, nested conversions, and formulas are resolved during index creation
+- Perfect for HTTP/remote file access scenarios
+- Zero file access needed for conversions during data reading
+- Complete self-contained index files
+
+```python
+import mf4_rs
+
+# Create enhanced index - automatically resolves all conversions
+index = mf4_rs.PyMdfIndex.from_file("data.mf4")
+
+# Check if index has resolved conversion data
+has_resolved = index.has_resolved_conversions()
+print(f"Enhanced conversions: {has_resolved}")
+
+# Get detailed conversion info
+conv_info = index.get_conversion_info(0, 1)  # group 0, channel 1
+if conv_info:
+    print(f"Conversion type: {conv_info['conversion_type']}")
+    if 'resolved_texts' in conv_info:
+        print(f"Resolved texts: {len(conv_info['resolved_texts'])}")
+
+# Advanced byte range features for HTTP optimization
+total_bytes, range_count = index.get_channel_byte_summary(0, 1)
+print(f"Channel data: {total_bytes} bytes in {range_count} ranges")
+
+# Get byte ranges for specific record ranges (perfect for HTTP partial content)
+partial_ranges = index.get_channel_byte_ranges_for_records(0, 1, 0, 10)  # first 10 records
+partial_bytes = sum(length for _, length in partial_ranges)
+savings = (1 - partial_bytes / total_bytes) * 100
+print(f"First 10 records: {partial_bytes} bytes ({savings:.1f}% bandwidth savings)")
+
+# Fast channel lookups
+channel_info = index.get_channel_info_by_name("Temperature")
+if channel_info:
+    group_idx, channel_idx, info = channel_info
+    print(f"Temperature: Group {group_idx}, Channel {channel_idx}, {info.bit_count} bits")
+
+# Find all channels with same name across groups
+all_matches = index.find_all_channels_by_name("Temperature")
+print(f"All Temperature channels: {all_matches}")
+```
+
+### 5. simple_enhanced_index.py - Quick Start Example
+
+A concise example showing the most important enhanced index features:
+- Automatic conversion resolution
+- HTTP-optimized byte range calculations
+- Name-based channel access
+- File size comparison
+
+### 6. enhanced_index_python_example.py - Comprehensive Demo
+
+A complete demonstration including:
+- Performance comparisons with direct MDF reading
+- HTTP range request simulation
+- Advanced search and lookup features
+- Detailed analysis of conversion resolution
+
 ## Key Features
 
 ### Data Types
@@ -175,14 +237,19 @@ This pattern is required by the MDF 4.1 specification and ensures all channels a
 - Use `write_records()` (when available) instead of multiple `write_record()` calls
 - The underlying Rust library uses memory-mapped files for efficient large file handling
 
-## Indexing Use Cases
+## Enhanced Indexing Use Cases
 
-The indexing system is particularly useful for:
+The enhanced indexing system is particularly useful for:
+- **HTTP/Remote File Access**: Pre-resolved conversions eliminate additional file requests
+- **Cloud Storage Optimization**: Precise byte ranges minimize bandwidth usage
 - **Fast channel browsing** without loading entire files
-- **Selective data extraction** for specific channels
-- **Metadata caching** for large file collections  
-- **Remote file analysis** by transferring only small index files
+- **Selective data extraction** for specific channels with bandwidth savings up to 90%
+- **Metadata caching** for large file collections with full conversion support
+- **Remote file analysis** by transferring only small self-contained index files
 - **Memory-efficient processing** of specific record ranges
+- **Text conversion support** without file access (ValueToText, RangeToText, etc.)
+- **Nested conversion chains** fully resolved and stored in index
+- **Microservice architectures** where index and data access are separated
 
 ## Compatibility
 

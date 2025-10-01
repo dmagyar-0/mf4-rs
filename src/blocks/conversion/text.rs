@@ -26,6 +26,17 @@ pub fn find_range_to_text_index(cc_val: &[f64], raw: f64, inclusive_upper: bool)
 pub fn apply_value_to_text(block: &ConversionBlock, value: DecodedValue, file_data: &[u8]) -> Result<DecodedValue, MdfError> {
     let raw = match extract_numeric(&value) { Some(x) => x, None => return Ok(value) };
     let idx = block.cc_val.iter().position(|&k| k == raw).unwrap_or(block.cc_val.len());
+    
+    // First try to use resolved data if available
+    if let Some(resolved_text) = block.get_resolved_text(idx) {
+        return Ok(DecodedValue::String(resolved_text.clone()));
+    }
+    
+    if let Some(resolved_conversion) = block.get_resolved_conversion(idx) {
+        return resolved_conversion.apply_decoded(value, &[]); // Use empty file_data for resolved conversions
+    }
+    
+    // Fallback to legacy behavior if no resolved data (for backward compatibility)
     let link = *block.cc_ref.get(idx).unwrap_or(&0);
     if link == 0 { return Ok(DecodedValue::Unknown); }
     let off = link as usize;
@@ -49,6 +60,17 @@ pub fn apply_range_to_text(block: &ConversionBlock, value: DecodedValue, file_da
     let raw = match extract_numeric(&value) { Some(x) => x, None => return Ok(value) };
     let inclusive_upper = matches!(value, DecodedValue::UnsignedInteger(_) | DecodedValue::SignedInteger(_));
     let idx = find_range_to_text_index(&block.cc_val, raw, inclusive_upper);
+    
+    // First try to use resolved data if available
+    if let Some(resolved_text) = block.get_resolved_text(idx) {
+        return Ok(DecodedValue::String(resolved_text.clone()));
+    }
+    
+    if let Some(resolved_conversion) = block.get_resolved_conversion(idx) {
+        return resolved_conversion.apply_decoded(value, &[]); // Use empty file_data for resolved conversions
+    }
+    
+    // Fallback to legacy behavior if no resolved data (for backward compatibility)
     let link = *block.cc_ref.get(idx).unwrap_or(&0);
     if link == 0 { return Ok(DecodedValue::Unknown); }
     let off = link as usize;
@@ -71,6 +93,27 @@ pub fn apply_range_to_text(block: &ConversionBlock, value: DecodedValue, file_da
 pub fn apply_text_to_value(block: &ConversionBlock, value: DecodedValue, file_data: &[u8]) -> Result<DecodedValue, MdfError> {
     let input = match value { DecodedValue::String(s) => s, other => return Ok(other) };
     let n = block.cc_ref.len();
+    
+    // First try to use resolved data if available
+    if let Some(resolved_texts) = &block.resolved_texts {
+        for (i, resolved_text) in resolved_texts.iter() {
+            if *i < n && input == *resolved_text {
+                if *i < block.cc_val.len() {
+                    return Ok(DecodedValue::Float(block.cc_val[*i]));
+                } else {
+                    return Ok(DecodedValue::Unknown);
+                }
+            }
+        }
+        // If we have resolved texts but no match found, return default or unknown
+        if block.cc_val.len() > n {
+            return Ok(DecodedValue::Float(block.cc_val[n]));
+        } else {
+            return Ok(DecodedValue::Unknown);
+        }
+    }
+    
+    // Fallback to legacy behavior if no resolved data (for backward compatibility)
     for i in 0..n {
         let link = block.cc_ref[i];
         if link == 0 { continue; }
@@ -94,6 +137,33 @@ pub fn apply_text_to_value(block: &ConversionBlock, value: DecodedValue, file_da
 pub fn apply_text_to_text(block: &ConversionBlock, value: DecodedValue, file_data: &[u8]) -> Result<DecodedValue, MdfError> {
     let input = match value { DecodedValue::String(s) => s, other => return Ok(other) };
     let pairs = block.cc_ref.len().saturating_sub(1) / 2;
+    
+    // First try to use resolved data if available
+    if let Some(resolved_texts) = &block.resolved_texts {
+        for i in 0..pairs {
+            let key_idx = 2 * i;
+            let output_idx = 2 * i + 1;
+            
+            if let Some(key_str) = resolved_texts.get(&key_idx) {
+                if *key_str == input {
+                    return if let Some(output_str) = resolved_texts.get(&output_idx) {
+                        Ok(DecodedValue::String(output_str.clone()))
+                    } else {
+                        Ok(DecodedValue::String(input))
+                    };
+                }
+            }
+        }
+        // Default case with resolved texts
+        let default_idx = 2 * pairs;
+        if let Some(default_str) = resolved_texts.get(&default_idx) {
+            return Ok(DecodedValue::String(default_str.clone()));
+        } else {
+            return Ok(DecodedValue::String(input));
+        }
+    }
+    
+    // Fallback to legacy behavior if no resolved data (for backward compatibility)
     for i in 0..pairs {
         let key_link = block.cc_ref[2*i];
         let output_link = block.cc_ref[2*i + 1];

@@ -170,10 +170,24 @@ impl MdfIndex {
 
         for group in mdf.channel_groups() {
             let mut indexed_channels = Vec::new();
+            let mmap = group.mmap(); // Get memory mapped file data for resolving conversions
             
             // Index each channel in the group
             for channel in group.channels() {
                 let block = channel.block();
+                
+                // Clone and resolve conversion dependencies if present
+                let resolved_conversion = if let Some(mut conversion) = block.conversion.clone() {
+                    // Resolve all dependencies for this conversion block
+                    if let Err(e) = conversion.resolve_all_dependencies(mmap) {
+                        eprintln!("Warning: Failed to resolve conversion dependencies for channel '{}': {}", 
+                                 block.name.as_deref().unwrap_or("<unnamed>"), e);
+                    }
+                    Some(conversion)
+                } else {
+                    None
+                };
+                
                 let indexed_channel = IndexedChannel {
                     name: channel.name()?,
                     unit: channel.unit()?,
@@ -182,7 +196,7 @@ impl MdfIndex {
                     bit_offset: block.bit_offset,
                     bit_count: block.bit_count,
                     channel_type: block.channel_type,
-                    conversion: block.conversion.clone(),
+                    conversion: resolved_conversion,
                     vlsd_data_address: if block.channel_type == 1 && block.data != 0 {
                         Some(block.data)
                     } else {

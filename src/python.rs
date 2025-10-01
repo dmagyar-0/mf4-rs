@@ -581,6 +581,101 @@ impl PyMdfIndex {
     fn get_channel_byte_ranges(&self, group_index: usize, channel_index: usize) -> PyResult<Vec<(u64, u64)>> {
         Ok(self.index.get_channel_byte_ranges(group_index, channel_index)?)
     }
+    
+    /// Get byte ranges for a specific record range of a channel
+    fn get_channel_byte_ranges_for_records(&self, group_index: usize, channel_index: usize, start_record: u64, record_count: u64) -> PyResult<Vec<(u64, u64)>> {
+        Ok(self.index.get_channel_byte_ranges_for_records(group_index, channel_index, start_record, record_count)?)
+    }
+    
+    /// Get byte range summary for a channel (total bytes, number of ranges)
+    fn get_channel_byte_summary(&self, group_index: usize, channel_index: usize) -> PyResult<(u64, usize)> {
+        Ok(self.index.get_channel_byte_summary(group_index, channel_index)?)
+    }
+    
+    /// Get byte ranges for a channel by name
+    fn get_channel_byte_ranges_by_name(&self, channel_name: &str) -> PyResult<Vec<(u64, u64)>> {
+        Ok(self.index.get_channel_byte_ranges_by_name(channel_name)?)
+    }
+    
+    /// Get channel info by name (returns group_index, channel_index, and channel info)
+    fn get_channel_info_by_name(&self, channel_name: &str) -> Option<(usize, usize, PyChannelInfo)> {
+        self.index.get_channel_info_by_name(channel_name).map(|(group_idx, channel_idx, channel)| {
+            let info = PyChannelInfo {
+                name: channel.name.clone(),
+                unit: channel.unit.clone(),
+                comment: None, // IndexedChannel doesn't store comment
+                data_type: PyDataType::from(&channel.data_type),
+                bit_count: channel.bit_count,
+            };
+            (group_idx, channel_idx, info)
+        })
+    }
+    
+    /// Find all channels with a given name across all groups
+    fn find_all_channels_by_name(&self, channel_name: &str) -> Vec<(usize, usize)> {
+        self.index.find_all_channels_by_name(channel_name)
+    }
+    
+    /// Get file size from the index
+    fn get_file_size(&self) -> u64 {
+        self.index.file_size
+    }
+    
+    /// Check if the index has resolved conversion data (enhanced index)
+    fn has_resolved_conversions(&self) -> bool {
+        // Check if any channel has resolved conversion data
+        for group in &self.index.channel_groups {
+            for channel in &group.channels {
+                if let Some(conversion) = &channel.conversion {
+                    if conversion.resolved_texts.is_some() || conversion.resolved_conversions.is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    
+    /// Get conversion info for a specific channel
+    fn get_conversion_info(&self, group_index: usize, channel_index: usize) -> PyResult<Option<HashMap<String, PyObject>>> {
+        use pyo3::Python;
+        
+        let group = self.index.channel_groups.get(group_index)
+            .ok_or_else(|| MdfException::new_err("Invalid group index"))?;
+        
+        let channel = group.channels.get(channel_index)
+            .ok_or_else(|| MdfException::new_err("Invalid channel index"))?;
+        
+        if let Some(conversion) = &channel.conversion {
+            Python::with_gil(|py| {
+                let mut info = HashMap::new();
+                
+                info.insert("conversion_type".to_string(), format!("{:?}", conversion.cc_type).to_object(py));
+                info.insert("precision".to_string(), conversion.cc_precision.to_object(py));
+                info.insert("flags".to_string(), conversion.cc_flags.to_object(py));
+                info.insert("values_count".to_string(), conversion.cc_val_count.to_object(py));
+                info.insert("values".to_string(), conversion.cc_val.to_object(py));
+                
+                // Include resolved data info if available
+                if let Some(resolved_texts) = &conversion.resolved_texts {
+                    let texts: HashMap<usize, String> = resolved_texts.clone();
+                    info.insert("resolved_texts".to_string(), texts.to_object(py));
+                }
+                
+                if let Some(_) = &conversion.resolved_conversions {
+                    info.insert("has_resolved_conversions".to_string(), true.to_object(py));
+                }
+                
+                if let Some(formula) = &conversion.formula {
+                    info.insert("formula".to_string(), formula.to_object(py));
+                }
+                
+                Ok(Some(info))
+            })
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 // Helper functions
