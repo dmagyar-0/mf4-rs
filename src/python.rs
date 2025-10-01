@@ -6,7 +6,7 @@
 //! - Creating and using indexes
 
 use pyo3::prelude::*;
-use pyo3::{exceptions::PyException, types::PyList, wrap_pyfunction};
+use pyo3::{create_exception, wrap_pyfunction};
 use std::collections::HashMap;
 
 use crate::api::mdf::MDF;
@@ -17,7 +17,7 @@ use crate::parsing::decoder::DecodedValue;
 use crate::error::MdfError;
 
 // Custom exception for MDF errors
-create_exception!(mf4_rs, MdfException, PyException);
+create_exception!(mf4_rs, MdfException, pyo3::exceptions::PyException);
 
 // Convert Rust MdfError to Python exception
 impl From<MdfError> for PyErr {
@@ -110,7 +110,7 @@ pub enum PyDecodedValue {
     SignedInteger { value: i64 },
     String { value: String },
     ByteArray { value: Vec<u8> },
-    Unknown,
+    Unknown { },
 }
 
 #[pymethods]
@@ -122,7 +122,7 @@ impl PyDecodedValue {
             PyDecodedValue::SignedInteger { value } => format!("{}", value),
             PyDecodedValue::String { value } => value.clone(),
             PyDecodedValue::ByteArray { value } => format!("bytes[{}]", value.len()),
-            PyDecodedValue::Unknown => "Unknown".to_string(),
+            PyDecodedValue::Unknown { } => "Unknown".to_string(),
         }
     }
     
@@ -133,7 +133,7 @@ impl PyDecodedValue {
             PyDecodedValue::SignedInteger { value } => format!("SignedInteger({})", value),
             PyDecodedValue::String { value } => format!("String('{}')", value),
             PyDecodedValue::ByteArray { value } => format!("ByteArray({})", value.len()),
-            PyDecodedValue::Unknown => "Unknown".to_string(),
+            PyDecodedValue::Unknown { } => "Unknown".to_string(),
         }
     }
     
@@ -145,7 +145,7 @@ impl PyDecodedValue {
             PyDecodedValue::SignedInteger { value } => value.to_object(py),
             PyDecodedValue::String { value } => value.to_object(py),
             PyDecodedValue::ByteArray { value } => value.to_object(py),
-            PyDecodedValue::Unknown => py.None(),
+            PyDecodedValue::Unknown { } => py.None(),
         }
     }
 }
@@ -158,7 +158,9 @@ impl From<DecodedValue> for PyDecodedValue {
             DecodedValue::SignedInteger(v) => PyDecodedValue::SignedInteger { value: v },
             DecodedValue::String(v) => PyDecodedValue::String { value: v },
             DecodedValue::ByteArray(v) => PyDecodedValue::ByteArray { value: v },
-            DecodedValue::Unknown => PyDecodedValue::Unknown,
+            DecodedValue::MimeSample(v) => PyDecodedValue::ByteArray { value: v },
+            DecodedValue::MimeStream(v) => PyDecodedValue::ByteArray { value: v },
+            DecodedValue::Unknown => PyDecodedValue::Unknown { },
         }
     }
 }
@@ -171,7 +173,7 @@ impl From<PyDecodedValue> for DecodedValue {
             PyDecodedValue::SignedInteger { value } => DecodedValue::SignedInteger(value),
             PyDecodedValue::String { value } => DecodedValue::String(value),
             PyDecodedValue::ByteArray { value } => DecodedValue::ByteArray(value),
-            PyDecodedValue::Unknown => DecodedValue::Unknown,
+            PyDecodedValue::Unknown { } => DecodedValue::Unknown,
         }
     }
 }
@@ -289,7 +291,7 @@ impl PyMDF {
     
     /// Get channels for a specific group by index
     fn get_channels_for_group(&self, group_index: usize) -> PyResult<Vec<PyChannelInfo>> {
-        let groups: Vec<_> = self.mdf.channel_groups().collect();
+        let groups: Vec<_> = self.mdf.channel_groups().into_iter().collect();
         if let Some(group) = groups.get(group_index) {
             let mut channels = Vec::new();
             
@@ -341,11 +343,13 @@ impl PyMDF {
 }
 
 // Python wrapper for MdfWriter
-#[pyclass]
+#[pyclass(unsendable)]
 pub struct PyMdfWriter {
     writer: Option<MdfWriter>,
     channel_groups: HashMap<String, String>, // Maps Python ID to Rust ID
     channels: HashMap<String, String>,       // Maps Python ID to Rust ID
+    // Track the last channel added for each channel group (for automatic linking)
+    last_channels: HashMap<String, String>,   // Maps channel group ID to last channel ID
     next_id: usize,
 }
 
@@ -359,6 +363,7 @@ impl PyMdfWriter {
             writer: Some(writer),
             channel_groups: HashMap::new(),
             channels: HashMap::new(),
+            last_channels: HashMap::new(),
             next_id: 0,
         })
     }
@@ -390,38 +395,60 @@ impl PyMdfWriter {
         }
     }
     
-    /// Add a channel to a channel group
+    /// Add a channel to a channel group with automatic linking and bit count
     fn add_channel(&mut self, 
                    group_id: &str, 
-                   name: Option<String>,
-                   data_type: PyDataType,
-                   bit_count: u32,
-                   master_channel_id: Option<String>) -> PyResult<String> {
+                   name: &str,
+                   data_type: PyDataType) -> PyResult<String> {
         if let Some(ref mut writer) = self.writer {
             let cg_id = self.channel_groups.get(group_id)
                 .ok_or_else(|| MdfException::new_err("Channel group not found"))?;
             
-            let master_id = if let Some(master_py_id) = master_channel_id {
-                self.channels.get(&master_py_id).cloned()
-            } else {
-                None
-            };
+            // Automatic linking: link to the previous channel in this group
+            let prev_channel_id = self.last_channels.get(group_id)
+                .and_then(|py_id| self.channels.get(py_id))
+                .cloned();
             
             let rust_data_type = DataType::from(data_type);
-            let ch_id = writer.add_channel(cg_id, master_id.as_ref(), |ch| {
-                ch.data_type = rust_data_type;
-                ch.name = name;
-                ch.bit_count = bit_count;
+            let ch_id = writer.add_channel(cg_id, prev_channel_id.as_ref().map(|s| s.as_str()), |ch| {
+                ch.data_type = rust_data_type.clone();
+                ch.name = Some(name.to_string());
+                // Automatic bit count from data type
+                ch.bit_count = rust_data_type.default_bits();
             })?;
             
             let py_id = format!("ch_{}", self.next_id);
             self.next_id += 1;
             self.channels.insert(py_id.clone(), ch_id);
             
+            // Update the last channel for this group
+            self.last_channels.insert(group_id.to_string(), py_id.clone());
+            
             Ok(py_id)
         } else {
             Err(MdfException::new_err("Writer has been finalized"))
         }
+    }
+    
+    /// Add a time channel (float64, commonly used as master channel)
+    fn add_time_channel(&mut self, group_id: &str, name: &str) -> PyResult<String> {
+        let float_type = PyDataType { name: "FloatLE".to_string(), value: 4 };
+        let ch_id = self.add_channel(group_id, name, float_type)?;
+        // Automatically set as time/master channel
+        self.set_time_channel(&ch_id)?;
+        Ok(ch_id)
+    }
+    
+    /// Add a float data channel
+    fn add_float_channel(&mut self, group_id: &str, name: &str) -> PyResult<String> {
+        let float_type = PyDataType { name: "FloatLE".to_string(), value: 4 };
+        self.add_channel(group_id, name, float_type)
+    }
+    
+    /// Add an integer data channel
+    fn add_int_channel(&mut self, group_id: &str, name: &str) -> PyResult<String> {
+        let uint_type = PyDataType { name: "UnsignedIntegerLE".to_string(), value: 0 };
+        self.add_channel(group_id, name, uint_type)
     }
     
     /// Set a channel as time/master channel
@@ -598,10 +625,9 @@ fn create_data_type_string_utf8() -> PyDataType {
     PyDataType { name: "StringUtf8".to_string(), value: 7 }
 }
 
-/// The main Python module
-#[pymodule]
-fn mf4_rs(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add("MdfException", _py.get_type::<MdfException>())?;
+/// The main Python module initialization function
+pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("MdfException", m.py().get_type_bound::<MdfException>())?;
     
     // Classes
     m.add_class::<PyMDF>()?;

@@ -36,6 +36,6 @@ use pyo3::prelude::*;
 
 #[cfg(feature = "pyo3")]
 #[pymodule]
-fn mf4_rs(_py: Python, m: &PyModule) -> PyResult<()> {
-    python::mf4_rs(_py, m)
+fn mf4_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    python::init_mf4_rs_module(m)
 }

@@ -2,11 +2,17 @@
 """
 Example: Writing MDF files with mf4-rs Python bindings
 
-This example demonstrates how to:
+This example demonstrates the new simplified API:
 1. Create a new MDF writer
-2. Add channel groups and channels
+2. Add channel groups and channels (automatic linking & bit counts)
 3. Write data records
 4. Finalize the file
+
+Features of the new API:
+- Automatic sequential channel linking (no manual master_channel_id)
+- Automatic bit count selection based on data type
+- Convenience methods (add_time_channel, add_float_channel, add_int_channel)
+- Automatic time/master channel setup
 """
 
 import mf4_rs
@@ -26,42 +32,18 @@ def main():
         group_id = writer.add_channel_group("Test Group")
         print(f"Added channel group: {group_id}")
         
-        # Create data types for channels
-        float_type = mf4_rs.create_data_type_float_le()
-        uint_type = mf4_rs.create_data_type_uint_le()
+        # Use the new simplified API - no manual linking or bit counts needed!
         
-        # Add a time channel (master channel)
-        time_ch_id = writer.add_channel(
-            group_id=group_id,
-            name="Time",
-            data_type=float_type,
-            bit_count=64,
-            master_channel_id=None  # No master for the time channel itself
-        )
-        print(f"Added time channel: {time_ch_id}")
+        # Add time channel (automatically sets as master channel)
+        time_ch_id = writer.add_time_channel(group_id, "Time")
+        print(f"Added time channel: {time_ch_id} (automatic: FloatLE 32-bit, master channel)")
         
-        # Set the time channel as master
-        writer.set_time_channel(time_ch_id)
-        print("Set time channel as master")
+        # Add data channels (automatically linked sequentially)
+        temp_ch_id = writer.add_float_channel(group_id, "Temperature")
+        print(f"Added temperature channel: {temp_ch_id} (automatic: FloatLE 32-bit, linked)")
         
-        # Add data channels with the time channel as master
-        temp_ch_id = writer.add_channel(
-            group_id=group_id,
-            name="Temperature",
-            data_type=float_type,
-            bit_count=32,
-            master_channel_id=time_ch_id
-        )
-        print(f"Added temperature channel: {temp_ch_id}")
-        
-        speed_ch_id = writer.add_channel(
-            group_id=group_id,
-            name="Speed",
-            data_type=uint_type,
-            bit_count=32,
-            master_channel_id=time_ch_id
-        )
-        print(f"Added speed channel: {speed_ch_id}")
+        speed_ch_id = writer.add_int_channel(group_id, "Speed")
+        print(f"Added speed channel: {speed_ch_id} (automatic: UnsignedIntegerLE 32-bit, linked)")
         
         # Start data block
         writer.start_data_block(group_id)
