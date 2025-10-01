@@ -134,6 +134,8 @@ impl MdfWriter {
             cc_phy_range_max: Some(0.0),
             cc_val: vals,
             formula: None,
+            resolved_texts: None,
+            resolved_conversions: None,
         };
         let cc_bytes = block.to_bytes()?;
         let pos = self.write_block_with_id(&cc_bytes, &cc_id)?;

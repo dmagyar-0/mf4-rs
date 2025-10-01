@@ -25,6 +25,15 @@ pub struct ConversionBlock {
     pub cc_val: Vec<f64>,
 
     pub formula: Option<String>,
+    
+    // Resolved data for self-contained conversions (populated during index creation)
+    /// Pre-resolved text strings for text-based conversions (ValueToText, RangeToText, etc.)
+    /// Maps cc_ref indices to their resolved text content
+    pub resolved_texts: Option<std::collections::HashMap<usize, String>>,
+    
+    /// Pre-resolved nested conversion blocks for chained conversions
+    /// Maps cc_ref indices to their resolved ConversionBlock content
+    pub resolved_conversions: Option<std::collections::HashMap<usize, Box<ConversionBlock>>>,
 }
 
 impl BlockParse<'_> for ConversionBlock {
@@ -96,6 +105,8 @@ impl BlockParse<'_> for ConversionBlock {
             cc_phy_range_max,
             cc_val,
             formula: None,
+            resolved_texts: None,
+            resolved_conversions: None,
         })
     }
 }
@@ -121,6 +132,82 @@ fn read_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, MdfError> {
 }
 
 impl ConversionBlock {
+    /// Resolve all dependencies for this conversion block to make it self-contained.
+    /// This reads referenced text blocks and nested conversions from the file data
+    /// and stores them in the resolved_texts and resolved_conversions fields.
+    ///
+    /// # Arguments
+    /// * `file_data` - Memory mapped MDF bytes used to read referenced data
+    ///
+    /// # Returns
+    /// `Ok(())` on success or an [`MdfError`] if resolution fails
+    pub fn resolve_all_dependencies(&mut self, file_data: &[u8]) -> Result<(), MdfError> {
+        use crate::blocks::common::{read_string_block, BlockHeader};
+        use std::collections::HashMap;
+        
+        // First resolve the formula if this is an algebraic conversion
+        self.resolve_formula(file_data)?;
+        
+        // Initialize resolved data containers
+        let mut resolved_texts = HashMap::new();
+        let mut resolved_conversions = HashMap::new();
+        
+        // Resolve each reference in cc_ref
+        for (i, &link_addr) in self.cc_ref.iter().enumerate() {
+            if link_addr == 0 {
+                continue; // Skip null links
+            }
+            
+            let offset = link_addr as usize;
+            if offset + 24 > file_data.len() {
+                continue; // Skip invalid offsets
+            }
+            
+            // Read the block header to determine the type
+            let header = BlockHeader::from_bytes(&file_data[offset..offset + 24])?;
+            
+            match header.id.as_str() {
+                "##TX" => {
+                    // Text block - resolve the string content
+                    if let Some(text) = read_string_block(file_data, link_addr)? {
+                        resolved_texts.insert(i, text);
+                    }
+                }
+                "##CC" => {
+                    // Nested conversion block - resolve recursively
+                    let mut nested_conversion = ConversionBlock::from_bytes(&file_data[offset..])?;
+                    nested_conversion.resolve_all_dependencies(file_data)?;
+                    resolved_conversions.insert(i, Box::new(nested_conversion));
+                }
+                _ => {
+                    // Other block types - ignore for now
+                }
+            }
+        }
+        
+        // Store resolved data if any was found
+        if !resolved_texts.is_empty() {
+            self.resolved_texts = Some(resolved_texts);
+        }
+        if !resolved_conversions.is_empty() {
+            self.resolved_conversions = Some(resolved_conversions);
+        }
+        
+        Ok(())
+    }
+    
+    /// Get a resolved text string for a given cc_ref index.
+    /// Returns the text if it was resolved during dependency resolution.
+    pub fn get_resolved_text(&self, ref_index: usize) -> Option<&String> {
+        self.resolved_texts.as_ref()?.get(&ref_index)
+    }
+    
+    /// Get a resolved nested conversion for a given cc_ref index.
+    /// Returns the conversion block if it was resolved during dependency resolution.
+    pub fn get_resolved_conversion(&self, ref_index: usize) -> Option<&ConversionBlock> {
+        self.resolved_conversions.as_ref()?.get(&ref_index).map(|boxed| boxed.as_ref())
+    }
+
     /// Serialize this conversion block back to bytes.
     ///
     /// # Returns
