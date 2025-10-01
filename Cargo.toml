@@ -22,3 +22,16 @@ pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 [features]
 default = []
 pyo3 = ["dep:pyo3"]
+
+# Benchmark examples
+[[example]]
+name = "data_generator"
+path = "benchmarks/rust/data_generator.rs"
+
+[[example]]
+name = "rust_performance_benchmark"
+path = "benchmarks/rust/rust_performance_benchmark.rs"
+
+[[example]]
+name = "index_reading_benchmark"
+path = "benchmarks/rust/index_reading_benchmark.rs"

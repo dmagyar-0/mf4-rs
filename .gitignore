@@ -51,6 +51,14 @@ asammdf_*.mf4
 *_index.json
 *_test.json
 
+# Benchmark Data
+# Generated test data and results (optional - remove if you want to commit test data)
+benchmarks/data/*.mf4
+benchmarks/data/*.json
+benchmarks/results/latest/
+benchmarks/results/history/
+benchmarks/results/reports/
+
 # Documentation PDFs
 *.pdf
 
