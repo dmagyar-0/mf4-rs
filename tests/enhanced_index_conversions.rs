@@ -71,7 +71,7 @@ fn test_enhanced_index_with_text_conversions() -> Result<(), MdfError> {
     // Verify the actual values match
     for (i, (expected_status, actual_value)) in status_values.iter().zip(status_values_via_index.iter()).enumerate() {
         match actual_value {
-            DecodedValue::UnsignedInteger(actual_status) => {
+            Some(DecodedValue::UnsignedInteger(actual_status)) => {
                 assert_eq!(*actual_status, *expected_status, "Status value mismatch at record {}", i);
             }
             _ => panic!("Expected UnsignedInteger value for status channel at record {}", i),
@@ -95,7 +95,7 @@ fn test_enhanced_index_with_text_conversions() -> Result<(), MdfError> {
     assert_eq!(status_by_name.len(), status_values.len());
     
     for (i, (expected, actual)) in status_values.iter().zip(status_by_name.iter()).enumerate() {
-        if let DecodedValue::UnsignedInteger(actual_val) = actual {
+        if let Some(DecodedValue::UnsignedInteger(actual_val)) = actual {
             assert_eq!(*actual_val, *expected, "Named access value mismatch at record {}", i);
         } else {
             panic!("Expected UnsignedInteger for named access at record {}", i);
@@ -256,6 +256,8 @@ fn test_index_serialization_with_resolved_data() -> Result<(), MdfError> {
         bit_offset: 0,
         bit_count: 32,
         channel_type: 0,
+        flags: 0,
+        pos_invalidation_bit: 0,
         conversion: Some(conversion),
         vlsd_data_address: None,
     };

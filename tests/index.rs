@@ -93,13 +93,13 @@ fn test_index_roundtrip() -> Result<(), MdfError> {
     
     // Verify the actual values
     for (i, (expected_time, expected_value)) in test_values.iter().enumerate() {
-        if let DecodedValue::Float(actual_time) = time_values[i] {
+        if let Some(DecodedValue::Float(actual_time)) = time_values[i] {
             assert!((actual_time - expected_time).abs() < 1e-10);
         } else {
             panic!("Expected Float value for time channel");
         }
         
-        if let DecodedValue::UnsignedInteger(actual_value) = value_values[i] {
+        if let Some(DecodedValue::UnsignedInteger(actual_value)) = value_values[i] {
             assert_eq!(actual_value, *expected_value);
         } else {
             panic!("Expected UnsignedInteger value for value channel");
@@ -159,7 +159,7 @@ fn test_index_vs_direct_read() -> Result<(), MdfError> {
     for i in 0..test_data.len() {
         assert_eq!(direct_values[i], indexed_values[i]);
         
-        if let DecodedValue::UnsignedInteger(value) = indexed_values[i] {
+        if let Some(DecodedValue::UnsignedInteger(value)) = indexed_values[i] {
             assert_eq!(value, test_data[i]);
         } else {
             panic!("Expected UnsignedInteger");
@@ -332,13 +332,13 @@ fn test_byte_ranges_accuracy() -> Result<(), MdfError> {
     
     // Verify the values are what we expect
     assert_eq!(direct_values.len(), 2);
-    if let DecodedValue::UnsignedInteger(val) = direct_values[0] {
+    if let Some(DecodedValue::UnsignedInteger(val)) = direct_values[0] {
         assert_eq!(val, 0x12345678);
     } else {
         panic!("Expected UnsignedInteger");
     }
     
-    if let DecodedValue::UnsignedInteger(val) = direct_values[1] {
+    if let Some(DecodedValue::UnsignedInteger(val)) = direct_values[1] {
         assert_eq!(val, 0xABCDEF00);
     } else {
         panic!("Expected UnsignedInteger");
@@ -418,7 +418,7 @@ fn test_name_based_lookup() -> Result<(), MdfError> {
     let mut reader = FileRangeReader::new(mdf_path.to_str().unwrap())?;
     let temp_values = index.read_channel_values_by_name("Temperature", &mut reader)?;
     assert_eq!(temp_values.len(), 1);
-    if let DecodedValue::Float(temp) = temp_values[0] {
+    if let Some(DecodedValue::Float(temp)) = temp_values[0] {
         assert!((temp - 25.5).abs() < 0.001);
     } else {
         panic!("Expected Float value");
@@ -426,7 +426,7 @@ fn test_name_based_lookup() -> Result<(), MdfError> {
     
     let speed_values = index.read_channel_values_by_name("Speed", &mut reader)?;
     assert_eq!(speed_values.len(), 1);
-    if let DecodedValue::UnsignedInteger(speed) = speed_values[0] {
+    if let Some(DecodedValue::UnsignedInteger(speed)) = speed_values[0] {
         assert_eq!(speed, 120);
     } else {
         panic!("Expected UnsignedInteger value");
