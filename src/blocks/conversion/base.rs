@@ -69,14 +69,22 @@ impl BlockParse<'_> for ConversionBlock {
         let cc_val_count = LittleEndian::read_u16(&bytes[offset..offset + 2]);
         offset += 2;
 
-        let cc_phy_range_min = if cc_flags & 0b10 != 0 {
+        // IMPORTANT: Some vendors (like dSPACE) always write the physical range fields
+        // even when cc_flags bit 1 is not set. We need to detect this by checking if
+        // there's enough data in the block for the range fields.
+        // Calculate expected sizes:
+        let size_without_range = 24 + (header.links_nr as usize * 8) + 8 + (cc_val_count as usize * 8);
+        let size_with_range = size_without_range + 16;
+        let has_range_data = header.block_len as usize >= size_with_range;
+        
+        let cc_phy_range_min = if has_range_data {
             let val = f64::from_bits(read_u64(bytes, &mut offset)?);
             Some(val)
         } else {
             None
         };
 
-        let cc_phy_range_max = if cc_flags & 0b10 != 0 {
+        let cc_phy_range_max = if has_range_data {
             let val = f64::from_bits(read_u64(bytes, &mut offset)?);
             Some(val)
         } else {
@@ -220,7 +228,8 @@ impl ConversionBlock {
         header.links_nr = links as u64;
 
         let mut size = 24 + links * 8 + 1 + 1 + 2 + 2 + 2;
-        if self.cc_flags & 0b10 != 0 {
+        // Include range fields if they exist (regardless of flag)
+        if self.cc_phy_range_min.is_some() || self.cc_phy_range_max.is_some() {
             size += 16;
         }
         size += self.cc_val.len() * 8;
@@ -239,7 +248,8 @@ impl ConversionBlock {
         buf.extend_from_slice(&self.cc_flags.to_le_bytes());
         buf.extend_from_slice(&(self.cc_ref_count).to_le_bytes());
         buf.extend_from_slice(&(self.cc_val_count).to_le_bytes());
-        if self.cc_flags & 0b10 != 0 {
+        // Write range fields if they exist (regardless of flag, for vendor compatibility)
+        if self.cc_phy_range_min.is_some() || self.cc_phy_range_max.is_some() {
             buf.extend_from_slice(&self.cc_phy_range_min.unwrap_or(0.0).to_le_bytes());
             buf.extend_from_slice(&self.cc_phy_range_max.unwrap_or(0.0).to_le_bytes());
         }

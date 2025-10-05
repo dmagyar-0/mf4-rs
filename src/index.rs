@@ -9,7 +9,7 @@ use crate::api::mdf::MDF;
 use crate::blocks::common::{DataType, BlockParse};
 use crate::blocks::conversion::ConversionBlock;
 use crate::error::MdfError;
-use crate::parsing::decoder::{decode_channel_value, DecodedValue};
+use crate::parsing::decoder::{decode_channel_value_with_validity, DecodedValue};
 
 /// Represents the location and metadata of data blocks in the file
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +39,10 @@ pub struct IndexedChannel {
     pub bit_count: u32,
     /// Channel type (0=data, 1=VLSD, 2=master, etc.)
     pub channel_type: u8,
+    /// Channel flags (includes invalidation bit flags)
+    pub flags: u32,
+    /// Position of invalidation bit within invalidation bytes
+    pub pos_invalidation_bit: u32,
     /// Conversion block for unit conversion (if any)
     pub conversion: Option<ConversionBlock>,
     /// For VLSD channels: address of signal data blocks
@@ -196,6 +200,8 @@ impl MdfIndex {
                     bit_offset: block.bit_offset,
                     bit_count: block.bit_count,
                     channel_type: block.channel_type,
+                    flags: block.flags,
+                    pos_invalidation_bit: block.pos_invalidation_bit,
                     conversion: resolved_conversion,
                     vlsd_data_address: if block.channel_type == 1 && block.data != 0 {
                         Some(block.data)
@@ -320,12 +326,17 @@ impl MdfIndex {
     }
 
     /// Read channel values using the index and a byte range reader
+    /// 
+    /// # Returns
+    /// A vector of `Option<DecodedValue>` where:
+    /// - `Some(value)` represents a valid decoded value
+    /// - `None` represents an invalid value (invalidation bit set or decoding failed)
     pub fn read_channel_values<R: ByteRangeReader<Error = MdfError>>(
         &self, 
         group_index: usize, 
         channel_index: usize,
         reader: &mut R
-    ) -> Result<Vec<DecodedValue>, MdfError> {
+    ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         let group = self.channel_groups.get(group_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid group index".to_string()))?;
         
@@ -347,7 +358,7 @@ impl MdfIndex {
         group: &IndexedChannelGroup,
         channel: &IndexedChannel,
         reader: &mut R,
-    ) -> Result<Vec<DecodedValue>, MdfError> {
+    ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         let record_size = group.record_id_len as usize + group.record_size as usize;
         let mut values = Vec::new();
 
@@ -396,8 +407,8 @@ impl MdfIndex {
                     bit_offset: channel.bit_offset,
                     byte_offset: channel.byte_offset,
                     bit_count: channel.bit_count,
-                    flags: 0,
-                    pos_invalidation_bit: 0,
+                    flags: channel.flags,
+                    pos_invalidation_bit: channel.pos_invalidation_bit,
                     precision: 0,
                     reserved1: 0,
                     attachment_nr: 0,
@@ -411,18 +422,28 @@ impl MdfIndex {
                     conversion: channel.conversion.clone(),
                 };
 
-                if let Some(raw_value) = decode_channel_value(
+                // Decode with validity checking
+                if let Some(decoded) = decode_channel_value_with_validity(
                     record, 
-                    group.record_id_len as usize, 
+                    group.record_id_len as usize,
+                    group.record_size,
                     &temp_channel_block
                 ) {
-                    // Apply conversion if present
-                    let final_value = if let Some(conversion) = &channel.conversion {
-                        conversion.apply_decoded(raw_value, &[])?
+                    if decoded.is_valid {
+                        // Apply conversion if present
+                        let final_value = if let Some(conversion) = &channel.conversion {
+                            conversion.apply_decoded(decoded.value, &[])?
+                        } else {
+                            decoded.value
+                        };
+                        values.push(Some(final_value));
                     } else {
-                        raw_value
-                    };
-                    values.push(final_value);
+                        // Invalid sample
+                        values.push(None);
+                    }
+                } else {
+                    // Decoding failed
+                    values.push(None);
                 }
             }
         }
@@ -436,7 +457,7 @@ impl MdfIndex {
         _group: &IndexedChannelGroup,
         _channel: &IndexedChannel,
         _reader: &mut R,
-    ) -> Result<Vec<DecodedValue>, MdfError> {
+    ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         // TODO: Implement VLSD channel reading
         Err(MdfError::BlockSerializationError(
             "VLSD channels not yet supported in index reader".to_string()
@@ -740,13 +761,13 @@ impl MdfIndex {
     /// * `reader` - Byte range reader implementation
     /// 
     /// # Returns
-    /// * `Ok(Vec<DecodedValue>)` - Channel values
+    /// * `Ok(Vec<Option<DecodedValue>>)` - Channel values (None for invalid samples)
     /// * `Err(MdfError)` - If channel not found or reading fails
     pub fn read_channel_values_by_name<R: ByteRangeReader<Error = MdfError>>(
         &self,
         channel_name: &str,
         reader: &mut R,
-    ) -> Result<Vec<DecodedValue>, MdfError> {
+    ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         let (group_index, channel_index) = self.find_channel_by_name_global(channel_name)
             .ok_or_else(|| MdfError::BlockSerializationError(
                 format!("Channel '{}' not found", channel_name)

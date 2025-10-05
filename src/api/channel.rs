@@ -1,6 +1,6 @@
 use crate::error::MdfError;
 use crate::blocks::channel_block::ChannelBlock;
-use crate::parsing::decoder::{ DecodedValue, decode_channel_value };
+use crate::parsing::decoder::{ DecodedValue, decode_channel_value_with_validity };
 use crate::parsing::raw_channel_group::RawChannelGroup;
 use crate::parsing::raw_data_group::RawDataGroup;
 use crate::parsing::raw_channel::RawChannel;
@@ -63,10 +63,16 @@ impl<'a> Channel<'a> {
 
     /// Decode and convert all samples of this channel.
     ///
+    /// This method decodes all channel values and applies conversions.
+    /// Invalid samples (as indicated by invalidation bits) are returned as `None`.
+    ///
     /// # Returns
-    /// A vector with one [`DecodedValue`] per record.
-    pub fn values(&self) -> Result<Vec<DecodedValue>, MdfError> {
+    /// A vector with one `Option<DecodedValue>` per record:
+    /// - `Some(value)` for valid samples
+    /// - `None` for invalid samples (invalidation bit set or decoding failed)
+    pub fn values(&self) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         let record_id_len = self.raw_data_group.block.record_id_len as usize;
+        let cg_data_bytes = self.raw_channel_group.block.samples_byte_nr;
         let mut out = Vec::new();
         
         let records_iter = self
@@ -75,10 +81,26 @@ impl<'a> Channel<'a> {
         
         for rec_res in records_iter {
             let ref rec = rec_res?;
-            let dv = decode_channel_value(rec, record_id_len, self.block)
-                .unwrap_or(DecodedValue::Unknown);
-            let phys = self.block.apply_conversion_value(dv, self.mmap)?;
-            out.push(phys);
+            
+            // Decode with validity checking
+            if let Some(decoded) = decode_channel_value_with_validity(
+                rec, 
+                record_id_len, 
+                cg_data_bytes,
+                self.block
+            ) {
+                if decoded.is_valid {
+                    // Value is valid, apply conversion
+                    let phys = self.block.apply_conversion_value(decoded.value, self.mmap)?;
+                    out.push(Some(phys));
+                } else {
+                    // Value is invalid according to invalidation bit
+                    out.push(None);
+                }
+            } else {
+                // Decoding failed
+                out.push(None);
+            }
         }
         Ok(out)
     }

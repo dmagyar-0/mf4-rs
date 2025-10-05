@@ -77,11 +77,11 @@ fn writer_data_roundtrip() -> Result<(), MdfError> {
     assert_eq!(vals1.len(), 1);
     assert_eq!(vals2.len(), 1);
     match &vals1[0] {
-        DecodedValue::UnsignedInteger(v) => assert_eq!(*v, 1),
+        Some(DecodedValue::UnsignedInteger(v)) => assert_eq!(*v, 1),
         other => panic!("unexpected {:?}", other),
     }
     match &vals2[0] {
-        DecodedValue::UnsignedInteger(v) => assert_eq!(*v, 2),
+        Some(DecodedValue::UnsignedInteger(v)) => assert_eq!(*v, 2),
         other => panic!("unexpected {:?}", other),
     }
 
@@ -113,8 +113,8 @@ fn writer_write_records() -> Result<(), MdfError> {
     let groups = mdf.channel_groups();
     let vals = groups[0].channels()[0].values()?;
     assert_eq!(vals.len(), 2);
-    if let DecodedValue::UnsignedInteger(v) = vals[0] { assert_eq!(v, 1); } else { panic!("wrong type") }
-    if let DecodedValue::UnsignedInteger(v) = vals[1] { assert_eq!(v, 2); } else { panic!("wrong type") }
+    if let Some(DecodedValue::UnsignedInteger(v)) = vals[0] { assert_eq!(v, 1); } else { panic!("wrong type") }
+    if let Some(DecodedValue::UnsignedInteger(v)) = vals[1] { assert_eq!(v, 2); } else { panic!("wrong type") }
 
     std::fs::remove_file(path)?;
     Ok(())
@@ -201,8 +201,8 @@ fn cut_mdf_file_by_time() -> Result<(), MdfError> {
     let vals = chs[1].values()?;
     assert_eq!(times.len(), 4);
     assert_eq!(vals.len(), 4);
-    if let DecodedValue::Float(t0) = times[0] { assert!((t0 - 0.2).abs() < 1e-6); }
-    if let DecodedValue::Float(t_last) = times[3] { assert!((t_last - 0.5).abs() < 1e-6); }
+    if let Some(DecodedValue::Float(t0)) = times[0] { assert!((t0 - 0.2).abs() < 1e-6); }
+    if let Some(DecodedValue::Float(t_last)) = times[3] { assert!((t_last - 0.5).abs() < 1e-6); }
 
     std::fs::remove_file(input)?;
     std::fs::remove_file(output)?;
