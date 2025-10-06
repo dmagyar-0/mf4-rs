@@ -147,6 +147,7 @@ fn test_conversion_dependency_resolution() -> Result<(), MdfError> {
         formula: None,
         resolved_texts: None,
         resolved_conversions: None,
+        default_conversion: None,
     };
     
     // Test resolution with empty file data (should not crash)
@@ -195,6 +196,7 @@ fn test_resolved_data_accessor_methods() -> Result<(), MdfError> {
         formula: None,
         resolved_texts: None,
         resolved_conversions: None,
+        default_conversion: None,
     };
     
     // Manually set some resolved data
@@ -242,6 +244,7 @@ fn test_index_serialization_with_resolved_data() -> Result<(), MdfError> {
         formula: None,
         resolved_texts: None,
         resolved_conversions: None,
+        default_conversion: None,
     };
     
     let mut resolved_texts = std::collections::HashMap::new();
