@@ -327,13 +327,16 @@ impl PyMDF {
     }
     
     /// Get channel values by name (first match)
-    fn get_channel_values(&self, channel_name: &str) -> PyResult<Option<Vec<PyDecodedValue>>> {
+    /// Returns a list of values where None represents invalid/missing samples
+    fn get_channel_values(&self, channel_name: &str) -> PyResult<Option<Vec<Option<PyDecodedValue>>>> {
         for group in self.mdf.channel_groups() {
             for channel in group.channels() {
                 if let Some(name) = channel.name()? {
                     if name == channel_name {
                         let values = channel.values()?;
-                        return Ok(Some(values.into_iter().map(PyDecodedValue::from).collect()));
+                        return Ok(Some(values.into_iter().map(|opt_val| {
+                            opt_val.map(PyDecodedValue::from)
+                        }).collect()));
                     }
                 }
             }
@@ -559,17 +562,23 @@ impl PyMdfIndex {
     }
     
     /// Read channel values by index
-    fn read_channel_values(&self, group_index: usize, channel_index: usize, file_path: &str) -> PyResult<Vec<PyDecodedValue>> {
+    /// Returns a list of values where None represents invalid/missing samples
+    fn read_channel_values(&self, group_index: usize, channel_index: usize, file_path: &str) -> PyResult<Vec<Option<PyDecodedValue>>> {
         let mut reader = FileRangeReader::new(file_path)?;
         let values = self.index.read_channel_values(group_index, channel_index, &mut reader)?;
-        Ok(values.into_iter().map(PyDecodedValue::from).collect())
+        Ok(values.into_iter().map(|opt_val| {
+            opt_val.map(PyDecodedValue::from)
+        }).collect())
     }
     
-    /// Read channel values by name
-    fn read_channel_values_by_name(&self, channel_name: &str, file_path: &str) -> PyResult<Vec<PyDecodedValue>> {
+    /// Read channel values by name  
+    /// Returns a list of values where None represents invalid/missing samples
+    fn read_channel_values_by_name(&self, channel_name: &str, file_path: &str) -> PyResult<Vec<Option<PyDecodedValue>>> {
         let mut reader = FileRangeReader::new(file_path)?;
         let values = self.index.read_channel_values_by_name(channel_name, &mut reader)?;
-        Ok(values.into_iter().map(PyDecodedValue::from).collect())
+        Ok(values.into_iter().map(|opt_val| {
+            opt_val.map(PyDecodedValue::from)
+        }).collect())
     }
     
     /// Find channel by name
