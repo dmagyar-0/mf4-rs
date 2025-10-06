@@ -267,6 +267,7 @@ fn test_index_serialization_with_resolved_data() -> Result<(), MdfError> {
         comment: None,
         record_id_len: 0,
         record_size: 4,
+        invalidation_bytes: 0,
         record_count: 1,
         channels: vec![indexed_channel],
         data_blocks: vec![],

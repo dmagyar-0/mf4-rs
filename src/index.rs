@@ -58,8 +58,10 @@ pub struct IndexedChannelGroup {
     pub comment: Option<String>,
     /// Size of record ID in bytes
     pub record_id_len: u8,
-    /// Total size of each record in bytes (excluding record ID)
+    /// Total size of each record in bytes (excluding record ID and invalidation bytes)
     pub record_size: u32,
+    /// Number of invalidation bytes per record
+    pub invalidation_bytes: u32,
     /// Number of records in this group
     pub record_count: u64,
     /// Channels in this group
@@ -220,6 +222,7 @@ impl MdfIndex {
                 comment: group.comment()?,
                 record_id_len: group.raw_data_group().block.record_id_len,
                 record_size: group.raw_channel_group().block.samples_byte_nr,
+                invalidation_bytes: group.raw_channel_group().block.invalidation_bytes_nr,
                 record_count: group.raw_channel_group().block.cycles_nr,
                 channels: indexed_channels,
                 data_blocks,
@@ -359,7 +362,8 @@ impl MdfIndex {
         channel: &IndexedChannel,
         reader: &mut R,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
-        let record_size = group.record_id_len as usize + group.record_size as usize;
+        // Record structure: record_id + data_bytes + invalidation_bytes
+        let record_size = group.record_id_len as usize + group.record_size as usize + group.invalidation_bytes as usize;
         let mut values = Vec::new();
 
         // Read from each data block
@@ -590,7 +594,8 @@ impl MdfIndex {
         start_record: u64,
         record_count: u64,
     ) -> Result<Vec<(u64, u64)>, MdfError> {
-        let record_size = group.record_id_len as usize + group.record_size as usize;
+        // Record structure: record_id + data_bytes + invalidation_bytes
+        let record_size = group.record_id_len as usize + group.record_size as usize + group.invalidation_bytes as usize;
         let channel_offset_in_record = group.record_id_len as usize + channel.byte_offset as usize;
         
         // Calculate how many bytes this channel needs per record
