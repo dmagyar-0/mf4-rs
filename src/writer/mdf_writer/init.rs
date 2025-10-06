@@ -136,6 +136,7 @@ impl MdfWriter {
             formula: None,
             resolved_texts: None,
             resolved_conversions: None,
+            default_conversion: None,
         };
         let cc_bytes = block.to_bytes()?;
         let pos = self.write_block_with_id(&cc_bytes, &cc_id)?;

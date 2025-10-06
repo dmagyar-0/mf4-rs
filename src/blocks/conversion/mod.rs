@@ -13,3 +13,9 @@ pub use linear::*;
 pub use table_lookup::*;
 pub use text::*;
 pub use bitfield::*;
+
+#[cfg(test)]
+mod test_deep_chains;
+
+#[cfg(test)]
+mod simple_test;

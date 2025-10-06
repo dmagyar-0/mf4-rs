@@ -24,18 +24,40 @@ pub fn apply_bitfield_text(block: &ConversionBlock, value: DecodedValue, file_da
         if let Some(resolved_conversion) = block.get_resolved_conversion(i) {
             let decoded_masked = resolved_conversion.apply_decoded(DecodedValue::UnsignedInteger(masked), &[])?;
             if let DecodedValue::String(s) = decoded_masked {
-                // TODO: For bitfield conversions, we may need to store resolved names separately
-                // For now, just use the string without the name prefix
-                parts.push(s);
+                // Try to get the name from the resolved conversion
+                let part = if let Some(name) = resolved_conversion.cc_tx_name {
+                    if let Some(name_text) = read_string_block(file_data, name)? {
+                        format!("{} = {}", name_text, s)
+                    } else {
+                        s
+                    }
+                } else {
+                    s
+                };
+                parts.push(part);
             }
             continue;
         }
         
         // Fallback to legacy behavior if no resolved data (for backward compatibility)
+        // Note: This should rarely be used now that we have deep resolution
         let off = link_addr as usize;
-        if off + 24 > file_data.len() { continue; }
+        if off + 24 > file_data.len() { 
+            // If we can't access the data, try default conversion as last resort
+            if let Some(default_conversion) = block.get_default_conversion() {
+                let decoded_masked = default_conversion.apply_decoded(DecodedValue::UnsignedInteger(masked), &[])?;
+                if let DecodedValue::String(s) = decoded_masked {
+                    parts.push(s);
+                }
+            }
+            continue; 
+        }
+        
         let hdr = BlockHeader::from_bytes(&file_data[off..off+24])?;
         if &hdr.id != "##CC" { continue; }
+        
+        // Create nested conversion but don't do deep resolution to avoid double work
+        // since this is fallback code that should rarely execute
         let mut nested = ConversionBlock::from_bytes(&file_data[off..])?;
         let _ = nested.resolve_formula(file_data);
         let decoded_masked = nested.apply_decoded(DecodedValue::UnsignedInteger(masked), file_data)?;
