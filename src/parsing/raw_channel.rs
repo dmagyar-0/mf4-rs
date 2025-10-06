@@ -136,9 +136,11 @@ impl<'a> RawChannel {
         }
 
         // Compute the size of each record:
-        let record_id_len    = data_group.block.record_id_len as usize;
-        let sample_byte_len  = channel_group.block.samples_byte_nr as usize;
-        let record_size      = record_id_len + sample_byte_len;
+        // Record structure: record_id + data_bytes + invalidation_bytes
+        let record_id_len       = data_group.block.record_id_len as usize;
+        let sample_byte_len     = channel_group.block.samples_byte_nr as usize;
+        let invalidation_bytes  = channel_group.block.invalidation_bytes_nr as usize;
+        let record_size         = record_id_len + sample_byte_len + invalidation_bytes;
 
         // Gather all DataBlock fragments (DT, DV or DZ):
         let blocks = data_group.data_blocks(mmap)?;
