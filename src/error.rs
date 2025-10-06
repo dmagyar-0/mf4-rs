@@ -33,4 +33,10 @@ pub enum MdfError {
 
     #[error("Block serialization error: {0}")]
     BlockSerializationError(String),
+
+    #[error("Conversion chain too deep: maximum depth of {max_depth} exceeded")]
+    ConversionChainTooDeep { max_depth: usize },
+
+    #[error("Conversion chain cycle detected at block address {address:#x}")]
+    ConversionChainCycle { address: u64 },
 }

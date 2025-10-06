@@ -34,6 +34,10 @@ pub struct ConversionBlock {
     /// Pre-resolved nested conversion blocks for chained conversions
     /// Maps cc_ref indices to their resolved ConversionBlock content
     pub resolved_conversions: Option<std::collections::HashMap<usize, Box<ConversionBlock>>>,
+    
+    /// Default conversion for fallback cases (similar to asammdf's "default_addr")
+    /// This is typically the last reference in cc_ref for some conversion types
+    pub default_conversion: Option<Box<ConversionBlock>>,
 }
 
 impl BlockParse<'_> for ConversionBlock {
@@ -115,6 +119,7 @@ impl BlockParse<'_> for ConversionBlock {
             formula: None,
             resolved_texts: None,
             resolved_conversions: None,
+            default_conversion: None,
         })
     }
 }
@@ -144,14 +149,55 @@ impl ConversionBlock {
     /// This reads referenced text blocks and nested conversions from the file data
     /// and stores them in the resolved_texts and resolved_conversions fields.
     ///
+    /// Supports arbitrary depth conversion chains with cycle detection.
+    ///
     /// # Arguments
     /// * `file_data` - Memory mapped MDF bytes used to read referenced data
     ///
     /// # Returns
     /// `Ok(())` on success or an [`MdfError`] if resolution fails
     pub fn resolve_all_dependencies(&mut self, file_data: &[u8]) -> Result<(), MdfError> {
+        self.resolve_all_dependencies_with_address(file_data, 0)
+    }
+    
+    /// Resolve all dependencies with a known current block address (used internally)
+    pub fn resolve_all_dependencies_with_address(&mut self, file_data: &[u8], current_address: u64) -> Result<(), MdfError> {
+        use std::collections::HashSet;
+        
+        // Start resolution with empty visited set to detect cycles
+        let mut visited = HashSet::new();
+        self.resolve_all_dependencies_recursive(file_data, 0, &mut visited, current_address)
+    }
+    
+    /// Internal recursive method for resolving conversion dependencies.
+    /// 
+    /// # Arguments
+    /// * `file_data` - Memory mapped MDF bytes used to read referenced data
+    /// * `depth` - Current recursion depth (for cycle detection)
+    /// * `visited` - Set of visited block addresses (for cycle detection)
+    /// * `current_address` - Address of the current conversion block being resolved
+    ///
+    /// # Returns
+    /// `Ok(())` on success or an [`MdfError`] if resolution fails
+    fn resolve_all_dependencies_recursive(
+        &mut self, 
+        file_data: &[u8], 
+        depth: usize, 
+        visited: &mut std::collections::HashSet<u64>,
+        current_address: u64
+    ) -> Result<(), MdfError> {
         use crate::blocks::common::{read_string_block, BlockHeader};
         use std::collections::HashMap;
+        
+        const MAX_DEPTH: usize = 20; // Reasonable depth limit
+        
+        // Prevent infinite recursion
+        if depth > MAX_DEPTH {
+            return Err(MdfError::ConversionChainTooDeep { max_depth: MAX_DEPTH });
+        }
+        
+        // Add current address to visited set
+        visited.insert(current_address);
         
         // First resolve the formula if this is an algebraic conversion
         self.resolve_formula(file_data)?;
@@ -159,11 +205,33 @@ impl ConversionBlock {
         // Initialize resolved data containers
         let mut resolved_texts = HashMap::new();
         let mut resolved_conversions = HashMap::new();
+        let mut default_conversion = None;
+        
+        // Re-enable default conversion logic for specific types that need it
+        let has_default_conversion = matches!(self.cc_type, 
+            crate::blocks::conversion::types::ConversionType::RangeToText
+            // Add other types here as needed based on MDF specification
+        );
+        
+        // For some conversion types, the last reference might be the default conversion
+        let default_ref_index = if has_default_conversion && self.cc_ref.len() > 2 {
+            // Only treat as default if there are more than 2 references
+            // This avoids incorrectly treating simple cases as having defaults
+            Some(self.cc_ref.len() - 1)
+        } else {
+            None
+        };
         
         // Resolve each reference in cc_ref
         for (i, &link_addr) in self.cc_ref.iter().enumerate() {
+            // Skip null links (address 0 typically means null in MDF format)
             if link_addr == 0 {
                 continue; // Skip null links
+            }
+            
+            // Check for cycles
+            if visited.contains(&link_addr) {
+                return Err(MdfError::ConversionChainCycle { address: link_addr });
             }
             
             let offset = link_addr as usize;
@@ -184,11 +252,18 @@ impl ConversionBlock {
                 "##CC" => {
                     // Nested conversion block - resolve recursively
                     let mut nested_conversion = ConversionBlock::from_bytes(&file_data[offset..])?;
-                    nested_conversion.resolve_all_dependencies(file_data)?;
-                    resolved_conversions.insert(i, Box::new(nested_conversion));
+                    nested_conversion.resolve_all_dependencies_recursive(file_data, depth + 1, visited, link_addr)?;
+                    
+                    // Check if this should be stored as default conversion
+                    if Some(i) == default_ref_index {
+                        default_conversion = Some(Box::new(nested_conversion));
+                    } else {
+                        resolved_conversions.insert(i, Box::new(nested_conversion));
+                    }
                 }
                 _ => {
-                    // Other block types - ignore for now
+                    // Other block types - ignore for now but could be extended
+                    // to support metadata blocks, source information, etc.
                 }
             }
         }
@@ -200,6 +275,12 @@ impl ConversionBlock {
         if !resolved_conversions.is_empty() {
             self.resolved_conversions = Some(resolved_conversions);
         }
+        if default_conversion.is_some() {
+            self.default_conversion = default_conversion;
+        }
+        
+        // Remove current address from visited set before returning
+        visited.remove(&current_address);
         
         Ok(())
     }
@@ -214,6 +295,12 @@ impl ConversionBlock {
     /// Returns the conversion block if it was resolved during dependency resolution.
     pub fn get_resolved_conversion(&self, ref_index: usize) -> Option<&ConversionBlock> {
         self.resolved_conversions.as_ref()?.get(&ref_index).map(|boxed| boxed.as_ref())
+    }
+    
+    /// Get the default conversion for fallback cases.
+    /// Returns the default conversion if it was resolved during dependency resolution.
+    pub fn get_default_conversion(&self) -> Option<&ConversionBlock> {
+        self.default_conversion.as_ref().map(|boxed| boxed.as_ref())
     }
 
     /// Serialize this conversion block back to bytes.

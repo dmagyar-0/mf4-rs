@@ -36,15 +36,40 @@ pub fn apply_value_to_text(block: &ConversionBlock, value: DecodedValue, file_da
         return resolved_conversion.apply_decoded(value, &[]); // Use empty file_data for resolved conversions
     }
     
+    // If no match found and we have a default conversion, use it
+    if idx >= block.cc_val.len() {
+        if let Some(default_conversion) = block.get_default_conversion() {
+            return default_conversion.apply_decoded(value, &[]);
+        }
+    }
+    
     // Fallback to legacy behavior if no resolved data (for backward compatibility)
     let link = *block.cc_ref.get(idx).unwrap_or(&0);
-    if link == 0 { return Ok(DecodedValue::Unknown); }
+    if link == 0 {
+        // Try default conversion as final fallback
+        if let Some(default_conversion) = block.get_default_conversion() {
+            return default_conversion.apply_decoded(value, &[]);
+        }
+        return Ok(DecodedValue::Unknown);
+    }
+    
     let off = link as usize;
-    if off + 24 > file_data.len() { return Ok(DecodedValue::Unknown); }
+    if off + 24 > file_data.len() { 
+        // Try default conversion if link is invalid
+        if let Some(default_conversion) = block.get_default_conversion() {
+            return default_conversion.apply_decoded(value, &[]);
+        }
+        return Ok(DecodedValue::Unknown); 
+    }
+    
     let hdr = BlockHeader::from_bytes(&file_data[off..off+24])?;
     if hdr.id == "##TX" {
         if let Some(txt) = read_string_block(file_data, link)? {
             return Ok(DecodedValue::String(txt));
+        }
+        // Try default conversion if text block read failed
+        if let Some(default_conversion) = block.get_default_conversion() {
+            return default_conversion.apply_decoded(value, &[]);
         }
         return Ok(DecodedValue::Unknown);
     }
@@ -53,6 +78,12 @@ pub fn apply_value_to_text(block: &ConversionBlock, value: DecodedValue, file_da
         let _ = nested.resolve_formula(file_data);
         return nested.apply_decoded(value, file_data);
     }
+    
+    // Try default conversion for unrecognized block types
+    if let Some(default_conversion) = block.get_default_conversion() {
+        return default_conversion.apply_decoded(value, &[]);
+    }
+    
     Ok(DecodedValue::Unknown)
 }
 
@@ -60,6 +91,7 @@ pub fn apply_range_to_text(block: &ConversionBlock, value: DecodedValue, file_da
     let raw = match extract_numeric(&value) { Some(x) => x, None => return Ok(value) };
     let inclusive_upper = matches!(value, DecodedValue::UnsignedInteger(_) | DecodedValue::SignedInteger(_));
     let idx = find_range_to_text_index(&block.cc_val, raw, inclusive_upper);
+    let n_ranges = block.cc_val.len() / 2;
     
     // First try to use resolved data if available
     if let Some(resolved_text) = block.get_resolved_text(idx) {
@@ -70,16 +102,44 @@ pub fn apply_range_to_text(block: &ConversionBlock, value: DecodedValue, file_da
         return resolved_conversion.apply_decoded(value, &[]); // Use empty file_data for resolved conversions
     }
     
+    // If no range matched (idx == n_ranges) and we have a default conversion, use it
+    if idx >= n_ranges {
+        if let Some(default_conversion) = block.get_default_conversion() {
+            return default_conversion.apply_decoded(value, &[]);
+        }
+    }
+    
     // Fallback to legacy behavior if no resolved data (for backward compatibility)
     let link = *block.cc_ref.get(idx).unwrap_or(&0);
-    if link == 0 { return Ok(DecodedValue::Unknown); }
+    if link == 0 {
+        // Try default conversion as final fallback
+        if let Some(default_conversion) = block.get_default_conversion() {
+            return default_conversion.apply_decoded(value, &[]);
+        }
+        return Ok(DecodedValue::Unknown);
+    }
+    
     let off = link as usize;
-    if off + 24 > file_data.len() { return Ok(DecodedValue::Unknown); }
+    if off + 24 > file_data.len() {
+        // Try default conversion if link is invalid
+        if let Some(default_conversion) = block.get_default_conversion() {
+            return default_conversion.apply_decoded(value, &[]);
+        }
+        return Ok(DecodedValue::Unknown);
+    }
+    
     let hdr = BlockHeader::from_bytes(&file_data[off..off+24])?;
     if hdr.id == "##TX" {
         return match read_string_block(file_data, link)? {
             Some(txt) => Ok(DecodedValue::String(txt)),
-            None => Ok(DecodedValue::Unknown),
+            None => {
+                // Try default conversion if text block read failed
+                if let Some(default_conversion) = block.get_default_conversion() {
+                    default_conversion.apply_decoded(value, &[])
+                } else {
+                    Ok(DecodedValue::Unknown)
+                }
+            },
         };
     }
     if hdr.id == "##CC" {
@@ -87,6 +147,12 @@ pub fn apply_range_to_text(block: &ConversionBlock, value: DecodedValue, file_da
         let _ = nested.resolve_formula(file_data);
         return nested.apply_decoded(value, file_data);
     }
+    
+    // Try default conversion for unrecognized block types
+    if let Some(default_conversion) = block.get_default_conversion() {
+        return default_conversion.apply_decoded(value, &[]);
+    }
+    
     Ok(DecodedValue::Unknown)
 }
 
