@@ -1,10 +1,10 @@
-use mf4_rs::error::MdfError;
 use mf4_rs::api::mdf::MDF;
+use mf4_rs::error::MdfError;
 
 fn main() -> Result<(), MdfError> {
     // 1) Parse the file (no data is decoded yet)
-    // This assumes `multi_groups_with_data` has been run to create the file
-    let path = "multi_group_data.mf4";
+    // This assumes `write_file` has been run to create the file
+    let path = "example.mf4";
     let mdf = MDF::from_file(path)?;
     println!();
 
@@ -52,9 +52,18 @@ fn main() -> Result<(), MdfError> {
             }
             if let Some(src) = channel.source()? {
                 println!("    Signal Source:");
-                println!("      Source Name   : {}", src.name.as_deref().unwrap_or("<none>"));
-                println!("      Source Path   : {}", src.path.as_deref().unwrap_or("<none>"));
-                println!("      Source Comment: {}", src.comment.as_deref().unwrap_or("<none>"));
+                println!(
+                    "      Source Name   : {}",
+                    src.name.as_deref().unwrap_or("<none>")
+                );
+                println!(
+                    "      Source Path   : {}",
+                    src.path.as_deref().unwrap_or("<none>")
+                );
+                println!(
+                    "      Source Comment: {}",
+                    src.comment.as_deref().unwrap_or("<none>")
+                );
             } else {
                 println!("    Signal Source: <none>");
             }
@@ -62,9 +71,14 @@ fn main() -> Result<(), MdfError> {
             let samples = channel.values()?;
             let total_samples = samples.len();
             println!("    Samples: {} records", total_samples);
-            println!("    Values: first 5 = {:?}", &samples[..5.min(total_samples)]);
-            println!("    Values: last 5 = {:?}", &samples[total_samples.saturating_sub(5)..]);
-
+            println!(
+                "    Values: first 5 = {:?}",
+                &samples[..5.min(total_samples)]
+            );
+            println!(
+                "    Values: last 5 = {:?}",
+                &samples[total_samples.saturating_sub(5)..]
+            );
         }
 
         println!(); // blank line between groups

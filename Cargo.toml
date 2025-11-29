@@ -1,7 +1,11 @@
 [package]
 name = "mf4-rs"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+description = "mf4-rs is a Rust library for working with ASAM MDF 4 (Measurement Data Format) files."
+license = "MIT"
+repository = "https://github.com/dmagyar-0/mf4-rs"
+readme = "README.md"
 
 [lib]
 name = "mf4_rs"
@@ -9,8 +13,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 nom = "8"  # Used for parsing binary MDF data
-byteorder = "1.4"  # Helps with reading binary data
-memmap2 = "0.9"
+byteorder = "1.5"  # Helps with reading binary data
+memmap2 = "0.9.9"
 meval = "0.2"  # Used for evaluating mathematical expressions
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -22,16 +26,3 @@ pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 [features]
 default = []
 pyo3 = ["dep:pyo3"]
-
-# Benchmark examples
-[[example]]
-name = "data_generator"
-path = "benchmarks/rust/data_generator.rs"
-
-[[example]]
-name = "rust_performance_benchmark"
-path = "benchmarks/rust/rust_performance_benchmark.rs"
-
-[[example]]
-name = "index_reading_benchmark"
-path = "benchmarks/rust/index_reading_benchmark.rs"

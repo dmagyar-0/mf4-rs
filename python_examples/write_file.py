@@ -21,7 +21,7 @@ import math
 def main():
     try:
         # Create a new MDF writer
-        writer = mf4_rs.PyMdfWriter("python_example.mf4")
+        writer = mf4_rs.PyMdfWriter("example.mf4")
         print("Created MDF writer")
         
         # Initialize the MDF file structure
@@ -74,7 +74,7 @@ def main():
         
         # Finalize the writer
         writer.finalize()
-        print("MDF file 'python_example.mf4' created successfully!")
+        print("MDF file 'example.mf4' created successfully!")
         
         # Now try to read the file we just created
         print("\nTesting the created file:")
@@ -88,7 +88,7 @@ def main():
 def test_read_created_file():
     """Test reading the file we just created"""
     try:
-        mdf = mf4_rs.PyMDF("python_example.mf4")
+        mdf = mf4_rs.PyMDF("example.mf4")
         
         # Get channel groups
         groups = mdf.channel_groups()

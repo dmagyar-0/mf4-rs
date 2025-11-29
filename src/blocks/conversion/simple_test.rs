@@ -1,10 +1,8 @@
 #[cfg(test)]
 mod simple_conversion_tests {
-    use super::*;
     use crate::blocks::conversion::base::ConversionBlock;
     use crate::blocks::conversion::types::ConversionType;
     use crate::blocks::common::BlockHeader;
-    use crate::parsing::decoder::DecodedValue;
 
     #[test]
     fn test_simple_linear_conversion_no_references() {
