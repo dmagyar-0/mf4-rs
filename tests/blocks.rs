@@ -1,6 +1,6 @@
-use mf4_rs::blocks::common::{BlockHeader, BlockParse, DataType};
 use mf4_rs::blocks::channel_block::ChannelBlock;
 use mf4_rs::blocks::channel_group_block::ChannelGroupBlock;
+use mf4_rs::blocks::common::{BlockHeader, BlockParse, DataType};
 use mf4_rs::blocks::data_block::DataBlock;
 use mf4_rs::blocks::data_group_block::DataGroupBlock;
 use mf4_rs::blocks::data_list_block::DataListBlock;
@@ -13,7 +13,12 @@ use mf4_rs::blocks::text_block::TextBlock;
 use mf4_rs::error::MdfError;
 
 fn header(id: &str, len: u64, links: u64) -> BlockHeader {
-    BlockHeader { id: id.to_string(), reserved0: 0, block_len: len, links_nr: links }
+    BlockHeader {
+        id: id.to_string(),
+        reserved0: 0,
+        block_len: len,
+        links_nr: links,
+    }
 }
 
 #[test]
@@ -41,12 +46,14 @@ fn metadata_block_parse() -> Result<(), MdfError> {
     let xml = "<x/>";
     let mut h = header("##MD", 0, 0);
     let needs_null = true;
-    let base_len = 24 + xml.len() + if needs_null {1} else {0};
+    let base_len = 24 + xml.len() + if needs_null { 1 } else { 0 };
     let padding = (8 - (base_len % 8)) % 8;
     h.block_len = (base_len + padding) as u64;
     let mut bytes = h.to_bytes()?;
     bytes.extend_from_slice(xml.as_bytes());
-    if needs_null { bytes.push(0); }
+    if needs_null {
+        bytes.push(0);
+    }
     bytes.extend_from_slice(&vec![0u8; padding]);
     let parsed = MetadataBlock::from_bytes(&bytes)?;
     assert_eq!(parsed.xml, xml);
@@ -55,8 +62,8 @@ fn metadata_block_parse() -> Result<(), MdfError> {
 
 #[test]
 fn data_block_parse() -> Result<(), MdfError> {
-    let data = vec![1u8,2,3,4];
-    let mut h = header("##DT", 24 + data.len() as u64, 0);
+    let data = vec![1u8, 2, 3, 4];
+    let h = header("##DT", 24 + data.len() as u64, 0);
     let mut bytes = h.to_bytes()?;
     bytes.extend_from_slice(&data);
     let block = DataBlock::from_bytes(&bytes)?;
@@ -76,7 +83,7 @@ fn data_list_block_roundtrip() -> Result<(), MdfError> {
 
 #[test]
 fn signal_data_block_parse() -> Result<(), MdfError> {
-    let mut h = header("##SD", 32, 0);
+    let h = header("##SD", 32, 0);
     let mut bytes = h.to_bytes()?;
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.push(42);
@@ -89,12 +96,12 @@ fn signal_data_block_parse() -> Result<(), MdfError> {
 
 #[test]
 fn source_block_parse() -> Result<(), MdfError> {
-    let mut h = header("##SI", 56, 3);
+    let h = header("##SI", 56, 3);
     let mut bytes = h.to_bytes()?;
     bytes.extend_from_slice(&1u64.to_le_bytes());
     bytes.extend_from_slice(&2u64.to_le_bytes());
     bytes.extend_from_slice(&3u64.to_le_bytes());
-    bytes.extend_from_slice(&[1,2,3,0,0,0,0,0]);
+    bytes.extend_from_slice(&[1, 2, 3, 0, 0, 0, 0, 0]);
     let sb = SourceBlock::from_bytes(&bytes)?;
     assert_eq!(sb.name_addr, 1);
     assert_eq!(sb.path_addr, 2);
@@ -148,7 +155,9 @@ fn channel_block_roundtrip() -> Result<(), MdfError> {
     let bytes = ch.to_bytes()?;
     let parsed = ChannelBlock::from_bytes(&bytes)?;
     assert_eq!(parsed.bit_count, ch.bit_count);
-    assert_eq!(parsed.data_type.to_u8(), DataType::UnsignedIntegerLE.to_u8());
+    assert_eq!(
+        parsed.data_type.to_u8(),
+        DataType::UnsignedIntegerLE.to_u8()
+    );
     Ok(())
 }
-
