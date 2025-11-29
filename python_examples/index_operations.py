@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple Enhanced Index Example
+Index Operations Example
 
 Demonstrates key features of the enhanced MF4 index system in Python.
 """
@@ -9,12 +9,12 @@ import mf4_rs
 import os
 
 def main():
-    print("🚀 Enhanced MF4 Index - Simple Example")
+    print("🚀 Index Operations Example")
     print("=" * 40)
     
     # Create a simple test file
-    mdf_file = "simple_test.mf4"
-    index_file = "simple_test.json"
+    mdf_file = "index_example.mf4"
+    index_file = "index_example.json"
     
     try:
         # Clean up existing files

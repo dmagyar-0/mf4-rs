@@ -11,7 +11,7 @@ This example demonstrates how to:
 import mf4_rs
 
 def main():
-    # Parse an MDF file (assumes you have created one with the Rust examples)
+    # Parse an MDF file (assumes you have created one with write_file.py)
     try:
         mdf = mf4_rs.PyMDF("example.mf4")
         print("Successfully opened MDF file")

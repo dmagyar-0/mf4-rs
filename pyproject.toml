@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "mf4-rs"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python bindings for mf4-rs - A minimal library for working with ASAM MDF 4 measurement files"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -29,9 +29,9 @@ keywords = ["mdf", "measurement", "data", "automotive", "asam"]
 requires-python = ">=3.8"
 
 [project.urls]
-homepage = "https://github.com/your-username/mf4-rs"
-repository = "https://github.com/your-username/mf4-rs"
-documentation = "https://github.com/your-username/mf4-rs"
+homepage = "https://github.com/dmagyar-0/mf4-rs"
+repository = "https://github.com/dmagyar-0/mf4-rs"
+documentation = "https://github.com/dmagyar-0/mf4-rs"
 
 [tool.maturin]
 features = ["pyo3"]

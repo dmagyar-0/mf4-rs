@@ -1,12 +1,12 @@
-use mf4_rs::writer::MdfWriter;
-use mf4_rs::blocks::common::DataType;
-use mf4_rs::parsing::decoder::DecodedValue;
 use mf4_rs::api::mdf::MDF;
+use mf4_rs::blocks::common::DataType;
 use mf4_rs::error::MdfError;
+use mf4_rs::parsing::decoder::DecodedValue;
+use mf4_rs::writer::MdfWriter;
 
 fn main() -> Result<(), MdfError> {
     // Create writer and base structure
-    let mut writer = MdfWriter::new("multi_group_data.mf4")?;
+    let mut writer = MdfWriter::new("example.mf4")?;
     let (_id, _hd) = writer.init_mdf_file()?;
     // -------- Channel Group 1 with 2 channels --------
     let cg1_id = writer.add_channel_group(None, |_| {})?;
@@ -69,7 +69,7 @@ fn main() -> Result<(), MdfError> {
     writer.finalize()?;
 
     // -------- Verify using the crate parser --------
-    let mdf = MDF::from_file("multi_group_data.mf4")?;
+    let mdf = MDF::from_file("example.mf4")?;
     println!("Channel groups: {}", mdf.channel_groups().len());
     for (idx, group) in mdf.channel_groups().iter().enumerate() {
         let chans = group.channels();
