@@ -3,7 +3,6 @@ mod tests {
     use crate::blocks::conversion::base::ConversionBlock;
     use crate::blocks::conversion::types::ConversionType;
     use crate::blocks::common::{BlockHeader, BlockParse};
-    use crate::error::MdfError;
 
     #[test]
     fn test_deep_conversion_chain_resolution() {

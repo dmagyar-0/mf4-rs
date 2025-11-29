@@ -46,7 +46,7 @@ fn create_large_mdf_file(filename: &str, record_count: usize) -> Result<(), MdfE
     let (_id, _hd) = writer.init_mdf_file()?;
     
     // Create a single channel group with multiple channels
-    let cg_id = writer.add_channel_group(None, |cg| {
+    let cg_id = writer.add_channel_group(None, |_cg| {
         // Could set channel group name here
     })?;
     
