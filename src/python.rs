@@ -431,7 +431,7 @@ impl PyMDF {
     ///
     /// This method reads a channel's values and returns them as a pandas Series
     /// with the time/master channel values as the index. If no master channel is found,
-    /// a default integer index is used.
+    /// or if the queried channel IS the master channel, a default integer index is used.
     ///
     /// Requires pandas to be installed.
     ///
@@ -440,6 +440,11 @@ impl PyMDF {
     ///
     /// # Returns
     /// Returns None if the channel is not found, otherwise returns a pandas Series.
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - pandas is not installed
+    /// - the master channel has a different number of values than the data channel
     fn get_channel_as_series(&self, py: Python, channel_name: &str) -> PyResult<Option<PyObject>> {
         // Check if pandas is available
         let pd = check_pandas_available(py)?;
@@ -466,6 +471,15 @@ impl PyMDF {
                                 let py_master_values: Vec<PyObject> = master_values.into_iter().map(|opt_val| {
                                     opt_val.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None())
                                 }).collect();
+
+                                // Validate that lengths match
+                                if py_master_values.len() != py_values.len() {
+                                    return Err(MdfException::new_err(format!(
+                                        "Master channel length ({}) does not match data channel length ({}) for channel '{}'",
+                                        py_master_values.len(), py_values.len(), channel_name
+                                    )));
+                                }
+
                                 py_master_values.to_object(py)
                             } else {
                                 // This channel IS the master channel, use default index
@@ -896,7 +910,7 @@ impl PyMdfIndex {
     ///
     /// This method reads a channel's values from the index and returns them as a pandas Series
     /// with the time/master channel values as the index. If no master channel is found,
-    /// a default integer index is used.
+    /// or if the queried channel IS the master channel, a default integer index is used.
     ///
     /// Requires pandas to be installed.
     ///
@@ -906,6 +920,12 @@ impl PyMdfIndex {
     ///
     /// # Returns
     /// Returns an error if the channel is not found, otherwise returns a pandas Series.
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - pandas is not installed
+    /// - the channel is not found
+    /// - the master channel has a different number of values than the data channel
     fn read_channel_as_series(&self, py: Python, channel_name: &str, file_path: &str) -> PyResult<PyObject> {
         // Check if pandas is available
         let pd = check_pandas_available(py)?;
@@ -930,6 +950,15 @@ impl PyMdfIndex {
                 let py_master_values: Vec<PyObject> = master_values.into_iter().map(|opt_val| {
                     opt_val.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None())
                 }).collect();
+
+                // Validate that lengths match
+                if py_master_values.len() != py_values.len() {
+                    return Err(MdfException::new_err(format!(
+                        "Master channel length ({}) does not match data channel length ({}) for channel '{}'",
+                        py_master_values.len(), py_values.len(), channel_name
+                    )));
+                }
+
                 py_master_values.to_object(py)
             } else {
                 // This channel IS the master channel, use default index
