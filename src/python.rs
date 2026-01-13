@@ -327,15 +327,18 @@ impl PyMDF {
     }
     
     /// Get channel values by name (first match)
-    /// Returns a list of values where None represents invalid/missing samples
-    fn get_channel_values(&self, channel_name: &str) -> PyResult<Option<Vec<Option<PyDecodedValue>>>> {
+    /// Returns a list of native Python values (float, int, str, bytes) where None represents invalid/missing samples
+    fn get_channel_values(&self, py: Python, channel_name: &str) -> PyResult<Option<Vec<Option<PyObject>>>> {
         for group in self.mdf.channel_groups() {
             for channel in group.channels() {
                 if let Some(name) = channel.name()? {
                     if name == channel_name {
                         let values = channel.values()?;
                         return Ok(Some(values.into_iter().map(|opt_val| {
-                            opt_val.map(PyDecodedValue::from)
+                            opt_val.map(|dv| {
+                                let py_val = PyDecodedValue::from(dv);
+                                py_val.value(py)
+                            })
                         }).collect()));
                     }
                 }
@@ -562,22 +565,28 @@ impl PyMdfIndex {
     }
     
     /// Read channel values by index
-    /// Returns a list of values where None represents invalid/missing samples
-    fn read_channel_values(&self, group_index: usize, channel_index: usize, file_path: &str) -> PyResult<Vec<Option<PyDecodedValue>>> {
+    /// Returns a list of native Python values (float, int, str, bytes) where None represents invalid/missing samples
+    fn read_channel_values(&self, py: Python, group_index: usize, channel_index: usize, file_path: &str) -> PyResult<Vec<Option<PyObject>>> {
         let mut reader = FileRangeReader::new(file_path)?;
         let values = self.index.read_channel_values(group_index, channel_index, &mut reader)?;
         Ok(values.into_iter().map(|opt_val| {
-            opt_val.map(PyDecodedValue::from)
+            opt_val.map(|dv| {
+                let py_val = PyDecodedValue::from(dv);
+                py_val.value(py)
+            })
         }).collect())
     }
     
-    /// Read channel values by name  
-    /// Returns a list of values where None represents invalid/missing samples
-    fn read_channel_values_by_name(&self, channel_name: &str, file_path: &str) -> PyResult<Vec<Option<PyDecodedValue>>> {
+    /// Read channel values by name
+    /// Returns a list of native Python values (float, int, str, bytes) where None represents invalid/missing samples
+    fn read_channel_values_by_name(&self, py: Python, channel_name: &str, file_path: &str) -> PyResult<Vec<Option<PyObject>>> {
         let mut reader = FileRangeReader::new(file_path)?;
         let values = self.index.read_channel_values_by_name(channel_name, &mut reader)?;
         Ok(values.into_iter().map(|opt_val| {
-            opt_val.map(PyDecodedValue::from)
+            opt_val.map(|dv| {
+                let py_val = PyDecodedValue::from(dv);
+                py_val.value(py)
+            })
         }).collect())
     }
     
