@@ -255,7 +255,49 @@ A concise example showing the most important enhanced index features:
 - Name-based channel access
 - File size comparison
 
-### 7. enhanced_index_python_example.py - Comprehensive Demo
+### 7. http_range_reading.py - HTTP Range Request Demonstration
+
+Demonstrates reading MDF files using local indexes with mocked HTTP range requests:
+- Shows how to calculate exact byte ranges needed using the index
+- Simulates HTTP range request fetching (mock implementation)
+- Demonstrates bandwidth savings from partial reads (up to 98%!)
+- Compares different read patterns (full channel, partial records, single channel)
+- Production-ready patterns for HTTP/S3/CDN integration
+
+**Key Concepts**:
+- Local index contains all metadata (no HTTP needed for structure)
+- Only data bytes are fetched via HTTP range requests
+- Perfect for cloud storage, remote files, and web applications
+- Shows real-world scenarios like streaming specific channels on-demand
+
+**IMPORTANT**: This is a demonstration showing the pattern. The current Python API requires a file path for decoding. In production, you would implement a `ByteRangeReader` in Rust that handles both fetching and decoding.
+
+```python
+import mf4_rs
+
+# Step 1: Create/load index (one-time operation)
+index = mf4_rs.PyMdfIndex.from_file("data.mf4")
+index.save_to_file("index.json")
+loaded_index = mf4_rs.PyMdfIndex.load_from_file("index.json")
+
+# Step 2: Calculate byte ranges (no network access)
+ranges = loaded_index.get_channel_byte_ranges(group_idx, channel_idx)
+
+# Step 3: Fetch via HTTP (in production)
+for offset, length in ranges:
+    headers = {'Range': f'bytes={offset}-{offset+length-1}'}
+    response = requests.get(url, headers=headers)
+    # Process response.content
+
+# Example: Partial read saves bandwidth
+full_bytes, _ = index.get_channel_byte_summary(0, 1)
+partial_ranges = index.get_channel_byte_ranges_for_records(0, 1, 0, 10)
+partial_bytes = sum(length for _, length in partial_ranges)
+savings = (1 - partial_bytes / full_bytes) * 100
+print(f"Bandwidth savings: {savings:.1f}%")  # Often 90%+!
+```
+
+### 8. enhanced_index_python_example.py - Comprehensive Demo
 
 A complete demonstration including:
 - Performance comparisons with direct MDF reading
