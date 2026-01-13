@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crate::api::mdf::MDF;
 use crate::writer::MdfWriter;
-use crate::index::{MdfIndex, FileRangeReader};
+use crate::index::{MdfIndex, FileRangeReader, IndexedChannel};
 use crate::blocks::common::DataType;
 use crate::parsing::decoder::DecodedValue;
 use crate::error::MdfError;
@@ -247,6 +247,40 @@ impl PyChannelGroupInfo {
     }
 }
 
+/// Helper function to check if pandas is available and import it
+fn check_pandas_available(py: Python) -> PyResult<PyObject> {
+    py.import_bound("pandas")
+        .map(|m| m.into())
+        .map_err(|_| MdfException::new_err(
+            "Pandas is not installed. Please install pandas to use Series-based methods."
+        ))
+}
+
+/// Helper function to find the master/time channel in a channel group
+/// Returns None if no master channel is found
+fn find_master_channel<'a>(channels: &Vec<crate::api::channel::Channel<'a>>) -> Option<usize> {
+    for (idx, channel) in channels.iter().enumerate() {
+        let block = channel.block();
+        // Master channels have channel_type == 2
+        if block.channel_type == 2 {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Helper function to find the master/time channel in indexed channels
+/// Returns None if no master channel is found
+fn find_master_channel_indexed(channels: &Vec<IndexedChannel>) -> Option<usize> {
+    for (idx, channel) in channels.iter().enumerate() {
+        // Master channels have channel_type == 2
+        if channel.channel_type == 2 {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 // Python wrapper for MDF
 #[pyclass]
 pub struct PyMDF {
@@ -359,6 +393,108 @@ impl PyMDF {
                 }
             }
         }
+        Ok(None)
+    }
+
+    /// Get channel values by channel group name and channel name.
+    ///
+    /// This method looks up the channel group by name first, then finds the channel
+    /// within that specific group. Returns None if either the group or channel is not found.
+    /// Inner Option represents invalid/missing samples: None = invalid, Some = valid value.
+    /// Returns a list of native Python values (float, int, str, bytes).
+    fn get_channel_values_by_group_and_name(&self, py: Python, group_name: &str, channel_name: &str) -> PyResult<Option<Vec<Option<PyObject>>>> {
+        for group in self.mdf.channel_groups() {
+            // Check if this is the group we're looking for
+            if let Some(gname) = group.name()? {
+                if gname == group_name {
+                    // Found the group, now look for the channel
+                    for channel in group.channels() {
+                        if let Some(cname) = channel.name()? {
+                            if cname == channel_name {
+                                let values = channel.values()?;
+                                return Ok(Some(values.into_iter().map(|opt_val| {
+                                    opt_val.map(|dv| decoded_value_to_pyobject(dv, py))
+                                }).collect()));
+                            }
+                        }
+                    }
+                    // Group found but channel not found
+                    return Ok(None);
+                }
+            }
+        }
+        // Group not found
+        Ok(None)
+    }
+
+    /// Get channel data as a pandas Series with time/master channel as index.
+    ///
+    /// This method reads a channel's values and returns them as a pandas Series
+    /// with the time/master channel values as the index. If no master channel is found,
+    /// a default integer index is used.
+    ///
+    /// Requires pandas to be installed.
+    ///
+    /// # Arguments
+    /// * `channel_name` - Name of the channel to read
+    ///
+    /// # Returns
+    /// Returns None if the channel is not found, otherwise returns a pandas Series.
+    fn get_channel_as_series(&self, py: Python, channel_name: &str) -> PyResult<Option<PyObject>> {
+        // Check if pandas is available
+        let pd = check_pandas_available(py)?;
+
+        // Find the channel
+        for group in self.mdf.channel_groups() {
+            let channels = group.channels();
+
+            for (ch_idx, channel) in channels.iter().enumerate() {
+                if let Some(name) = channel.name()? {
+                    if name == channel_name {
+                        // Found the channel, get its values
+                        let values = channel.values()?;
+                        let py_values: Vec<PyObject> = values.into_iter().map(|opt_val| {
+                            opt_val.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None())
+                        }).collect();
+
+                        // Find the master/time channel for this group
+                        let index: PyObject = if let Some(master_idx) = find_master_channel(&channels) {
+                            if master_idx != ch_idx {
+                                // Use the master channel values as index
+                                let master_channel = &channels[master_idx];
+                                let master_values = master_channel.values()?;
+                                let py_master_values: Vec<PyObject> = master_values.into_iter().map(|opt_val| {
+                                    opt_val.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None())
+                                }).collect();
+                                py_master_values.to_object(py)
+                            } else {
+                                // This channel IS the master channel, use default index
+                                py.None()
+                            }
+                        } else {
+                            // No master channel found, use default index
+                            py.None()
+                        };
+
+                        // Create pandas Series
+                        let series_class = pd.getattr(py, "Series")?;
+                        let series = if index.is_none(py) {
+                            // No index specified, pandas will use default integer index
+                            series_class.call1(py, (py_values,))?
+                        } else {
+                            // Use the master channel values as index
+                            series_class.call(py, (py_values,), Some(&[("index", index)].into_py_dict_bound(py)))?
+                        };
+
+                        // Set the series name to the channel name
+                        series.setattr(py, "name", channel_name)?;
+
+                        return Ok(Some(series));
+                    }
+                }
+            }
+        }
+
         Ok(None)
     }
 }
@@ -672,42 +808,152 @@ impl PyMdfIndex {
     /// Get conversion info for a specific channel
     fn get_conversion_info(&self, group_index: usize, channel_index: usize) -> PyResult<Option<HashMap<String, PyObject>>> {
         use pyo3::Python;
-        
+
         let group = self.index.channel_groups.get(group_index)
             .ok_or_else(|| MdfException::new_err("Invalid group index"))?;
-        
+
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfException::new_err("Invalid channel index"))?;
-        
+
         if let Some(conversion) = &channel.conversion {
             Python::with_gil(|py| {
                 let mut info = HashMap::new();
-                
+
                 info.insert("conversion_type".to_string(), format!("{:?}", conversion.cc_type).to_object(py));
                 info.insert("precision".to_string(), conversion.cc_precision.to_object(py));
                 info.insert("flags".to_string(), conversion.cc_flags.to_object(py));
                 info.insert("values_count".to_string(), conversion.cc_val_count.to_object(py));
                 info.insert("values".to_string(), conversion.cc_val.to_object(py));
-                
+
                 // Include resolved data info if available
                 if let Some(resolved_texts) = &conversion.resolved_texts {
                     let texts: HashMap<usize, String> = resolved_texts.clone();
                     info.insert("resolved_texts".to_string(), texts.to_object(py));
                 }
-                
+
                 if let Some(_) = &conversion.resolved_conversions {
                     info.insert("has_resolved_conversions".to_string(), true.to_object(py));
                 }
-                
+
                 if let Some(formula) = &conversion.formula {
                     info.insert("formula".to_string(), formula.to_object(py));
                 }
-                
+
                 Ok(Some(info))
             })
         } else {
             Ok(None)
         }
+    }
+
+    /// Read channel values by channel group name and channel name.
+    ///
+    /// This method looks up the channel group by name first, then finds the channel
+    /// within that specific group. Returns an error if either the group or channel is not found.
+    /// Option in Vec represents invalid/missing samples: None = invalid, Some = valid value.
+    /// Returns a list of native Python values (float, int, str, bytes).
+    fn read_channel_values_by_group_and_name(&self, py: Python, group_name: &str, channel_name: &str, file_path: &str) -> PyResult<Vec<Option<PyObject>>> {
+        // Find the group by name
+        let mut group_index = None;
+        for (idx, group) in self.index.channel_groups.iter().enumerate() {
+            if let Some(ref gname) = group.name {
+                if gname == group_name {
+                    group_index = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        let group_idx = group_index.ok_or_else(||
+            MdfException::new_err(format!("Channel group '{}' not found", group_name))
+        )?;
+
+        // Find the channel by name within the group
+        let group = &self.index.channel_groups[group_idx];
+        let mut channel_index = None;
+        for (idx, channel) in group.channels.iter().enumerate() {
+            if let Some(ref cname) = channel.name {
+                if cname == channel_name {
+                    channel_index = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        let channel_idx = channel_index.ok_or_else(||
+            MdfException::new_err(format!("Channel '{}' not found in group '{}'", channel_name, group_name))
+        )?;
+
+        // Read the channel values using the found indices
+        let mut reader = FileRangeReader::new(file_path)?;
+        let values = self.index.read_channel_values(group_idx, channel_idx, &mut reader)?;
+        Ok(values.into_iter().map(|opt_val| {
+            opt_val.map(|dv| decoded_value_to_pyobject(dv, py))
+        }).collect())
+    }
+
+    /// Read channel data as a pandas Series with time/master channel as index.
+    ///
+    /// This method reads a channel's values from the index and returns them as a pandas Series
+    /// with the time/master channel values as the index. If no master channel is found,
+    /// a default integer index is used.
+    ///
+    /// Requires pandas to be installed.
+    ///
+    /// # Arguments
+    /// * `channel_name` - Name of the channel to read
+    /// * `file_path` - Path to the MDF file
+    ///
+    /// # Returns
+    /// Returns an error if the channel is not found, otherwise returns a pandas Series.
+    fn read_channel_as_series(&self, py: Python, channel_name: &str, file_path: &str) -> PyResult<PyObject> {
+        // Check if pandas is available
+        let pd = check_pandas_available(py)?;
+
+        // Find the channel
+        let (group_idx, channel_idx) = self.find_channel_by_name(channel_name)
+            .ok_or_else(|| MdfException::new_err(format!("Channel '{}' not found", channel_name)))?;
+
+        // Read the channel values
+        let mut reader = FileRangeReader::new(file_path)?;
+        let values = self.index.read_channel_values(group_idx, channel_idx, &mut reader)?;
+        let py_values: Vec<PyObject> = values.into_iter().map(|opt_val| {
+            opt_val.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None())
+        }).collect();
+
+        // Find the master/time channel for this group
+        let group = &self.index.channel_groups[group_idx];
+        let index: PyObject = if let Some(master_idx) = find_master_channel_indexed(&group.channels) {
+            if master_idx != channel_idx {
+                // Use the master channel values as index
+                let master_values = self.index.read_channel_values(group_idx, master_idx, &mut reader)?;
+                let py_master_values: Vec<PyObject> = master_values.into_iter().map(|opt_val| {
+                    opt_val.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None())
+                }).collect();
+                py_master_values.to_object(py)
+            } else {
+                // This channel IS the master channel, use default index
+                py.None()
+            }
+        } else {
+            // No master channel found, use default index
+            py.None()
+        };
+
+        // Create pandas Series
+        let series_class = pd.getattr(py, "Series")?;
+        let series = if index.is_none(py) {
+            // No index specified, pandas will use default integer index
+            series_class.call1(py, (py_values,))?
+        } else {
+            // Use the master channel values as index
+            series_class.call(py, (py_values,), Some(&[("index", index)].into_py_dict_bound(py)))?
+        };
+
+        // Set the series name to the channel name
+        series.setattr(py, "name", channel_name)?;
+
+        Ok(series)
     }
 }
 
