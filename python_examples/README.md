@@ -153,11 +153,13 @@ ranges = index.get_channel_byte_ranges(0, 1)  # group 0, channel 1
 
 ### 4. pandas_example.py - Pandas Integration
 
-**NEW!** Direct pandas Series support with automatic time indexing:
-- Returns pandas Series objects directly from the library
+**NEW!** Direct pandas Series support with automatic DatetimeIndex:
+- Returns pandas Series objects with absolute timestamps
+- **Automatic DatetimeIndex creation** from MDF start time + relative time values
 - Automatic master/time channel detection and indexing
 - Works with both PyMDF and PyMdfIndex
-- Enables full pandas data analysis capabilities
+- Enables full pandas time-series analysis capabilities
+- Demonstrates resampling, time-based slicing, and datetime operations
 
 ```python
 import mf4_rs
@@ -166,19 +168,25 @@ import pandas as pd
 # Open MDF file
 mdf = mf4_rs.PyMDF("data.mf4")
 
-# Get channel as pandas Series with time index
+# Get channel as pandas Series with DatetimeIndex
 temp_series = mdf.get_channel_as_series("Temperature")
 speed_series = mdf.get_channel_as_series("Speed")
+
+# Index is now a DatetimeIndex with absolute timestamps!
+print(temp_series.index)  # DatetimeIndex(['2024-01-15 10:30:00', ...])
 
 # Now use full pandas functionality!
 print(temp_series.describe())
 print(f"Mean: {temp_series.mean():.2f}")
 print(f"Max: {temp_series.max():.2f}")
 
-# Time-based operations (index is time)
-print(f"Value at t=5.0: {temp_series.loc[5.0]}")
+# Time-based operations with absolute timestamps
+print(f"Value at 10:30:05: {temp_series.loc['2024-01-15 10:30:05']}")
 
-# Plot with matplotlib
+# Resampling to different time intervals
+temp_1s = temp_series.resample('1S').mean()  # Resample to 1-second intervals
+
+# Plot with matplotlib (x-axis shows real timestamps!)
 temp_series.plot(title="Temperature over Time")
 
 # Combine multiple series into DataFrame
@@ -273,17 +281,31 @@ mean = sum(v for v in values if v is not None) / len([v for v in values if v is 
 
 ### Pandas Integration
 
-**NEW!** Direct pandas Series support with automatic time indexing:
-- `get_channel_as_series(name)` - Returns pandas Series with time index
+**NEW!** Direct pandas Series support with automatic DatetimeIndex:
+- `get_channel_as_series(name)` - Returns pandas Series with datetime index
 - `read_channel_as_series(name, file)` - Index-based version
+- **Automatic DatetimeIndex creation** - Converts MDF start time + relative time to absolute timestamps
 - Automatic master/time channel detection (channel_type == 2)
-- Falls back to integer index if no master channel
+- Falls back to integer index if no master channel or datetime conversion fails
 - Validates length matching between master and data channels
+
+**DatetimeIndex Features**:
+- Uses MDF file start timestamp (`abs_time` from header)
+- Adds relative time values from master channel (in seconds)
+- Returns pandas `DatetimeIndex` with absolute timestamps
+- Enables time-based slicing, resampling, and time-series operations
+- Handles None values (converts to `NaT`)
+- Supports integer and float time channels
 
 ```python
 series = mdf.get_channel_as_series("Temperature")
-# series.index = time values, series.values = temperature
+# series.index is now a pandas DatetimeIndex with absolute timestamps!
+print(series.index[0])  # Timestamp('2024-01-15 10:30:00.000000000')
 print(series.describe())  # Full pandas functionality!
+
+# Time-based operations
+series.resample('1S').mean()  # Resample to 1-second intervals
+series.loc['2024-01-15 10:30:00':'2024-01-15 10:30:10']  # Slice by time
 ```
 
 ### Enhanced Channel Lookup

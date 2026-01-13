@@ -37,11 +37,19 @@ def main():
         mdf = mf4_rs.PyMDF(mdf_file)
 
         # Get channel as pandas Series with automatic time indexing
+        # NEW: Time index is now a pandas DatetimeIndex with absolute timestamps!
         temp_series = mdf.get_channel_as_series("Temperature")
         rpm_series = mdf.get_channel_as_series("RPM")
 
         print(f"   Temperature Series: {len(temp_series)} samples")
-        print(f"   Index (time): {temp_series.index[0]:.2f} to {temp_series.index[-1]:.2f}")
+        print(f"   Index type: {type(temp_series.index).__name__}")
+
+        if isinstance(temp_series.index, pd.DatetimeIndex):
+            print(f"   Datetime range: {temp_series.index[0]} to {temp_series.index[-1]}")
+            print(f"   Index dtype: {temp_series.index.dtype}")
+        else:
+            print(f"   Index (numeric): {temp_series.index[0]:.2f} to {temp_series.index[-1]:.2f}")
+
         print(f"   Values: {temp_series.values[0]:.2f} to {temp_series.values[-1]:.2f}")
 
         print("\n3️⃣ Using pandas functionality...")
@@ -85,8 +93,30 @@ def main():
         rolling_temp = temp_series.rolling(window=5).mean()
         print(f"   Rolling average (window=5): {rolling_temp.iloc[-1]:.2f}°C")
 
-        # Resampling (if time index is datetime-like, otherwise skip)
-        print(f"   Data frequency: ~{(temp_series.index[1] - temp_series.index[0]):.3f}s between samples")
+        # Datetime-specific operations (if using DatetimeIndex)
+        if isinstance(temp_series.index, pd.DatetimeIndex):
+            print(f"\n   Datetime-specific features:")
+            print(f"     Time span: {temp_series.index[-1] - temp_series.index[0]}")
+            print(f"     Frequency: {pd.infer_freq(temp_series.index) or 'irregular'}")
+
+            # Resampling to different time intervals
+            try:
+                # Resample to 1-second intervals (mean aggregation)
+                resampled = temp_series.resample('1S').mean()
+                print(f"     Resampled to 1s: {len(resampled)} samples (from {len(temp_series)})")
+            except:
+                print(f"     Resampling: not applicable for this dataset")
+
+            # Time-based slicing
+            try:
+                first_second = temp_series.index[0]
+                after_2s = first_second + pd.Timedelta(seconds=2)
+                subset = temp_series.loc[first_second:after_2s]
+                print(f"     First 2 seconds: {len(subset)} samples")
+            except:
+                pass
+        else:
+            print(f"   Data frequency: ~{(temp_series.index[1] - temp_series.index[0]):.3f}s between samples")
 
         # Filtering
         hot_samples = temp_series[temp_series > temp_series.mean()]
