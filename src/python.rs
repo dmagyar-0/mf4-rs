@@ -6,6 +6,7 @@
 //! - Creating and using indexes
 
 use pyo3::prelude::*;
+use pyo3::types::IntoPyDict;
 use pyo3::{create_exception, wrap_pyfunction};
 use std::collections::HashMap;
 
@@ -497,7 +498,7 @@ impl PyMDF {
                             series_class.call1(py, (py_values,))?
                         } else {
                             // Use the master channel values as index
-                            series_class.call(py, (py_values,), Some(&[("index", index)].into_py_dict_bound(py)))?
+                            series_class.call(py, (py_values,), Some([("index", index)].into_py_dict(py)))?
                         };
 
                         // Set the series name to the channel name
@@ -976,7 +977,7 @@ impl PyMdfIndex {
             series_class.call1(py, (py_values,))?
         } else {
             // Use the master channel values as index
-            series_class.call(py, (py_values,), Some(&[("index", index)].into_py_dict_bound(py)))?
+            series_class.call(py, (py_values,), Some([("index", index)].into_py_dict(py)))?
         };
 
         // Set the series name to the channel name
