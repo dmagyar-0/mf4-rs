@@ -42,4 +42,17 @@ impl MDF {
 
         groups
     }
+
+    /// Get the start time of the measurement in nanoseconds since epoch.
+    ///
+    /// This is the absolute timestamp stored in the MDF file header.
+    /// Returns None if the start time is 0 (not set).
+    pub fn start_time_ns(&self) -> Option<u64> {
+        let time = self.raw.header.abs_time;
+        if time == 0 {
+            None
+        } else {
+            Some(time)
+        }
+    }
 }

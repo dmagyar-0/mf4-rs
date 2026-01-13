@@ -75,6 +75,9 @@ pub struct IndexedChannelGroup {
 pub struct MdfIndex {
     /// File size for validation
     pub file_size: u64,
+    /// Start time of the measurement in nanoseconds since epoch (from MDF header)
+    /// None if the start time is not set (0) in the file
+    pub start_time_ns: Option<u64>,
     /// Channel groups in the file
     pub channel_groups: Vec<IndexedChannelGroup>,
 }
@@ -172,6 +175,9 @@ impl MdfIndex {
             .map_err(|e| MdfError::IOError(e))?
             .len();
 
+        // Extract start time from MDF header
+        let start_time_ns = mdf.start_time_ns();
+
         let mut indexed_groups = Vec::new();
 
         for group in mdf.channel_groups() {
@@ -232,6 +238,7 @@ impl MdfIndex {
 
         Ok(MdfIndex {
             file_size,
+            start_time_ns,
             channel_groups: indexed_groups,
         })
     }
