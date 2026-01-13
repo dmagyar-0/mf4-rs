@@ -20,13 +20,15 @@ From the root directory of the project:
 
 ```bash
 # Build in development mode (creates a .pyd/.so file that Python can import)
-maturin develop --features pyo3
+maturin develop --release
 
 # Or build a wheel for distribution
-maturin build --features pyo3
+maturin build --release
 ```
 
-After running `maturin develop`, you should be able to import `mf4_rs` in Python.
+After running `maturin develop --release`, you should be able to import `mf4_rs` in Python.
+
+**Note**: The `pyo3` feature is automatically enabled by maturin via `pyproject.toml`, so you don't need to specify `--features pyo3`.
 
 ### Installation from Wheel
 
@@ -38,12 +40,14 @@ pip install target/wheels/mf4_rs-*.whl
 
 ## Examples
 
-### 1. parse_mdf.py - Reading MDF Files
+### 1. read_file.py - Reading MDF Files
 
 This example shows how to:
 - Open an MDF file
 - Inspect channel groups and channels
-- Read channel values
+- Read channel values (returns native Python types: float, int, str, bytes)
+- Use pandas Series for data analysis
+- Look up channels by group name and channel name
 
 ```python
 import mf4_rs
@@ -58,8 +62,18 @@ print(f"Found {len(groups)} channel groups")
 # Get all channel names
 names = mdf.get_all_channel_names()
 
-# Read values for a specific channel
+# Read values for a specific channel (returns native Python types)
 values = mdf.get_channel_values("Temperature")
+# values is a list of Python floats/ints/str/bytes (no wrapper objects!)
+
+# Read channel by group name + channel name (more precise lookup)
+engine_temp = mdf.get_channel_values_by_group_and_name("Engine", "Temperature")
+
+# Get channel as pandas Series with time index (requires pandas)
+import pandas as pd
+series = mdf.get_channel_as_series("Temperature")
+# series.index contains time values, series.values contains temperature
+print(series.describe())  # Use full pandas functionality!
 ```
 
 ### 2. write_mdf.py - Creating MDF Files
@@ -101,13 +115,15 @@ writer.finish_data_block(group_id)
 writer.finalize()
 ```
 
-### 3. index_mdf.py - MDF File Indexing
+### 3. index_operations.py - MDF File Indexing
 
 This example shows the powerful indexing system:
 - Creating lightweight indexes from MDF files
 - Saving/loading indexes to/from JSON
-- Fast channel data access using indexes
+- Fast channel data access using indexes (returns native Python types)
 - Getting byte ranges for efficient I/O
+- Pandas Series support with automatic time indexing
+- Group + name channel lookup
 
 ```python
 import mf4_rs
@@ -121,14 +137,63 @@ index.save_to_file("data_index.json")
 # Load index later
 index = mf4_rs.PyMdfIndex.load_from_file("data_index.json")
 
-# Read channel data using the index
+# Read channel data using the index (returns native Python types)
 values = index.read_channel_values_by_name("Temperature", "data.mf4")
+
+# Read channel by group name + channel name
+engine_temp = index.read_channel_values_by_group_and_name("Engine", "Temperature", "data.mf4")
+
+# Get channel as pandas Series with time index
+series = index.read_channel_as_series("Temperature", "data.mf4")
+print(series.describe())  # Full pandas functionality!
 
 # Get byte ranges for custom I/O
 ranges = index.get_channel_byte_ranges(0, 1)  # group 0, channel 1
 ```
 
-### 4. Enhanced Index with Resolved Conversions
+### 4. pandas_example.py - Pandas Integration
+
+**NEW!** Direct pandas Series support with automatic time indexing:
+- Returns pandas Series objects directly from the library
+- Automatic master/time channel detection and indexing
+- Works with both PyMDF and PyMdfIndex
+- Enables full pandas data analysis capabilities
+
+```python
+import mf4_rs
+import pandas as pd
+
+# Open MDF file
+mdf = mf4_rs.PyMDF("data.mf4")
+
+# Get channel as pandas Series with time index
+temp_series = mdf.get_channel_as_series("Temperature")
+speed_series = mdf.get_channel_as_series("Speed")
+
+# Now use full pandas functionality!
+print(temp_series.describe())
+print(f"Mean: {temp_series.mean():.2f}")
+print(f"Max: {temp_series.max():.2f}")
+
+# Time-based operations (index is time)
+print(f"Value at t=5.0: {temp_series.loc[5.0]}")
+
+# Plot with matplotlib
+temp_series.plot(title="Temperature over Time")
+
+# Combine multiple series into DataFrame
+df = pd.DataFrame({
+    'Temperature': temp_series,
+    'Speed': speed_series
+})
+print(df.corr())  # Correlation matrix
+
+# Works with indexes too (faster for repeated access)
+index = mf4_rs.PyMdfIndex.from_file("data.mf4")
+series = index.read_channel_as_series("Temperature", "data.mf4")
+```
+
+### 5. Enhanced Index with Resolved Conversions
 
 **NEW!** The enhanced index system pre-resolves all conversion dependencies:
 - All text conversions, nested conversions, and formulas are resolved during index creation
@@ -174,7 +239,7 @@ all_matches = index.find_all_channels_by_name("Temperature")
 print(f"All Temperature channels: {all_matches}")
 ```
 
-### 5. simple_enhanced_index.py - Quick Start Example
+### 6. simple_enhanced_index.py - Quick Start Example
 
 A concise example showing the most important enhanced index features:
 - Automatic conversion resolution
@@ -182,7 +247,7 @@ A concise example showing the most important enhanced index features:
 - Name-based channel access
 - File size comparison
 
-### 6. enhanced_index_python_example.py - Comprehensive Demo
+### 7. enhanced_index_python_example.py - Comprehensive Demo
 
 A complete demonstration including:
 - Performance comparisons with direct MDF reading
@@ -191,6 +256,49 @@ A complete demonstration including:
 - Detailed analysis of conversion resolution
 
 ## Key Features
+
+### Native Python Types
+
+**NEW!** All value methods now return native Python types directly:
+- Reading channels returns `list` of `float`, `int`, `str`, or `bytes`
+- No wrapper objects - values are immediately usable
+- `None` represents invalid/missing samples
+- Full type compatibility with pandas, numpy, and other libraries
+
+```python
+values = mdf.get_channel_values("Temperature")
+# values is List[Optional[float]] - native Python floats!
+mean = sum(v for v in values if v is not None) / len([v for v in values if v is not None])
+```
+
+### Pandas Integration
+
+**NEW!** Direct pandas Series support with automatic time indexing:
+- `get_channel_as_series(name)` - Returns pandas Series with time index
+- `read_channel_as_series(name, file)` - Index-based version
+- Automatic master/time channel detection (channel_type == 2)
+- Falls back to integer index if no master channel
+- Validates length matching between master and data channels
+
+```python
+series = mdf.get_channel_as_series("Temperature")
+# series.index = time values, series.values = temperature
+print(series.describe())  # Full pandas functionality!
+```
+
+### Enhanced Channel Lookup
+
+**NEW!** Look up channels by group name + channel name:
+- `get_channel_values_by_group_and_name(group, channel)` - Direct MDF access
+- `read_channel_values_by_group_and_name(group, channel, file)` - Index-based access
+- More precise than global name lookup
+- Useful when multiple groups have channels with the same name
+
+```python
+# Precise lookup when multiple "Temperature" channels exist
+engine_temp = mdf.get_channel_values_by_group_and_name("Engine", "Temperature")
+cabin_temp = mdf.get_channel_values_by_group_and_name("Cabin", "Temperature")
+```
 
 ### Data Types
 
@@ -202,7 +310,7 @@ The Python bindings support all MDF data types:
 ### Value Creation
 
 Create values for writing:
-- `create_float_value(3.14)` 
+- `create_float_value(3.14)`
 - `create_uint_value(42)`
 - `create_int_value(-10)`
 - `create_string_value("text")`

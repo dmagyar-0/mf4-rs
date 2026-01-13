@@ -51,10 +51,32 @@ def main():
                     print(f"     - {ch_name} ({data_type.name})")
         
         print("4️⃣ Reading data efficiently...")
-        # Read by name - fastest way
+        # Read by name - fastest way (returns native Python types!)
         temp_values = loaded_index.read_channel_values_by_name("Temperature", mdf_file)
-        print(f"   Temperature: {len(temp_values)} values")
-        print(f"   Range: {temp_values[0]} to {temp_values[-1]}")
+        print(f"   Temperature: {len(temp_values)} values (native Python floats!)")
+        valid_temps = [v for v in temp_values if v is not None]
+        print(f"   Range: {min(valid_temps):.2f} to {max(valid_temps):.2f}")
+
+        # NEW: Read by group name + channel name
+        first_group_name = groups[0][1] if groups and groups[0][1] else None
+        if first_group_name:
+            result = loaded_index.read_channel_values_by_group_and_name(
+                first_group_name, "Temperature", mdf_file
+            )
+            print(f"   By group+name: {len(result)} values")
+
+        # NEW: Get as pandas Series with automatic time indexing
+        try:
+            import pandas as pd
+            print("\n   Pandas Series conversion:")
+            series = loaded_index.read_channel_as_series("Temperature", mdf_file)
+            print(f"     Series length: {len(series)}")
+            print(f"     Mean: {series.mean():.2f}")
+            print(f"     Std: {series.std():.2f}")
+        except ImportError:
+            print("   (pandas not installed - skipping Series examples)")
+        except Exception as e:
+            print(f"   Note: {e}")
         
         print("5️⃣ HTTP optimization features...")
         # Find channel location
