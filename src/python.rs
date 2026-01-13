@@ -178,6 +178,21 @@ impl From<PyDecodedValue> for DecodedValue {
     }
 }
 
+/// Direct conversion from DecodedValue to PyObject without intermediate allocation.
+/// This is more efficient than creating a PyDecodedValue and immediately extracting its value.
+fn decoded_value_to_pyobject(dv: DecodedValue, py: Python) -> PyObject {
+    match dv {
+        DecodedValue::Float(v) => v.to_object(py),
+        DecodedValue::UnsignedInteger(v) => v.to_object(py),
+        DecodedValue::SignedInteger(v) => v.to_object(py),
+        DecodedValue::String(v) => v.to_object(py),
+        DecodedValue::ByteArray(v) | DecodedValue::MimeSample(v) | DecodedValue::MimeStream(v) => {
+            v.to_object(py)
+        }
+        DecodedValue::Unknown => py.None(),
+    }
+}
+
 // Simplified Channel info structure to avoid lifetime issues
 #[pyclass]
 #[derive(Debug, Clone)]
@@ -326,8 +341,11 @@ impl PyMDF {
         Ok(names)
     }
     
-    /// Get channel values by name (first match)
-    /// Returns a list of native Python values (float, int, str, bytes) where None represents invalid/missing samples
+    /// Get channel values by name (first match).
+    ///
+    /// Returns None if the channel is not found.
+    /// Inner Option represents invalid/missing samples: None = invalid, Some = valid value.
+    /// Returns a list of native Python values (float, int, str, bytes).
     fn get_channel_values(&self, py: Python, channel_name: &str) -> PyResult<Option<Vec<Option<PyObject>>>> {
         for group in self.mdf.channel_groups() {
             for channel in group.channels() {
@@ -335,10 +353,7 @@ impl PyMDF {
                     if name == channel_name {
                         let values = channel.values()?;
                         return Ok(Some(values.into_iter().map(|opt_val| {
-                            opt_val.map(|dv| {
-                                let py_val = PyDecodedValue::from(dv);
-                                py_val.value(py)
-                            })
+                            opt_val.map(|dv| decoded_value_to_pyobject(dv, py))
                         }).collect()));
                     }
                 }
@@ -564,29 +579,29 @@ impl PyMdfIndex {
             })
     }
     
-    /// Read channel values by index
-    /// Returns a list of native Python values (float, int, str, bytes) where None represents invalid/missing samples
+    /// Read channel values by index.
+    ///
+    /// Returns an error if indices are invalid.
+    /// Option in Vec represents invalid/missing samples: None = invalid, Some = valid value.
+    /// Returns a list of native Python values (float, int, str, bytes).
     fn read_channel_values(&self, py: Python, group_index: usize, channel_index: usize, file_path: &str) -> PyResult<Vec<Option<PyObject>>> {
         let mut reader = FileRangeReader::new(file_path)?;
         let values = self.index.read_channel_values(group_index, channel_index, &mut reader)?;
         Ok(values.into_iter().map(|opt_val| {
-            opt_val.map(|dv| {
-                let py_val = PyDecodedValue::from(dv);
-                py_val.value(py)
-            })
+            opt_val.map(|dv| decoded_value_to_pyobject(dv, py))
         }).collect())
     }
     
-    /// Read channel values by name
-    /// Returns a list of native Python values (float, int, str, bytes) where None represents invalid/missing samples
+    /// Read channel values by name.
+    ///
+    /// Returns an error if the channel is not found.
+    /// Option in Vec represents invalid/missing samples: None = invalid, Some = valid value.
+    /// Returns a list of native Python values (float, int, str, bytes).
     fn read_channel_values_by_name(&self, py: Python, channel_name: &str, file_path: &str) -> PyResult<Vec<Option<PyObject>>> {
         let mut reader = FileRangeReader::new(file_path)?;
         let values = self.index.read_channel_values_by_name(channel_name, &mut reader)?;
         Ok(values.into_iter().map(|opt_val| {
-            opt_val.map(|dv| {
-                let py_val = PyDecodedValue::from(dv);
-                py_val.value(py)
-            })
+            opt_val.map(|dv| decoded_value_to_pyobject(dv, py))
         }).collect())
     }
     
