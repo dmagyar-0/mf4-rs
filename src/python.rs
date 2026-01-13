@@ -292,6 +292,13 @@ fn find_master_channel_indexed(channels: &Vec<IndexedChannel>) -> Option<usize> 
 ///
 /// # Returns
 /// PyObject representing a pandas DatetimeIndex, or an error if conversion fails
+///
+/// # Error Handling
+/// This function handles multiple edge cases:
+/// - None values in master channel (converted to NaT - Not a Time)
+/// - Integer time values (i64, u64) in addition to float values
+/// - Negative time values that would create timestamps before epoch
+/// - Overflow/underflow when adding large time deltas
 fn create_datetime_index(
     py: Python,
     pd: &PyObject,
@@ -308,18 +315,43 @@ fn create_datetime_index(
 
     // Create a Timedelta for each relative time and add to start time
     let timedelta_class = pd.getattr(py, "Timedelta")?;
+    let nat = pd.getattr(py, "NaT")?;  // Not-a-Time for None values
     let mut absolute_times = Vec::with_capacity(relative_times.len());
 
     for rel_time in relative_times {
-        // Try to extract the float value from the PyObject
-        let seconds: f64 = rel_time.extract(py)?;
+        // Handle None values (invalid samples) - convert to NaT
+        if rel_time.is_none(py) {
+            absolute_times.push(nat.clone());
+            continue;
+        }
+
+        // Try to extract the time value as f64, then i64, then u64
+        // Master channels can be float or integer type
+        let seconds: f64 = if let Ok(f) = rel_time.extract::<f64>(py) {
+            f
+        } else if let Ok(i) = rel_time.extract::<i64>(py) {
+            i as f64
+        } else if let Ok(u) = rel_time.extract::<u64>(py) {
+            u as f64
+        } else {
+            // If we can't extract as any numeric type, use NaT
+            absolute_times.push(nat.clone());
+            continue;
+        };
+
+        // Check for edge cases that might cause overflow or invalid timestamps
+        // pandas datetime64[ns] has range: 1678-2262 (approximately)
+        // If start_ns + seconds would overflow, pandas will raise an OutOfBoundsDatetime error
+        // We'll let pandas handle this and propagate the error up
 
         // Create a Timedelta in seconds and add to start time
+        // This can fail if the resulting timestamp is out of pandas' valid range
         let delta = timedelta_class.call(
             py,
             (seconds,),
             Some([("unit", "s")].into_py_dict(py))
         )?;
+
         let absolute_time = start_timestamp.call_method1(py, "__add__", (delta,))?;
         absolute_times.push(absolute_time);
     }
