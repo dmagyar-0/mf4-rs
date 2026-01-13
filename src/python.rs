@@ -282,6 +282,55 @@ fn find_master_channel_indexed(channels: &Vec<IndexedChannel>) -> Option<usize> 
     None
 }
 
+/// Helper function to create a pandas DatetimeIndex from relative time values
+///
+/// # Arguments
+/// * `py` - Python GIL token
+/// * `pd` - pandas module PyObject
+/// * `relative_times` - Vector of relative time values (in seconds) as PyObjects
+/// * `start_ns` - Start time in nanoseconds since epoch
+///
+/// # Returns
+/// PyObject representing a pandas DatetimeIndex, or an error if conversion fails
+fn create_datetime_index(
+    py: Python,
+    pd: &PyObject,
+    relative_times: &[PyObject],
+    start_ns: u64,
+) -> PyResult<PyObject> {
+    // Convert start time from nanoseconds to a pandas Timestamp
+    let to_datetime = pd.getattr(py, "to_datetime")?;
+    let start_timestamp = to_datetime.call(
+        py,
+        (start_ns,),
+        Some([("unit", "ns")].into_py_dict(py))
+    )?;
+
+    // Create a Timedelta for each relative time and add to start time
+    let timedelta_class = pd.getattr(py, "Timedelta")?;
+    let mut absolute_times = Vec::with_capacity(relative_times.len());
+
+    for rel_time in relative_times {
+        // Try to extract the float value from the PyObject
+        let seconds: f64 = rel_time.extract(py)?;
+
+        // Create a Timedelta in seconds and add to start time
+        let delta = timedelta_class.call(
+            py,
+            (seconds,),
+            Some([("unit", "s")].into_py_dict(py))
+        )?;
+        let absolute_time = start_timestamp.call_method1(py, "__add__", (delta,))?;
+        absolute_times.push(absolute_time);
+    }
+
+    // Create DatetimeIndex from the list of timestamps
+    let datetime_index_class = pd.getattr(py, "DatetimeIndex")?;
+    let datetime_index = datetime_index_class.call1(py, (absolute_times,))?;
+
+    Ok(datetime_index)
+}
+
 // Python wrapper for MDF
 #[pyclass]
 pub struct PyMDF {
@@ -428,11 +477,14 @@ impl PyMDF {
         Ok(None)
     }
 
-    /// Get channel data as a pandas Series with time/master channel as index.
+    /// Get channel data as a pandas Series with time/master channel as DatetimeIndex.
     ///
     /// This method reads a channel's values and returns them as a pandas Series
-    /// with the time/master channel values as the index. If no master channel is found,
-    /// or if the queried channel IS the master channel, a default integer index is used.
+    /// with the time/master channel values converted to absolute timestamps as a DatetimeIndex.
+    /// The timestamps are created by adding the relative time values to the MDF start time.
+    /// If no master channel is found, or if the queried channel IS the master channel,
+    /// a default integer index is used. If the MDF file has no start time, falls back to
+    /// numeric index.
     ///
     /// Requires pandas to be installed.
     ///
@@ -449,6 +501,9 @@ impl PyMDF {
     fn get_channel_as_series(&self, py: Python, channel_name: &str) -> PyResult<Option<PyObject>> {
         // Check if pandas is available
         let pd = check_pandas_available(py)?;
+
+        // Get the MDF start time for datetime conversion
+        let start_time_ns = self.mdf.start_time_ns();
 
         // Find the channel
         for group in self.mdf.channel_groups() {
@@ -469,6 +524,8 @@ impl PyMDF {
                                 // Use the master channel values as index
                                 let master_channel = &channels[master_idx];
                                 let master_values = master_channel.values()?;
+
+                                // Convert master values to Python objects
                                 let py_master_values: Vec<PyObject> = master_values.into_iter().map(|opt_val| {
                                     opt_val.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None())
                                 }).collect();
@@ -481,7 +538,20 @@ impl PyMDF {
                                     )));
                                 }
 
-                                py_master_values.to_object(py)
+                                // Try to convert to DatetimeIndex if we have a start time
+                                if let Some(start_ns) = start_time_ns {
+                                    // Attempt to create DatetimeIndex from absolute timestamps
+                                    match create_datetime_index(py, &pd, &py_master_values, start_ns) {
+                                        Ok(datetime_index) => datetime_index,
+                                        Err(_) => {
+                                            // Fall back to numeric index if datetime conversion fails
+                                            py_master_values.to_object(py)
+                                        }
+                                    }
+                                } else {
+                                    // No start time, use numeric index
+                                    py_master_values.to_object(py)
+                                }
                             } else {
                                 // This channel IS the master channel, use default index
                                 py.None()
@@ -907,11 +977,14 @@ impl PyMdfIndex {
         }).collect())
     }
 
-    /// Read channel data as a pandas Series with time/master channel as index.
+    /// Read channel data as a pandas Series with time/master channel as DatetimeIndex.
     ///
     /// This method reads a channel's values from the index and returns them as a pandas Series
-    /// with the time/master channel values as the index. If no master channel is found,
-    /// or if the queried channel IS the master channel, a default integer index is used.
+    /// with the time/master channel values converted to absolute timestamps as a DatetimeIndex.
+    /// The timestamps are created by adding the relative time values to the MDF start time
+    /// stored in the index. If no master channel is found, or if the queried channel IS the
+    /// master channel, a default integer index is used. If the MDF file has no start time,
+    /// falls back to numeric index.
     ///
     /// Requires pandas to be installed.
     ///
@@ -930,6 +1003,9 @@ impl PyMdfIndex {
     fn read_channel_as_series(&self, py: Python, channel_name: &str, file_path: &str) -> PyResult<PyObject> {
         // Check if pandas is available
         let pd = check_pandas_available(py)?;
+
+        // Get the MDF start time from the index for datetime conversion
+        let start_time_ns = self.index.start_time_ns;
 
         // Find the channel
         let (group_idx, channel_idx) = self.find_channel_by_name(channel_name)
@@ -960,7 +1036,20 @@ impl PyMdfIndex {
                     )));
                 }
 
-                py_master_values.to_object(py)
+                // Try to convert to DatetimeIndex if we have a start time
+                if let Some(start_ns) = start_time_ns {
+                    // Attempt to create DatetimeIndex from absolute timestamps
+                    match create_datetime_index(py, &pd, &py_master_values, start_ns) {
+                        Ok(datetime_index) => datetime_index,
+                        Err(_) => {
+                            // Fall back to numeric index if datetime conversion fails
+                            py_master_values.to_object(py)
+                        }
+                    }
+                } else {
+                    // No start time, use numeric index
+                    py_master_values.to_object(py)
+                }
             } else {
                 // This channel IS the master channel, use default index
                 py.None()
