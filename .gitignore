@@ -69,6 +69,8 @@ test_*.py
 *_test.py
 *_debug.py
 temp_*.py
+# Exception: committed interop tests in tests/
+!tests/test_*.py
 
 # IDE
 # RustRover

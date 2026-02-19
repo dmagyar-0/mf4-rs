@@ -275,13 +275,49 @@ Channels with `channel_type == 1` and a non-zero `data` field store variable-len
 
 ## Test Organization
 
+### Running Tests
+
+**Rust tests (always run these after any code change):**
+```bash
+# Run all Rust tests (fast, no external dependencies)
+cargo test
+
+# Run the cross-compatibility suite specifically (10 tests covering all data types,
+# multi-group files, data block splitting, conversions, performance, and spec compliance)
+cargo test --test cross_compatibility
+```
+
+**Python interop tests (run when changing Python bindings or file format):**
+```bash
+# Prerequisites: set up a virtualenv with required packages
+python3 -m venv .venv
+source .venv/bin/activate
+pip install asammdf pandas numpy
+maturin develop --release
+
+# Run 14 cross-library tests (asammdf <-> mf4-rs)
+python tests/test_asammdf_interop.py
+```
+The Python tests exit 0 if dependencies are missing (so CI won't fail without asammdf installed). When dependencies are available, all 14 tests must pass.
+
 ### Integration Tests (`tests/`)
 - `api.rs` - Writer/parser round-trip, data writing, bulk records, block positions, time-based cutting
 - `blocks.rs` - Serialization round-trips for all major block types
 - `index.rs` - Index creation, JSON persistence, metadata queries, byte range calculations, name-based lookups
 - `merge.rs` - Merging files with identical and different channel structures
 - `test_invalidation_bits.rs` - Invalidation flag shortcuts, bit position checking, flag priority, edge cases
+- `cross_compatibility.rs` - **Spec-compliance and regression tests** (10 tests): float32/float64 roundtrip, signed/unsigned integer boundary values, multi-group with master channels, data block splitting (##DL) for 300K records, value-to-text conversions, performance (100K records < 10s), file identification block validation, master channel type/sync verification
 - `enhanced_index_conversions.rs` - Index with text conversions, conversion dependency resolution, index persistence with resolved data (**has a known compile error**: missing `start_time_ns` field in `MdfIndex` constructor)
+
+### Python Cross-Compatibility Tests (`tests/test_asammdf_interop.py`)
+14 tests verifying interoperability between mf4-rs and asammdf:
+- asammdf reads mf4-rs files (basic, multi-group, data block splitting, value-to-text conversions)
+- mf4-rs reads asammdf files (basic, all integer types, float types, units/comments)
+- Cross-read value matching (both libraries produce identical values)
+- Master channel detection by asammdf
+- File identification block correctness
+- Compressed file graceful failure (##DZ → clear error)
+- Performance sanity checks (write < 30s, 10x read < 10s)
 
 ### Unit Tests (`src/blocks/conversion/`)
 - `simple_test.rs` - Basic linear, identity, and value-to-text conversions
