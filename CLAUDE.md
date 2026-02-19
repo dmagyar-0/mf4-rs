@@ -303,3 +303,71 @@ Channels with `channel_type == 1` and a non-zero `data` field store variable-len
 7. **Conversion resolution** - When creating indexes, conversions must be resolved with the file's mmap available; after serialization, they work without file data
 8. **Data block splitting** - Don't assume a single DT block per channel group; the writer may create multiple fragments linked by a DL block
 9. **Record ID** - Many simple files use `record_id_len = 0`, but the code must handle non-zero values (used when multiple channel groups share a data group)
+
+## Comparison with asammdf (Python)
+
+This section documents tested interoperability and differences between `mf4-rs` and `asammdf` 8.7.2 (the dominant open-source Python MDF library). Both libraries produce valid MDF 4.10 files that the other can read.
+
+### Interoperability Status
+
+- **mf4-rs files read by asammdf**: All tested scenarios work correctly, including multi-group files, data block splitting via `##DL`, and value-to-text conversions (conversion type 7)
+- **asammdf files read by mf4-rs**: Works for uncompressed files. asammdf adds an auto-generated lowercase `time` master channel per group (in addition to any user-created `Time` channel), so mf4-rs sees one extra channel per group. Fails on compressed (`##DZ`) files with `BlockIDError`
+- **Value accuracy**: Both produce correct values when cross-reading. All standard integer and float data types (uint8-64, int8-64, float32, float64) round-trip correctly
+
+### Key Structural Differences
+
+| Aspect | mf4-rs | asammdf |
+|--------|--------|---------|
+| **Default float precision** | 32-bit (`default_bits()` returns 32 for FloatLE) | 64-bit (uses numpy float64) |
+| **Master channel** | User-created channel marked as master via `set_time_channel()` | Auto-generates a separate lowercase `time` channel per group |
+| **Channel group name** | `PyMdfWriter.add_channel_group(name)` accepts a name parameter but **does not write it** to the file (the closure `\|_cg\| {}` ignores it) | Writes `comment` and `acq_name` to `##CG` metadata block |
+| **File header timestamp** | Defaults to epoch (1970-01-01) | Sets to current time at file creation |
+| **File history (`##FH`)** | Not written | Writes `##FH` block with tool info |
+| **Metadata blocks (`##MD`)** | Not written | Writes XML `##MD` blocks for group comments |
+| **File size** | ~2.5x smaller for equivalent data (fewer metadata blocks, 32-bit defaults) | Larger due to 64-bit types, extra channels, and metadata |
+| **Program ID** | `mf4-rs` | `amdf8.7.` |
+
+### Feature Comparison
+
+| Feature | mf4-rs | asammdf |
+|---------|--------|---------|
+| MDF versions | 4.1+ only | MDF 2.x, 3.x, 4.x (full spec) |
+| Compression (`##DZ`) | **Not supported** (reader errors on `##DZ` blocks) | Full support (deflate + transposition) |
+| VLSD channels | Read support via `##SD`/`##DL` chains | Full read/write support |
+| Conversions | All 12 types implemented, chained resolution | All types, same spec coverage |
+| Bus logging (CAN/LIN/FlexRay) | No bus-specific support | Full bus extraction and decoding |
+| Attachments | Not supported | Read/write embedded and referenced files |
+| Events/triggers | Not supported | Full support |
+| Signal processing | `cut_mdf_by_time()`, `merge_files()` only | Cut, resample, filter, concatenate, stack |
+| Export formats | JSON index only | CSV, HDF5, Excel, Parquet, MDF3 |
+| Remote file access | `ByteRangeReader` trait (HTTP/S3 pluggable) | Not supported |
+| JSON index system | Yes (unique to mf4-rs) | No equivalent |
+| Byte range calculation | Yes (for HTTP range requests) | No equivalent |
+| Data block auto-splitting | Yes (at 4MB boundary) | Yes |
+| String channels (write) | Via Rust API only (not in Python bindings) | Via numpy byte-string arrays |
+
+### Python API Surface
+
+| Class | mf4-rs | asammdf |
+|-------|--------|---------|
+| Reader | `PyMDF` - 7 methods | `MDF` - 58+ methods |
+| Writer | `PyMdfWriter` - 11 methods | `MDF.append()` + `Signal` (numpy-based) |
+| Index | `PyMdfIndex` - 19 methods | No equivalent |
+
+### Performance (100K records, 4 float channels)
+
+| Operation | mf4-rs | asammdf |
+|-----------|--------|---------|
+| Write | ~0.07s (record-at-a-time loop) | ~0.04s (numpy vectorized) |
+| Read | ~0.03s | ~0.02s |
+| File size | 1.6 MB (32-bit) | 4.0 MB (64-bit) |
+
+Note: asammdf's write advantage comes from numpy vectorized operations (bulk array writes) vs mf4-rs's Python binding overhead of creating `DecodedValue` objects per record. The Rust API is significantly faster for bulk operations via `write_records()` / `write_records_u64()`. When accounting for 64-bit vs 32-bit precision difference, asammdf writes 2x more data per value.
+
+### Recommended Improvements Based on Comparison
+
+1. **Compression support**: Add `##DZ` block reading (deflate decompression) - this is the most impactful missing feature for reading real-world MDF files
+2. **64-bit float default**: The Python `add_float_channel()` uses `default_bits()` which returns 32 for FloatLE. Consider defaulting to 64-bit in the Python API to match scientific computing conventions and avoid precision loss
+3. **Channel group metadata**: The `add_channel_group(name)` parameter is silently ignored - either implement it or remove the parameter
+4. **File header timestamp**: Write the current time to the header block instead of epoch
+5. **File history block**: Write a `##FH` block for tool identification and traceability
