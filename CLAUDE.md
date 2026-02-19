@@ -354,15 +354,26 @@ This section documents tested interoperability and differences between `mf4-rs` 
 | Writer | `PyMdfWriter` - 11 methods | `MDF.append()` + `Signal` (numpy-based) |
 | Index | `PyMdfIndex` - 19 methods | No equivalent |
 
-### Performance (100K records, 4 float channels)
+### Performance (100K records, 4 x f64 channels)
 
-| Operation | mf4-rs | asammdf |
-|-----------|--------|---------|
-| Write | ~0.07s (record-at-a-time loop) | ~0.04s (numpy vectorized) |
-| Read | ~0.03s | ~0.02s |
-| File size | 1.6 MB (32-bit) | 4.0 MB (64-bit) |
+**Rust API (native, --release):**
 
-Note: asammdf's write advantage comes from numpy vectorized operations (bulk array writes) vs mf4-rs's Python binding overhead of creating `DecodedValue` objects per record. The Rust API is significantly faster for bulk operations via `write_records()` / `write_records_u64()`. When accounting for 64-bit vs 32-bit precision difference, asammdf writes 2x more data per value.
+| Operation | Time |
+|-----------|------|
+| `write_record()` loop | ~0.008s |
+| `write_records()` bulk | ~0.013s |
+| `write_records_u64()` bulk | ~0.009s |
+| Read all channels | ~0.006s |
+
+**Python API comparison (same data):**
+
+| Operation | mf4-rs Python bindings | asammdf |
+|-----------|------------------------|---------|
+| Write | ~0.08s (record-at-a-time loop) | ~0.03s (numpy vectorized) |
+| Read | ~0.012s | ~0.011s |
+| File size | 1.6 MB (32-bit default) | 4.0 MB (64-bit default) |
+
+The native Rust API is **4-10x faster than both Python libraries**. The mf4-rs Python bindings appear slower than asammdf for writes because the Python API forces record-at-a-time calls with `DecodedValue` object creation overhead per value. Read performance is essentially identical between the two Python APIs. asammdf's write speed comes from numpy vectorized bulk array writes.
 
 ### Recommended Improvements Based on Comparison
 
