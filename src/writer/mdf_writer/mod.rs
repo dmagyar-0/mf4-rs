@@ -12,7 +12,7 @@ use crate::writer::mdf_writer::data::ChannelEncoder;
 
 mod io;
 mod init;
-mod data;
+pub mod data;
 
 /// Helper structure tracking an open DTBLOCK during writing
 struct OpenDataBlock {

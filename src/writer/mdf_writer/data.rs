@@ -5,6 +5,23 @@ use crate::blocks::common::{BlockHeader, DataType};
 use crate::blocks::data_list_block::DataListBlock;
 use crate::parsing::decoder::DecodedValue;
 
+/// Column data for use with [`MdfWriter::write_columns`].
+///
+/// Each variant holds a slice of typed values for a single channel. All
+/// columns passed to `write_columns` must have the same length (number of
+/// records). The encoder for each channel must match the corresponding
+/// `ColumnData` variant.
+pub enum ColumnData<'a> {
+    /// 64-bit IEEE 754 float values.
+    F64(&'a [f64]),
+    /// 32-bit IEEE 754 float values.
+    F32(&'a [f32]),
+    /// Unsigned 64-bit integer values.
+    U64(&'a [u64]),
+    /// Signed 64-bit integer values.
+    I64(&'a [i64]),
+}
+
 pub(super) enum ChannelEncoder {
     UInt { offset: usize, bytes: usize },
     Int { offset: usize, bytes: usize },
@@ -316,6 +333,15 @@ impl MdfWriter {
             })?.record_size;
             dt
         };
+        // Check ONCE that all encoders are unsigned integer type
+        {
+            let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+                MdfError::BlockSerializationError("no open DT block for this channel group".into())
+            })?;
+            if !dt.encoders.iter().all(|e| matches!(e, ChannelEncoder::UInt { .. })) {
+                return Err(MdfError::BlockSerializationError("channel types not unsigned".into()));
+            }
+        }
         let max_records = (MAX_DT_BLOCK_SIZE - 24) / record_size;
         let mut buffer = Vec::with_capacity(record_size * max_records);
         for rec in records {
@@ -325,9 +351,6 @@ impl MdfWriter {
                 })?;
                 if rec.len() != dt.encoders.len() {
                     return Err(MdfError::BlockSerializationError("value count mismatch".into()));
-                }
-                if !dt.encoders.iter().all(|e| matches!(e, ChannelEncoder::UInt { .. })) {
-                    return Err(MdfError::BlockSerializationError("channel types not unsigned".into()));
                 }
                 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
             };
@@ -374,6 +397,349 @@ impl MdfWriter {
         if !buffer.is_empty() {
             self.file.write_all(&buffer)?;
             self.offset += buffer.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Helper: finalize the current DT block fragment, update its size, and start a new one.
+    /// Called internally when a DT block would exceed MAX_DT_BLOCK_SIZE.
+    fn split_dt_block(&mut self, cg_id: &str, buffer: &mut Vec<u8>) -> Result<(), MdfError> {
+        // Flush pending bytes first
+        if !buffer.is_empty() {
+            self.file.write_all(buffer)?;
+            self.offset += buffer.len() as u64;
+            buffer.clear();
+        }
+        let (start_pos, record_count, record_size) = {
+            let dt = self.open_dts.get(cg_id).unwrap();
+            (dt.start_pos, dt.record_count, dt.record_size)
+        };
+        let size = 24 + record_size * record_count as usize;
+        self.update_link(start_pos + 8, size as u64)?;
+        {
+            let dt = self.open_dts.get_mut(cg_id).unwrap();
+            dt.total_record_count += record_count;
+            dt.dt_sizes.push(size as u64);
+        }
+        let header = BlockHeader { id: "##DT".to_string(), reserved0: 0, block_len: 24, links_nr: 0 };
+        let header_bytes = header.to_bytes()?;
+        let new_dt_id = format!("dt_{}", self.dt_counter);
+        self.dt_counter += 1;
+        let new_dt_pos = self.write_block_with_id(&header_bytes, &new_dt_id)?;
+
+        let dt = self.open_dts.get_mut(cg_id).unwrap();
+        dt.dt_id = new_dt_id.clone();
+        dt.start_pos = new_dt_pos;
+        dt.record_count = 0;
+        dt.dt_ids.push(new_dt_id);
+        dt.dt_positions.push(new_dt_pos);
+        Ok(())
+    }
+
+    /// Batch write for uniform f64/f32 channel groups.
+    ///
+    /// Each item yielded by `records` is a slice of `f64` values — one per
+    /// channel — for a single record. This avoids the `DecodedValue`
+    /// allocation overhead of `write_records` while still supporting mixed
+    /// 32-/64-bit float groups: channels whose encoder is `F32` will have
+    /// their value narrowed to `f32` automatically.
+    ///
+    /// Returns an error if any encoder is not a float type.
+    pub fn write_records_f64<'a, I>(&mut self, cg_id: &str, records: I) -> Result<(), MdfError>
+    where
+        I: IntoIterator<Item = &'a [f64]>,
+    {
+        let record_size = {
+            let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+                MdfError::BlockSerializationError("no open DT block for this channel group".into())
+            })?.record_size;
+            dt
+        };
+        // Check ONCE that all encoders are float types (F32 or F64).
+        {
+            let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+                MdfError::BlockSerializationError("no open DT block for this channel group".into())
+            })?;
+            if !dt.encoders.iter().all(|e| matches!(e, ChannelEncoder::F32 { .. } | ChannelEncoder::F64 { .. })) {
+                return Err(MdfError::BlockSerializationError("channel types not float".into()));
+            }
+        }
+        let max_records = (MAX_DT_BLOCK_SIZE - 24) / record_size;
+        let mut buffer = Vec::with_capacity(record_size * max_records);
+        for rec in records {
+            let potential_new_block = {
+                let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+                    MdfError::BlockSerializationError("no open DT block for this channel group".into())
+                })?;
+                if rec.len() != dt.encoders.len() {
+                    return Err(MdfError::BlockSerializationError("value count mismatch".into()));
+                }
+                24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
+            };
+
+            if potential_new_block {
+                self.split_dt_block(cg_id, &mut buffer)?;
+            }
+
+            let dt = self.open_dts.get_mut(cg_id).unwrap();
+            dt.record_buf.copy_from_slice(&dt.record_template);
+            for (enc, &v) in dt.encoders.iter().zip(rec.iter()) {
+                match enc {
+                    ChannelEncoder::F64 { offset } => {
+                        dt.record_buf[*offset..*offset + 8].copy_from_slice(&v.to_le_bytes());
+                    }
+                    ChannelEncoder::F32 { offset } => {
+                        dt.record_buf[*offset..*offset + 4].copy_from_slice(&(v as f32).to_le_bytes());
+                    }
+                    _ => {}
+                }
+            }
+            buffer.extend_from_slice(&dt.record_buf);
+            dt.record_count += 1;
+        }
+
+        if !buffer.is_empty() {
+            self.file.write_all(&buffer)?;
+            self.offset += buffer.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Columnar write for uniform f64 channel groups.
+    ///
+    /// `columns` holds one `&[f64]` slice per channel; all slices must have
+    /// the same length (= number of records to write). All encoders must be
+    /// `F64`. Values are written channel-by-column into a pre-allocated
+    /// record buffer, then flushed to disk in one `write_all` per DT chunk.
+    /// This eliminates per-record overhead and is the fastest available write
+    /// path for f64-only groups.
+    pub fn write_columns_f64(&mut self, cg_id: &str, columns: &[&[f64]]) -> Result<(), MdfError> {
+        // Validate inputs and extract metadata once.
+        let (offsets, record_size, nrows, need_template, template) = {
+            let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+                MdfError::BlockSerializationError("no open DT block for this channel group".into())
+            })?;
+            if columns.len() != dt.encoders.len() {
+                return Err(MdfError::BlockSerializationError("column count does not match encoder count".into()));
+            }
+            if !dt.encoders.iter().all(|e| matches!(e, ChannelEncoder::F64 { .. })) {
+                return Err(MdfError::BlockSerializationError("channel types not f64".into()));
+            }
+            let nrows = columns.first().map(|c| c.len()).unwrap_or(0);
+            if columns.iter().any(|c| c.len() != nrows) {
+                return Err(MdfError::BlockSerializationError("column length mismatch".into()));
+            }
+            let offsets: Vec<usize> = dt.encoders.iter().map(|e| match e {
+                ChannelEncoder::F64 { offset } => *offset,
+                _ => 0,
+            }).collect();
+            // Skip template stamping when all record bytes are covered by f64 channels.
+            let need_template = columns.len() * 8 < dt.record_size;
+            let template = dt.record_template.clone();
+            (offsets, dt.record_size, nrows, need_template, template)
+        };
+
+        if nrows == 0 {
+            return Ok(());
+        }
+
+        let max_per_dt = (MAX_DT_BLOCK_SIZE - 24) / record_size;
+        let ncols = columns.len();
+        let record_f64s = record_size / 8;
+        // Check if channels are tightly packed f64 values (common case: no gaps, 8-byte aligned).
+        let contiguous = !need_template && record_size == ncols * 8
+            && offsets.iter().enumerate().all(|(i, &off)| off == i * 8);
+
+        // Pre-allocate the write buffer once at maximum chunk size.
+        let mut buf = vec![0u8; max_per_dt * record_size];
+
+        let mut row = 0usize;
+        while row < nrows {
+            let records_in_current = {
+                let dt = &self.open_dts[cg_id];
+                let capacity = (MAX_DT_BLOCK_SIZE - 24) / dt.record_size;
+                capacity.saturating_sub(dt.record_count as usize)
+            };
+            let chunk_size = (nrows - row).min(records_in_current).min(max_per_dt);
+            if chunk_size == 0 {
+                let mut empty = Vec::new();
+                self.split_dt_block(cg_id, &mut empty)?;
+                continue;
+            }
+
+            let buf_len = chunk_size * record_size;
+
+            if contiguous {
+                // Fast path: channels are contiguous f64s — write directly via f64 pointer.
+                // SAFETY: buf is aligned to at least 1 byte, and we use write_unaligned.
+                // The buffer has capacity max_per_dt * record_size >= chunk_size * record_size.
+                let f64_count = chunk_size * record_f64s;
+                let f64_buf = unsafe {
+                    std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut f64, f64_count)
+                };
+                for (col_idx, col) in columns.iter().enumerate() {
+                    for r in 0..chunk_size {
+                            f64_buf[r * record_f64s + col_idx] = f64::from_bits(col[row + r].to_bits().to_le());
+                    }
+                }
+            } else {
+                // General path: stamp template if needed, then write columns at offsets.
+                if need_template {
+                    for r in 0..chunk_size {
+                        buf[r * record_size..(r + 1) * record_size].copy_from_slice(&template);
+                    }
+                }
+                for (col_idx, col) in columns.iter().enumerate() {
+                    let off = offsets[col_idx];
+                    for r in 0..chunk_size {
+                        let base = r * record_size + off;
+                        buf[base..base + 8].copy_from_slice(&col[row + r].to_le_bytes());
+                    }
+                }
+            }
+
+            self.file.write_all(&buf[..buf_len])?;
+            self.offset += buf_len as u64;
+            {
+                let dt = self.open_dts.get_mut(cg_id).unwrap();
+                dt.record_count += chunk_size as u64;
+            }
+            row += chunk_size;
+        }
+        Ok(())
+    }
+
+    /// Columnar write for mixed-type channel groups.
+    ///
+    /// `columns` holds one [`ColumnData`] per channel. All columns must have
+    /// the same length. Each `ColumnData` variant must match the corresponding
+    /// channel's encoder type. Values are written column-by-column into a
+    /// pre-allocated record buffer and flushed in large chunks, avoiding
+    /// per-record dispatch overhead.
+    pub fn write_columns(&mut self, cg_id: &str, columns: &[ColumnData<'_>]) -> Result<(), MdfError> {
+        // Validate and extract metadata once.
+        let (nrows, enc_info, record_size, need_template, template) = {
+            let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+                MdfError::BlockSerializationError("no open DT block for this channel group".into())
+            })?;
+            if columns.len() != dt.encoders.len() {
+                return Err(MdfError::BlockSerializationError("column count does not match encoder count".into()));
+            }
+            let nrows = match columns.first() {
+                Some(ColumnData::F64(s)) => s.len(),
+                Some(ColumnData::F32(s)) => s.len(),
+                Some(ColumnData::U64(s)) => s.len(),
+                Some(ColumnData::I64(s)) => s.len(),
+                None => 0,
+            };
+            let mut total_channel_bytes = 0usize;
+            for (col, enc) in columns.iter().zip(dt.encoders.iter()) {
+                let col_len = match col {
+                    ColumnData::F64(s) => s.len(),
+                    ColumnData::F32(s) => s.len(),
+                    ColumnData::U64(s) => s.len(),
+                    ColumnData::I64(s) => s.len(),
+                };
+                if col_len != nrows {
+                    return Err(MdfError::BlockSerializationError("column length mismatch".into()));
+                }
+                let type_ok = match (col, enc) {
+                    (ColumnData::F64(_), ChannelEncoder::F64 { .. }) => true,
+                    (ColumnData::F32(_), ChannelEncoder::F32 { .. }) => true,
+                    (ColumnData::U64(_), ChannelEncoder::UInt { .. }) => true,
+                    (ColumnData::I64(_), ChannelEncoder::Int { .. }) => true,
+                    _ => false,
+                };
+                if !type_ok {
+                    return Err(MdfError::BlockSerializationError("column type does not match encoder type".into()));
+                }
+            }
+            let enc_info: Vec<(usize, usize)> = dt.encoders.iter().map(|e| match e {
+                ChannelEncoder::F64 { offset } => (*offset, 8usize),
+                ChannelEncoder::F32 { offset } => (*offset, 4usize),
+                ChannelEncoder::UInt { offset, bytes } => (*offset, *bytes),
+                ChannelEncoder::Int { offset, bytes } => (*offset, *bytes),
+                ChannelEncoder::Bytes { offset, bytes } => (*offset, *bytes),
+                ChannelEncoder::Skip => (0, 0),
+            }).collect();
+            for &(_, nbytes) in &enc_info {
+                total_channel_bytes += nbytes;
+            }
+            let need_template = total_channel_bytes < dt.record_size;
+            let template = dt.record_template.clone();
+            (nrows, enc_info, dt.record_size, need_template, template)
+        };
+
+        if nrows == 0 {
+            return Ok(());
+        }
+
+        let max_per_dt = (MAX_DT_BLOCK_SIZE - 24) / record_size;
+        let mut buf = vec![0u8; max_per_dt * record_size];
+
+        let mut row = 0usize;
+        while row < nrows {
+            let records_in_current = {
+                let dt = &self.open_dts[cg_id];
+                let capacity = (MAX_DT_BLOCK_SIZE - 24) / dt.record_size;
+                capacity.saturating_sub(dt.record_count as usize)
+            };
+            let chunk_size = (nrows - row).min(records_in_current).min(max_per_dt);
+            if chunk_size == 0 {
+                let mut empty = Vec::new();
+                self.split_dt_block(cg_id, &mut empty)?;
+                continue;
+            }
+
+            let buf_len = chunk_size * record_size;
+            if need_template {
+                for r in 0..chunk_size {
+                    buf[r * record_size..(r + 1) * record_size].copy_from_slice(&template);
+                }
+            }
+
+            for (col_idx, col) in columns.iter().enumerate() {
+                let (off, nbytes) = enc_info[col_idx];
+                if nbytes == 0 {
+                    continue;
+                }
+                match col {
+                    ColumnData::F64(vals) => {
+                        for r in 0..chunk_size {
+                            let base = r * record_size + off;
+                            buf[base..base + 8].copy_from_slice(&vals[row + r].to_le_bytes());
+                        }
+                    }
+                    ColumnData::F32(vals) => {
+                        for r in 0..chunk_size {
+                            let base = r * record_size + off;
+                            buf[base..base + 4].copy_from_slice(&vals[row + r].to_le_bytes());
+                        }
+                    }
+                    ColumnData::U64(vals) => {
+                        for r in 0..chunk_size {
+                            let base = r * record_size + off;
+                            let b = vals[row + r].to_le_bytes();
+                            buf[base..base + nbytes].copy_from_slice(&b[..nbytes]);
+                        }
+                    }
+                    ColumnData::I64(vals) => {
+                        for r in 0..chunk_size {
+                            let base = r * record_size + off;
+                            let b = vals[row + r].to_le_bytes();
+                            buf[base..base + nbytes].copy_from_slice(&b[..nbytes]);
+                        }
+                    }
+                }
+            }
+
+            self.file.write_all(&buf[..buf_len])?;
+            self.offset += buf_len as u64;
+            {
+                let dt = self.open_dts.get_mut(cg_id).unwrap();
+                dt.record_count += chunk_size as u64;
+            }
+            row += chunk_size;
         }
         Ok(())
     }

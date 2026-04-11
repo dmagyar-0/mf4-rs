@@ -8,11 +8,11 @@
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 use pyo3::{create_exception, wrap_pyfunction};
-use numpy::PyArray1;
+use numpy::{PyArray1, PyReadonlyArray1};
 use std::collections::HashMap;
 
 use crate::api::mdf::MDF;
-use crate::writer::MdfWriter;
+use crate::writer::{MdfWriter, ColumnData};
 use crate::index::{MdfIndex, FileRangeReader, IndexedChannel};
 use crate::blocks::common::DataType;
 use crate::parsing::decoder::DecodedValue;
@@ -577,6 +577,31 @@ pub struct PyMdfWriter {
     next_id: usize,
 }
 
+impl PyMdfWriter {
+    fn add_channel_with_bits(&mut self, group_id: &str, name: &str, data_type: PyDataType, bit_count: u32) -> PyResult<String> {
+        if let Some(ref mut writer) = self.writer {
+            let cg_id = self.channel_groups.get(group_id)
+                .ok_or_else(|| MdfException::new_err("Channel group not found"))?;
+            let prev_channel_id = self.last_channels.get(group_id)
+                .and_then(|py_id| self.channels.get(py_id))
+                .cloned();
+            let rust_data_type = DataType::from(data_type);
+            let ch_id = writer.add_channel(cg_id, prev_channel_id.as_ref().map(|s| s.as_str()), |ch| {
+                ch.data_type = rust_data_type.clone();
+                ch.name = Some(name.to_string());
+                ch.bit_count = bit_count;
+            })?;
+            let py_id = format!("ch_{}", self.next_id);
+            self.next_id += 1;
+            self.channels.insert(py_id.clone(), ch_id);
+            self.last_channels.insert(group_id.to_string(), py_id.clone());
+            Ok(py_id)
+        } else {
+            Err(MdfException::new_err("Writer has been finalized"))
+        }
+    }
+}
+
 #[pymethods]
 impl PyMdfWriter {
     /// Create a new MdfWriter
@@ -620,59 +645,37 @@ impl PyMdfWriter {
     }
     
     /// Add a channel to a channel group with automatic linking and bit count
-    fn add_channel(&mut self, 
-                   group_id: &str, 
+    fn add_channel(&mut self,
+                   group_id: &str,
                    name: &str,
                    data_type: PyDataType) -> PyResult<String> {
-        if let Some(ref mut writer) = self.writer {
-            let cg_id = self.channel_groups.get(group_id)
-                .ok_or_else(|| MdfException::new_err("Channel group not found"))?;
-            
-            // Automatic linking: link to the previous channel in this group
-            let prev_channel_id = self.last_channels.get(group_id)
-                .and_then(|py_id| self.channels.get(py_id))
-                .cloned();
-            
-            let rust_data_type = DataType::from(data_type);
-            let ch_id = writer.add_channel(cg_id, prev_channel_id.as_ref().map(|s| s.as_str()), |ch| {
-                ch.data_type = rust_data_type.clone();
-                ch.name = Some(name.to_string());
-                // Automatic bit count from data type
-                ch.bit_count = rust_data_type.default_bits();
-            })?;
-            
-            let py_id = format!("ch_{}", self.next_id);
-            self.next_id += 1;
-            self.channels.insert(py_id.clone(), ch_id);
-            
-            // Update the last channel for this group
-            self.last_channels.insert(group_id.to_string(), py_id.clone());
-            
-            Ok(py_id)
-        } else {
-            Err(MdfException::new_err("Writer has been finalized"))
-        }
+        let bits = {
+            let rust_dt = DataType::from(data_type.clone());
+            rust_dt.default_bits()
+        };
+        self.add_channel_with_bits(group_id, name, data_type, bits)
     }
     
     /// Add a time channel (float64, commonly used as master channel)
     fn add_time_channel(&mut self, group_id: &str, name: &str) -> PyResult<String> {
-        let float_type = PyDataType { name: "FloatLE".to_string(), value: 4 };
-        let ch_id = self.add_channel(group_id, name, float_type)?;
-        // Automatically set as time/master channel
+        let ch_id = self.add_channel_with_bits(group_id, name, PyDataType { name: "FloatLE".to_string(), value: 4 }, 64)?;
         self.set_time_channel(&ch_id)?;
         Ok(ch_id)
     }
-    
-    /// Add a float data channel
+
+    /// Add a float64 data channel (default for scientific data)
     fn add_float_channel(&mut self, group_id: &str, name: &str) -> PyResult<String> {
-        let float_type = PyDataType { name: "FloatLE".to_string(), value: 4 };
-        self.add_channel(group_id, name, float_type)
+        self.add_channel_with_bits(group_id, name, PyDataType { name: "FloatLE".to_string(), value: 4 }, 64)
     }
-    
-    /// Add an integer data channel
+
+    /// Add a float32 data channel
+    fn add_float32_channel(&mut self, group_id: &str, name: &str) -> PyResult<String> {
+        self.add_channel_with_bits(group_id, name, PyDataType { name: "FloatLE".to_string(), value: 4 }, 32)
+    }
+
+    /// Add an integer data channel (64-bit unsigned)
     fn add_int_channel(&mut self, group_id: &str, name: &str) -> PyResult<String> {
-        let uint_type = PyDataType { name: "UnsignedIntegerLE".to_string(), value: 0 };
-        self.add_channel(group_id, name, uint_type)
+        self.add_channel_with_bits(group_id, name, PyDataType { name: "UnsignedIntegerLE".to_string(), value: 0 }, 64)
     }
     
     /// Set a channel as time/master channel
@@ -725,6 +728,93 @@ impl PyMdfWriter {
         }
     }
     
+    /// Write multiple channels at once using numpy float64 arrays (one array per channel).
+    ///
+    /// `columns` must be a list of 1-D numpy float64 arrays all of the same length.
+    /// This is significantly faster than calling `write_record` in a loop.
+    fn write_columns_f64(&mut self, _py: Python<'_>, group_id: &str, columns: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
+        if let Some(ref mut writer) = self.writer {
+            let cg_id = self.channel_groups.get(group_id)
+                .ok_or_else(|| MdfException::new_err("Channel group not found"))?
+                .clone();
+
+            let arrays: Vec<PyReadonlyArray1<f64>> = columns.iter()
+                .map(|c| c.extract::<PyReadonlyArray1<f64>>())
+                .collect::<PyResult<Vec<_>>>()?;
+            let slices: Vec<&[f64]> = arrays.iter()
+                .map(|a| a.as_slice().map_err(|e| MdfException::new_err(format!("Array not contiguous: {}", e))))
+                .collect::<PyResult<Vec<_>>>()?;
+
+            writer.write_columns_f64(&cg_id, &slices)?;
+            Ok(())
+        } else {
+            Err(MdfException::new_err("Writer has been finalized"))
+        }
+    }
+
+    /// Write multiple channels at once using numpy arrays with explicit dtype strings.
+    ///
+    /// `columns` is a list of 1-D numpy arrays (all the same length).
+    /// `dtypes` is a list of strings matching each column: `"f64"`, `"f32"`, `"u64"`, or `"i64"`.
+    /// This is significantly faster than calling `write_record` in a loop.
+    fn write_columns(&mut self, _py: Python<'_>, group_id: &str, columns: Vec<Bound<'_, PyAny>>, dtypes: Vec<String>) -> PyResult<()> {
+        if columns.len() != dtypes.len() {
+            return Err(MdfException::new_err(format!(
+                "columns length ({}) must match dtypes length ({})",
+                columns.len(), dtypes.len()
+            )));
+        }
+
+        if let Some(ref mut writer) = self.writer {
+            let cg_id = self.channel_groups.get(group_id)
+                .ok_or_else(|| MdfException::new_err("Channel group not found"))?
+                .clone();
+
+            // We need to keep the extracted arrays alive for the duration of the call.
+            // Use an enum to hold each typed array so lifetimes work out.
+            enum OwnedArray<'py> {
+                F64(PyReadonlyArray1<'py, f64>),
+                F32(PyReadonlyArray1<'py, f32>),
+                U64(PyReadonlyArray1<'py, u64>),
+                I64(PyReadonlyArray1<'py, i64>),
+            }
+
+            let owned: Vec<OwnedArray<'_>> = columns.iter().zip(dtypes.iter())
+                .map(|(col, dtype)| match dtype.as_str() {
+                    "f64" => col.extract::<PyReadonlyArray1<f64>>().map(OwnedArray::F64),
+                    "f32" => col.extract::<PyReadonlyArray1<f32>>().map(OwnedArray::F32),
+                    "u64" => col.extract::<PyReadonlyArray1<u64>>().map(OwnedArray::U64),
+                    "i64" => col.extract::<PyReadonlyArray1<i64>>().map(OwnedArray::I64),
+                    other => Err(MdfException::new_err(format!(
+                        "Unknown dtype '{}'; expected one of: f64, f32, u64, i64", other
+                    ))),
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+
+            let column_data: Vec<ColumnData<'_>> = owned.iter()
+                .map(|arr| match arr {
+                    OwnedArray::F64(a) => a.as_slice()
+                        .map(ColumnData::F64)
+                        .map_err(|e| MdfException::new_err(format!("Array not contiguous: {}", e))),
+                    OwnedArray::F32(a) => a.as_slice()
+                        .map(ColumnData::F32)
+                        .map_err(|e| MdfException::new_err(format!("Array not contiguous: {}", e))),
+                    OwnedArray::U64(a) => a.as_slice()
+                        .map(ColumnData::U64)
+                        .map_err(|e| MdfException::new_err(format!("Array not contiguous: {}", e))),
+                    OwnedArray::I64(a) => a.as_slice()
+                        .map(ColumnData::I64)
+                        .map_err(|e| MdfException::new_err(format!("Array not contiguous: {}", e))),
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+
+            writer.write_columns(&cg_id, &column_data)?;
+            Ok(())
+        } else {
+            Err(MdfException::new_err("Writer has been finalized"))
+        }
+    }
+
     /// Finalize the writer and close the file
     fn finalize(&mut self) -> PyResult<()> {
         if let Some(writer) = self.writer.take() {
