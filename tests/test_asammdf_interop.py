@@ -162,10 +162,9 @@ def test_mf4rs_reads_asammdf_basic():
 
         temp_vals = mdf.get_channel_values("Temperature")
         assert temp_vals is not None, "Temperature channel not found"
-        valid = [v for v in temp_vals if v is not None]
-        assert len(valid) == 100, f"expected 100 values, got {len(valid)}"
-        assert abs(valid[0] - 20.0) < 0.001, f"first temp should be 20.0, got {valid[0]}"
-        assert abs(valid[99] - 69.5) < 0.001, f"last temp should be 69.5, got {valid[99]}"
+        assert len(temp_vals) == 100, f"expected 100 values, got {len(temp_vals)}"
+        assert abs(temp_vals[0] - 20.0) < 0.001, f"first temp should be 20.0, got {temp_vals[0]}"
+        assert abs(temp_vals[99] - 69.5) < 0.001, f"last temp should be 69.5, got {temp_vals[99]}"
     finally:
         cleanup(path)
 
@@ -174,10 +173,10 @@ def test_cross_read_values_match():
     """Values written by mf4-rs match when read by both libraries."""
     path = write_mf4rs_basic()
     try:
-        # Read with mf4-rs
+        # Read with mf4-rs (returns numpy arrays)
         rs_mdf = mf4_rs.PyMDF(path)
-        rs_temp = [v for v in rs_mdf.get_channel_values("Temperature") if v is not None]
-        rs_count = [v for v in rs_mdf.get_channel_values("Counter") if v is not None]
+        rs_temp = rs_mdf.get_channel_values("Temperature")
+        rs_count = rs_mdf.get_channel_values("Counter")
 
         # Read with asammdf
         a_mdf = AsamMDF(path)
@@ -221,10 +220,15 @@ def test_all_integer_types_roundtrip():
 
             rs_mdf = mf4_rs.PyMDF(path)
             rs_vals = rs_mdf.get_channel_values(name)
-            valid = [v for v in rs_vals if v is not None]
-            assert len(valid) == len(values), f"{name}: expected {len(values)}, got {len(valid)}"
-            for orig, read in zip(values, valid):
-                assert int(orig) == int(read), f"{name}: expected {orig}, got {read}"
+            assert len(rs_vals) == len(values), f"{name}: expected {len(values)}, got {len(rs_vals)}"
+            for orig, read in zip(values, rs_vals):
+                # Values are returned as float64, which has 53 bits of precision.
+                # For large integers (>2^53), check relative error instead of exact match.
+                if abs(orig) > 2**53:
+                    rel_err = abs(float(orig) - read) / abs(float(orig))
+                    assert rel_err < 1e-15, f"{name}: expected {orig}, got {read} (rel_err={rel_err})"
+                else:
+                    assert int(orig) == int(read), f"{name}: expected {orig}, got {read}"
     finally:
         cleanup(*paths)
 
@@ -248,9 +252,8 @@ def test_float_types_roundtrip():
 
             rs_mdf = mf4_rs.PyMDF(path)
             rs_vals = rs_mdf.get_channel_values(name)
-            valid = [v for v in rs_vals if v is not None]
-            assert len(valid) == len(values), f"{name}: expected {len(values)}, got {len(valid)}"
-            for orig, read in zip(values, valid):
+            assert len(rs_vals) == len(values), f"{name}: expected {len(values)}, got {len(rs_vals)}"
+            for orig, read in zip(values, rs_vals):
                 tol = 1e-2 if name == "float32" else 1e-10
                 assert abs(orig - read) < tol, f"{name}: expected {orig}, got {read}"
     finally:
@@ -346,7 +349,7 @@ def test_compressed_file_fails_gracefully():
 
         try:
             rs_mdf = mf4_rs.PyMDF(path)
-            rs_mdf.get_channel_values("data")
+            _ = rs_mdf.get_channel_values("data")
             # If we get here without error, compression support was added
             print("    (NOTE: ##DZ reading now works - update comparison docs)")
         except Exception as e:

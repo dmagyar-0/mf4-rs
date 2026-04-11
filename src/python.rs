@@ -8,6 +8,7 @@
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 use pyo3::{create_exception, wrap_pyfunction};
+use numpy::PyArray1;
 use std::collections::HashMap;
 
 use crate::api::mdf::MDF;
@@ -457,20 +458,20 @@ impl PyMDF {
         Ok(names)
     }
     
-    /// Get channel values by name (first match).
+    /// Get channel values by name (first match) as a numpy float64 array.
+    ///
+    /// Returns channel data directly as a numpy ndarray. This is the fastest
+    /// way to read numeric channels. Non-decodable values are returned as NaN.
     ///
     /// Returns None if the channel is not found.
-    /// Inner Option represents invalid/missing samples: None = invalid, Some = valid value.
-    /// Returns a list of native Python values (float, int, str, bytes).
-    fn get_channel_values(&self, py: Python, channel_name: &str) -> PyResult<Option<Vec<Option<PyObject>>>> {
+    fn get_channel_values<'py>(&self, py: Python<'py>, channel_name: &str) -> PyResult<Option<PyObject>> {
         for group in self.mdf.channel_groups() {
             for channel in group.channels() {
                 if let Some(name) = channel.name()? {
                     if name == channel_name {
-                        let values = channel.values()?;
-                        return Ok(Some(values.into_iter().map(|opt_val| {
-                            opt_val.map(|dv| decoded_value_to_pyobject(dv, py))
-                        }).collect()));
+                        let values = channel.values_as_f64()?;
+                        let array = PyArray1::from_vec_bound(py, values);
+                        return Ok(Some(array.into()));
                     }
                 }
             }
@@ -478,140 +479,89 @@ impl PyMDF {
         Ok(None)
     }
 
-    /// Get channel values by channel group name and channel name.
+    /// Get channel values by channel group name and channel name as numpy array.
     ///
-    /// This method looks up the channel group by name first, then finds the channel
-    /// within that specific group. Returns None if either the group or channel is not found.
-    /// Inner Option represents invalid/missing samples: None = invalid, Some = valid value.
-    /// Returns a list of native Python values (float, int, str, bytes).
-    fn get_channel_values_by_group_and_name(&self, py: Python, group_name: &str, channel_name: &str) -> PyResult<Option<Vec<Option<PyObject>>>> {
+    /// Returns None if either the group or channel is not found.
+    fn get_channel_values_by_group_and_name<'py>(&self, py: Python<'py>, group_name: &str, channel_name: &str) -> PyResult<Option<PyObject>> {
         for group in self.mdf.channel_groups() {
-            // Check if this is the group we're looking for
             if let Some(gname) = group.name()? {
                 if gname == group_name {
-                    // Found the group, now look for the channel
                     for channel in group.channels() {
                         if let Some(cname) = channel.name()? {
                             if cname == channel_name {
-                                let values = channel.values()?;
-                                return Ok(Some(values.into_iter().map(|opt_val| {
-                                    opt_val.map(|dv| decoded_value_to_pyobject(dv, py))
-                                }).collect()));
+                                let values = channel.values_as_f64()?;
+                                let array = PyArray1::from_vec_bound(py, values);
+                                return Ok(Some(array.into()));
                             }
                         }
                     }
-                    // Group found but channel not found
                     return Ok(None);
                 }
             }
         }
-        // Group not found
         Ok(None)
     }
 
     /// Get channel data as a pandas Series with time/master channel as DatetimeIndex.
     ///
-    /// This method reads a channel's values and returns them as a pandas Series
-    /// with the time/master channel values converted to absolute timestamps as a DatetimeIndex.
-    /// The timestamps are created by adding the relative time values to the MDF start time.
-    /// If no master channel is found, or if the queried channel IS the master channel,
-    /// a default integer index is used. If the MDF file has no start time, falls back to
-    /// numeric index.
-    ///
-    /// Requires pandas to be installed.
-    ///
-    /// # Arguments
-    /// * `channel_name` - Name of the channel to read
-    ///
-    /// # Returns
     /// Returns None if the channel is not found, otherwise returns a pandas Series.
-    ///
-    /// # Errors
-    /// Returns an error if:
-    /// - pandas is not installed
-    /// - the master channel has a different number of values than the data channel
     fn get_channel_as_series(&self, py: Python, channel_name: &str) -> PyResult<Option<PyObject>> {
-        // Check if pandas is available
         let pd = check_pandas_available(py)?;
-
-        // Get the MDF start time for datetime conversion
         let start_time_ns = self.mdf.start_time_ns();
 
-        // Find the channel
         for group in self.mdf.channel_groups() {
             let channels = group.channels();
 
             for (ch_idx, channel) in channels.iter().enumerate() {
                 if let Some(name) = channel.name()? {
                     if name == channel_name {
-                        // Found the channel, get its values
-                        let values = channel.values()?;
-                        let py_values: Vec<PyObject> = values.into_iter().map(|opt_val| {
-                            opt_val.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None())
-                        }).collect();
+                        let values = channel.values_as_f64()?;
+                        let py_values = PyArray1::from_vec_bound(py, values);
 
-                        // Find the master/time channel for this group
                         let index: PyObject = if let Some(master_idx) = find_master_channel(&channels) {
                             if master_idx != ch_idx {
-                                // Use the master channel values as index
-                                let master_channel = &channels[master_idx];
-                                let master_values = master_channel.values()?;
+                                let master_values = channels[master_idx].values_as_f64()?;
+                                let py_master = PyArray1::from_vec_bound(py, master_values);
 
-                                // Convert master values to Python objects
-                                let py_master_values: Vec<PyObject> = master_values.into_iter().map(|opt_val| {
-                                    opt_val.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None())
-                                }).collect();
-
-                                // Validate that lengths match
-                                if py_master_values.len() != py_values.len() {
-                                    return Err(MdfException::new_err(format!(
-                                        "Master channel length ({}) does not match data channel length ({}) for channel '{}'",
-                                        py_master_values.len(), py_values.len(), channel_name
-                                    )));
-                                }
-
-                                // Try to convert to DatetimeIndex if we have a start time
                                 if let Some(start_ns) = start_time_ns {
-                                    // Attempt to create DatetimeIndex from absolute timestamps
-                                    match create_datetime_index(py, &pd, &py_master_values, start_ns) {
+                                    // Vectorized datetime conversion using pandas
+                                    let to_datetime = pd.getattr(py, "to_datetime")?;
+                                    let to_timedelta = pd.getattr(py, "to_timedelta")?;
+                                    let start_ts = to_datetime.call(
+                                        py, (start_ns,),
+                                        Some([("unit", "ns")].into_py_dict(py))
+                                    )?;
+                                    let deltas = to_timedelta.call(
+                                        py, (py_master.clone(),),
+                                        Some([("unit", "s")].into_py_dict(py))
+                                    )?;
+                                    match deltas.call_method1(py, "__add__", (start_ts,)) {
                                         Ok(datetime_index) => datetime_index,
-                                        Err(_) => {
-                                            // Fall back to numeric index if datetime conversion fails
-                                            py_master_values.to_object(py)
-                                        }
+                                        Err(_) => py_master.into(),
                                     }
                                 } else {
-                                    // No start time, use numeric index
-                                    py_master_values.to_object(py)
+                                    py_master.into()
                                 }
                             } else {
-                                // This channel IS the master channel, use default index
                                 py.None()
                             }
                         } else {
-                            // No master channel found, use default index
                             py.None()
                         };
 
-                        // Create pandas Series
                         let series_class = pd.getattr(py, "Series")?;
                         let series = if index.is_none(py) {
-                            // No index specified, pandas will use default integer index
                             series_class.call1(py, (py_values,))?
                         } else {
-                            // Use the master channel values as index
                             series_class.call(py, (py_values,), Some([("index", index)].into_py_dict(py)))?
                         };
 
-                        // Set the series name to the channel name
                         series.setattr(py, "name", channel_name)?;
-
                         return Ok(Some(series));
                     }
                 }
             }
         }
-
         Ok(None)
     }
 }
