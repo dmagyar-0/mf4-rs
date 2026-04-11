@@ -129,6 +129,141 @@ pub fn decode_channel_value_with_validity(
     Some(DecodedChannelValue { value, is_valid })
 }
 
+/// Decode a single f64 value directly from a record, bypassing DecodedValue.
+/// Returns NaN for values that can't be decoded as f64.
+/// This is the fastest path for reading numeric channels.
+#[inline(always)]
+pub fn decode_f64_from_record(
+    record: &[u8],
+    record_id_size: usize,
+    channel: &ChannelBlock,
+) -> f64 {
+    let base_offset = record_id_size + channel.byte_offset as usize;
+    let bit_offset = channel.bit_offset as usize;
+    let bit_count = channel.bit_count as usize;
+
+    // For non-VLSD channels only
+    if channel.channel_type == 1 && channel.data != 0 {
+        return f64::NAN;
+    }
+
+    let num_bytes = ((bit_offset + bit_count + 7) / 8).max(1);
+    if base_offset + num_bytes > record.len() {
+        return f64::NAN;
+    }
+    let slice = &record[base_offset..base_offset + num_bytes];
+
+    match &channel.data_type {
+        DataType::FloatLE => {
+            if bit_offset == 0 {
+                if bit_count == 64 {
+                    return LittleEndian::read_f64(slice);
+                } else if bit_count == 32 {
+                    return LittleEndian::read_f32(slice) as f64;
+                }
+            }
+            let raw = slice.iter().rev().fold(0u64, |acc, &b| (acc << 8) | b as u64);
+            if bit_count == 32 {
+                f32::from_bits(raw as u32) as f64
+            } else if bit_count == 64 {
+                f64::from_bits(raw)
+            } else {
+                f64::NAN
+            }
+        },
+        DataType::FloatBE => {
+            if bit_offset == 0 {
+                if bit_count == 64 {
+                    return BigEndian::read_f64(slice);
+                } else if bit_count == 32 {
+                    return BigEndian::read_f32(slice) as f64;
+                }
+            }
+            let raw = slice.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
+            if bit_count == 32 {
+                f32::from_bits(raw as u32) as f64
+            } else if bit_count == 64 {
+                f64::from_bits(raw)
+            } else {
+                f64::NAN
+            }
+        },
+        DataType::UnsignedIntegerLE => {
+            if bit_offset == 0 {
+                match bit_count {
+                    8 => return slice[0] as f64,
+                    16 => return LittleEndian::read_u16(slice) as f64,
+                    32 => return LittleEndian::read_u32(slice) as f64,
+                    64 => return LittleEndian::read_u64(slice) as f64,
+                    _ => {}
+                }
+            }
+            let raw = slice.iter().rev().fold(0u64, |acc, &b| (acc << 8) | b as u64);
+            let shifted = raw >> bit_offset;
+            let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
+            (shifted & mask) as f64
+        },
+        DataType::UnsignedIntegerBE => {
+            if bit_offset == 0 {
+                match bit_count {
+                    8 => return slice[0] as f64,
+                    16 => return BigEndian::read_u16(slice) as f64,
+                    32 => return BigEndian::read_u32(slice) as f64,
+                    64 => return BigEndian::read_u64(slice) as f64,
+                    _ => {}
+                }
+            }
+            let raw = slice.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
+            let shifted = raw >> bit_offset;
+            let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
+            (shifted & mask) as f64
+        },
+        DataType::SignedIntegerLE => {
+            if bit_offset == 0 {
+                match bit_count {
+                    8 => return (slice[0] as i8) as f64,
+                    16 => return LittleEndian::read_i16(slice) as f64,
+                    32 => return LittleEndian::read_i32(slice) as f64,
+                    64 => return LittleEndian::read_i64(slice) as f64,
+                    _ => {}
+                }
+            }
+            let raw = slice.iter().rev().fold(0u64, |acc, &b| (acc << 8) | b as u64);
+            let shifted = raw >> bit_offset;
+            let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
+            let unsigned = shifted & mask;
+            let sign_bit = 1u64 << (bit_count - 1);
+            if unsigned & sign_bit != 0 {
+                ((unsigned as i64) | (!(mask as i64))) as f64
+            } else {
+                unsigned as f64
+            }
+        },
+        DataType::SignedIntegerBE => {
+            if bit_offset == 0 {
+                match bit_count {
+                    8 => return (slice[0] as i8) as f64,
+                    16 => return BigEndian::read_i16(slice) as f64,
+                    32 => return BigEndian::read_i32(slice) as f64,
+                    64 => return BigEndian::read_i64(slice) as f64,
+                    _ => {}
+                }
+            }
+            let raw = slice.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
+            let shifted = raw >> bit_offset;
+            let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
+            let unsigned = shifted & mask;
+            let sign_bit = 1u64 << (bit_count - 1);
+            if unsigned & sign_bit != 0 {
+                ((unsigned as i64) | (!(mask as i64))) as f64
+            } else {
+                unsigned as f64
+            }
+        },
+        _ => f64::NAN,
+    }
+}
+
 /// Internal function that performs the actual value decoding.
 ///
 /// This is the core decoding logic separated out so it can be used by both
@@ -166,18 +301,45 @@ fn decode_value_internal(
 
     match &channel.data_type {
         DataType::UnsignedIntegerLE => {
+            if bit_offset == 0 {
+                match bit_count {
+                    8 => return Some(DecodedValue::UnsignedInteger(slice[0] as u64)),
+                    16 => return Some(DecodedValue::UnsignedInteger(LittleEndian::read_u16(slice) as u64)),
+                    32 => return Some(DecodedValue::UnsignedInteger(LittleEndian::read_u32(slice) as u64)),
+                    64 => return Some(DecodedValue::UnsignedInteger(LittleEndian::read_u64(slice))),
+                    _ => {}
+                }
+            }
             let raw = slice.iter().rev().fold(0u64, |acc, &b| (acc << 8) | b as u64);
             let shifted = raw >> bit_offset;
             let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
             Some(DecodedValue::UnsignedInteger(shifted & mask))
         },
         DataType::UnsignedIntegerBE => {
+            if bit_offset == 0 {
+                match bit_count {
+                    8 => return Some(DecodedValue::UnsignedInteger(slice[0] as u64)),
+                    16 => return Some(DecodedValue::UnsignedInteger(BigEndian::read_u16(slice) as u64)),
+                    32 => return Some(DecodedValue::UnsignedInteger(BigEndian::read_u32(slice) as u64)),
+                    64 => return Some(DecodedValue::UnsignedInteger(BigEndian::read_u64(slice))),
+                    _ => {}
+                }
+            }
             let raw = slice.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
             let shifted = raw >> bit_offset;
             let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
             Some(DecodedValue::UnsignedInteger(shifted & mask))
         },
         DataType::SignedIntegerLE => {
+            if bit_offset == 0 {
+                match bit_count {
+                    8 => return Some(DecodedValue::SignedInteger(slice[0] as i8 as i64)),
+                    16 => return Some(DecodedValue::SignedInteger(LittleEndian::read_i16(slice) as i64)),
+                    32 => return Some(DecodedValue::SignedInteger(LittleEndian::read_i32(slice) as i64)),
+                    64 => return Some(DecodedValue::SignedInteger(LittleEndian::read_i64(slice))),
+                    _ => {}
+                }
+            }
             let raw = slice.iter().rev().fold(0u64, |acc, &b| (acc << 8) | b as u64);
             let shifted = raw >> bit_offset;
             let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
@@ -191,6 +353,15 @@ fn decode_value_internal(
             Some(DecodedValue::SignedInteger(signed))
         },
         DataType::SignedIntegerBE => {
+            if bit_offset == 0 {
+                match bit_count {
+                    8 => return Some(DecodedValue::SignedInteger(slice[0] as i8 as i64)),
+                    16 => return Some(DecodedValue::SignedInteger(BigEndian::read_i16(slice) as i64)),
+                    32 => return Some(DecodedValue::SignedInteger(BigEndian::read_i32(slice) as i64)),
+                    64 => return Some(DecodedValue::SignedInteger(BigEndian::read_i64(slice))),
+                    _ => {}
+                }
+            }
             let raw = slice.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
             let shifted = raw >> bit_offset;
             let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
@@ -204,6 +375,13 @@ fn decode_value_internal(
             Some(DecodedValue::SignedInteger(signed))
         },
         DataType::FloatLE => {
+            if bit_offset == 0 {
+                if bit_count == 32 {
+                    return Some(DecodedValue::Float(LittleEndian::read_f32(slice) as f64));
+                } else if bit_count == 64 {
+                    return Some(DecodedValue::Float(LittleEndian::read_f64(slice)));
+                }
+            }
             let raw = slice.iter().rev().fold(0u64, |acc, &b| (acc << 8) | b as u64);
             if bit_count == 32 {
                 Some(DecodedValue::Float(f32::from_bits(raw as u32) as f64))
@@ -214,6 +392,13 @@ fn decode_value_internal(
             }
         },
         DataType::FloatBE => {
+            if bit_offset == 0 {
+                if bit_count == 32 {
+                    return Some(DecodedValue::Float(BigEndian::read_f32(slice) as f64));
+                } else if bit_count == 64 {
+                    return Some(DecodedValue::Float(BigEndian::read_f64(slice)));
+                }
+            }
             let raw = slice.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
             if bit_count == 32 {
                 Some(DecodedValue::Float(f32::from_bits(raw as u32) as f64))

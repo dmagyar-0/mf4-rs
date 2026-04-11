@@ -509,6 +509,27 @@ impl PyMDF {
         Ok(None)
     }
 
+    /// Get channel values as f64 by name (first match).
+    ///
+    /// This is significantly faster than get_channel_values() for numeric channels
+    /// because it bypasses the DecodedValue enum and Python object wrapping.
+    /// Non-numeric values are returned as NaN. No conversions are applied.
+    ///
+    /// Returns None if the channel is not found.
+    fn get_channel_values_f64(&self, channel_name: &str) -> PyResult<Option<Vec<f64>>> {
+        for group in self.mdf.channel_groups() {
+            for channel in group.channels() {
+                if let Some(name) = channel.name()? {
+                    if name == channel_name {
+                        let values = channel.values_as_f64()?;
+                        return Ok(Some(values));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Get channel data as a pandas Series with time/master channel as DatetimeIndex.
     ///
     /// This method reads a channel's values and returns them as a pandas Series
