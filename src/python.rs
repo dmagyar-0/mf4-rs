@@ -8,6 +8,7 @@
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 use pyo3::{create_exception, wrap_pyfunction};
+use numpy::PyArray1;
 use std::collections::HashMap;
 
 use crate::api::mdf::MDF;
@@ -523,6 +524,28 @@ impl PyMDF {
                     if name == channel_name {
                         let values = channel.values_as_f64()?;
                         return Ok(Some(values));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Get channel values as a numpy float64 array (fastest path).
+    ///
+    /// Returns channel data directly as a numpy ndarray with zero per-element
+    /// Python object allocation. This is the fastest way to read numeric channels.
+    /// Non-numeric values are returned as NaN. No conversions are applied.
+    ///
+    /// Returns None if the channel is not found.
+    fn get_channel_values_numpy<'py>(&self, py: Python<'py>, channel_name: &str) -> PyResult<Option<PyObject>> {
+        for group in self.mdf.channel_groups() {
+            for channel in group.channels() {
+                if let Some(name) = channel.name()? {
+                    if name == channel_name {
+                        let values = channel.values_as_f64()?;
+                        let array = PyArray1::from_vec_bound(py, values);
+                        return Ok(Some(array.into()));
                     }
                 }
             }
