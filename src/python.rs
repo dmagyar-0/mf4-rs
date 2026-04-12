@@ -898,6 +898,32 @@ impl PyMdfIndex {
         }).collect())
     }
     
+    /// Fast path: read channel values as f64 list by index.
+    ///
+    /// Significantly faster than `read_channel_values` for numeric channels.
+    /// Uses zero-copy mmap access and bypasses DecodedValue enum boxing.
+    /// Invalid samples are represented as float('nan').
+    fn read_channel_values_as_f64(&self, group_index: usize, channel_index: usize, file_path: &str) -> PyResult<Vec<f64>> {
+        let file = std::fs::File::open(file_path).map_err(|e| MdfError::IOError(e))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| MdfError::IOError(e))?;
+        Ok(self.index.read_channel_values_from_slice_as_f64(group_index, channel_index, &mmap)?)
+    }
+
+    /// Fast path: read channel values as f64 list by name.
+    ///
+    /// Significantly faster than `read_channel_values_by_name` for numeric channels.
+    /// Uses zero-copy mmap access and bypasses DecodedValue enum boxing.
+    /// Invalid samples are represented as float('nan').
+    fn read_channel_values_by_name_as_f64(&self, channel_name: &str, file_path: &str) -> PyResult<Vec<f64>> {
+        let (group_index, channel_index) = self.index.find_channel_by_name_global(channel_name)
+            .ok_or_else(|| MdfError::BlockSerializationError(
+                format!("Channel '{}' not found", channel_name)
+            ))?;
+        let file = std::fs::File::open(file_path).map_err(|e| MdfError::IOError(e))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| MdfError::IOError(e))?;
+        Ok(self.index.read_channel_values_from_slice_as_f64(group_index, channel_index, &mmap)?)
+    }
+
     /// Find channel by name
     fn find_channel_by_name(&self, channel_name: &str) -> Option<(usize, usize)> {
         self.index.find_channel_by_name_global(channel_name)
