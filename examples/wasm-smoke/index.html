@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>mf4-rs WASM smoke test</title>
+</head>
+<body>
+  <h2>mf4-rs WASM smoke test</h2>
+  <input type="file" id="fileInput" accept=".mf4,.mf,.mdf">
+  <pre id="output">Load a .mf4 file to inspect it.</pre>
+
+  <script type="module">
+    // The worker runs wasm-bindgen output inside a Web Worker to avoid blocking
+    // the main thread and to validate that the WASM works in a Worker context.
+    const worker = new Worker('./worker.js', { type: 'module' });
+
+    worker.onmessage = (e) => {
+      document.getElementById('output').textContent = JSON.stringify(e.data, null, 2);
+    };
+
+    worker.onerror = (e) => {
+      document.getElementById('output').textContent = 'Worker error: ' + e.message;
+    };
+
+    document.getElementById('fileInput').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      document.getElementById('output').textContent = 'Parsing…';
+      const t0 = performance.now();
+      const buf = await file.arrayBuffer();
+      worker.postMessage({ buf, filename: file.name, t0 }, [buf]);
+    });
+  </script>
+</body>
+</html>

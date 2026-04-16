@@ -173,11 +173,16 @@ pub trait ByteRangeReader {
     fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, Self::Error>;
 }
 
-/// Local file reader implementation
+/// Local file reader implementation.
+///
+/// Not available on `wasm32-unknown-unknown`; implement [`ByteRangeReader`] over
+/// a `Cursor<Vec<u8>>` or a JS `Blob`-backed reader instead.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct FileRangeReader {
     file: std::fs::File,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl FileRangeReader {
     pub fn new(file_path: &str) -> Result<Self, MdfError> {
         let file = std::fs::File::open(file_path)
@@ -186,31 +191,33 @@ impl FileRangeReader {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ByteRangeReader for FileRangeReader {
     type Error = MdfError;
-    
+
     fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, Self::Error> {
         use std::io::{Read, Seek, SeekFrom};
-        
+
         self.file.seek(SeekFrom::Start(offset))
             .map_err(|e| MdfError::IOError(e))?;
-        
+
         let mut buffer = vec![0u8; length as usize];
         self.file.read_exact(&mut buffer)
             .map_err(|e| MdfError::IOError(e))?;
-        
+
         Ok(buffer)
     }
 }
 
-/// Memory-mapped file reader implementation
+/// Memory-mapped file reader implementation.
 ///
-/// Uses `memmap2::Mmap` for zero-syscall-overhead reads by slicing directly
-/// into the mapped region and copying into the output `Vec<u8>`.
+/// Not available on `wasm32-unknown-unknown`.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct MmapRangeReader {
     mmap: memmap2::Mmap,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl MmapRangeReader {
     pub fn new(file_path: &str) -> Result<Self, MdfError> {
         let file = std::fs::File::open(file_path).map_err(MdfError::IOError)?;
@@ -219,6 +226,7 @@ impl MmapRangeReader {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ByteRangeReader for MmapRangeReader {
     type Error = MdfError;
 
@@ -234,6 +242,39 @@ impl ByteRangeReader for MmapRangeReader {
             });
         }
         Ok(self.mmap[start..end].to_vec())
+    }
+}
+
+/// In-memory byte-slice reader — available on all targets including WASM.
+///
+/// Wraps an owned `Vec<u8>` and satisfies [`ByteRangeReader`] by slicing
+/// directly into it.  Useful when the entire file has already been loaded
+/// into memory (e.g. via `Blob.arrayBuffer()` in a browser Worker).
+pub struct SliceRangeReader {
+    data: Vec<u8>,
+}
+
+impl SliceRangeReader {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self { data }
+    }
+}
+
+impl ByteRangeReader for SliceRangeReader {
+    type Error = MdfError;
+
+    fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, Self::Error> {
+        let start = offset as usize;
+        let end = start + length as usize;
+        if end > self.data.len() {
+            return Err(MdfError::TooShortBuffer {
+                actual: self.data.len(),
+                expected: end,
+                file: file!(),
+                line: line!(),
+            });
+        }
+        Ok(self.data[start..end].to_vec())
     }
 }
 
@@ -284,39 +325,41 @@ impl ByteRangeReader for MmapRangeReader {
 pub struct _HttpRangeReaderExample;
 
 impl MdfIndex {
-    /// Create an index from an MDF file
+    /// Create an index from an MDF file on disk.
+    ///
+    /// Not available on `wasm32-unknown-unknown`; use [`from_bytes`] instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_file(file_path: &str) -> Result<Self, MdfError> {
         let mdf = MDF::from_file(file_path)?;
         let file_size = std::fs::metadata(file_path)
             .map_err(|e| MdfError::IOError(e))?
             .len();
+        Self::build_index(mdf, file_size)
+    }
 
-        // Extract start time from MDF header
+    /// Shared index-building logic operating on an already-parsed [`MDF`].
+    fn build_index(mdf: MDF, file_size: u64) -> Result<Self, MdfError> {
         let start_time_ns = mdf.start_time_ns();
-
         let mut indexed_groups = Vec::new();
 
         for group in mdf.channel_groups() {
             let mut indexed_channels = Vec::new();
-            let mmap = group.mmap(); // Get memory mapped file data for resolving conversions
-            
-            // Index each channel in the group
+            let mmap = group.mmap();
+
             for channel in group.channels() {
                 let block = channel.block();
-                
-                // Clone and resolve conversion dependencies if present
+
                 let resolved_conversion = if let Some(mut conversion) = block.conversion.clone() {
-                    // Resolve all dependencies for this conversion block
                     if let Err(e) = conversion.resolve_all_dependencies(mmap) {
-                        eprintln!("Warning: Failed to resolve conversion dependencies for channel '{}': {}", 
+                        eprintln!("Warning: Failed to resolve conversion dependencies for channel '{}': {}",
                                  block.name.as_deref().unwrap_or("<unnamed>"), e);
                     }
                     Some(conversion)
                 } else {
                     None
                 };
-                
-                let indexed_channel = IndexedChannel {
+
+                indexed_channels.push(IndexedChannel {
                     name: channel.name()?,
                     unit: channel.unit()?,
                     data_type: block.data_type.clone(),
@@ -332,14 +375,12 @@ impl MdfIndex {
                     } else {
                         None
                     },
-                };
-                indexed_channels.push(indexed_channel);
+                });
             }
 
-            // Get data block information
             let data_blocks = Self::extract_data_blocks(&group)?;
 
-            let indexed_group = IndexedChannelGroup {
+            indexed_groups.push(IndexedChannelGroup {
                 name: group.name()?,
                 comment: group.comment()?,
                 record_id_len: group.raw_data_group().block.record_id_len,
@@ -348,15 +389,10 @@ impl MdfIndex {
                 record_count: group.raw_channel_group().block.cycles_nr,
                 channels: indexed_channels,
                 data_blocks,
-            };
-            indexed_groups.push(indexed_group);
+            });
         }
 
-        Ok(MdfIndex {
-            file_size,
-            start_time_ns,
-            channel_groups: indexed_groups,
-        })
+        Ok(MdfIndex { file_size, start_time_ns, channel_groups: indexed_groups })
     }
 
     /// Extract data block information from a channel group
@@ -429,26 +465,46 @@ impl MdfIndex {
         Ok(data_blocks)
     }
 
-    /// Save the index to a JSON file
+    /// Create an index from an in-memory MDF byte buffer.
+    ///
+    /// This is the primary constructor on `wasm32-unknown-unknown`.
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self, MdfError> {
+        let file_size = data.len() as u64;
+        let mdf = MDF::from_bytes(data)?;
+        Self::build_index(mdf, file_size)
+    }
+
+    /// Save the index to a JSON file.
+    ///
+    /// Not available on `wasm32-unknown-unknown`; use [`to_json`] instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn save_to_file(&self, index_path: &str) -> Result<(), MdfError> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| MdfError::BlockSerializationError(format!("JSON serialization failed: {}", e)))?;
-        
+        let json = self.to_json()?;
         std::fs::write(index_path, json)
             .map_err(|e| MdfError::IOError(e))?;
-        
         Ok(())
     }
 
-    /// Load an index from a JSON file
+    /// Load an index from a JSON file.
+    ///
+    /// Not available on `wasm32-unknown-unknown`; use [`from_json`] instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_from_file(index_path: &str) -> Result<Self, MdfError> {
         let json = std::fs::read_to_string(index_path)
             .map_err(|e| MdfError::IOError(e))?;
-        
-        let index: MdfIndex = serde_json::from_str(&json)
-            .map_err(|e| MdfError::BlockSerializationError(format!("JSON deserialization failed: {}", e)))?;
-        
-        Ok(index)
+        Self::from_json(&json)
+    }
+
+    /// Serialize the index to a JSON string (available on all targets).
+    pub fn to_json(&self) -> Result<String, MdfError> {
+        serde_json::to_string_pretty(self)
+            .map_err(|e| MdfError::BlockSerializationError(format!("JSON serialization failed: {}", e)))
+    }
+
+    /// Deserialize an index from a JSON string (available on all targets).
+    pub fn from_json(json: &str) -> Result<Self, MdfError> {
+        serde_json::from_str(json)
+            .map_err(|e| MdfError::BlockSerializationError(format!("JSON deserialization failed: {}", e)))
     }
 
     /// Read channel values using the index and a byte range reader

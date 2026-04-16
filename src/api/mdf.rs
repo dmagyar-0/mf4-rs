@@ -14,13 +14,20 @@ pub struct MDF {
 impl MDF {
     /// Parse an MDF4 file from disk.
     ///
-    /// # Arguments
-    /// * `path` - Path to the `.mf4` file.
-    ///
-    /// # Returns
-    /// A new [`MDF`] on success or [`MdfError`] on failure.
+    /// Not available on `wasm32-unknown-unknown`; use [`from_bytes`] instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_file(path: &str) -> Result<Self, MdfError> {
         let raw = MdfFile::parse_from_file(path)?;
+        Ok(MDF { raw })
+    }
+
+    /// Parse an MDF4 file from an owned byte buffer.
+    ///
+    /// This is the primary entry point on `wasm32-unknown-unknown` where
+    /// filesystem access is unavailable.  On native targets the caller can
+    /// populate the buffer from `std::fs::read` or a memory-mapped file.
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self, MdfError> {
+        let raw = MdfFile::parse_from_bytes(data)?;
         Ok(MDF { raw })
     }
 
