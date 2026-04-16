@@ -1,29 +1,41 @@
 # WASM Feasibility Spike — mf4-rs
 
-**Branch:** `wasm-spike` (alias: `claude/wasm-feasibility-spike-D7jOW`)
-**Date:** 2026-04-16
+**Branch:** `claude/wasm-feasibility-spike-Op9Z3`  
+**Prior spike:** `claude/wasm-feasibility-spike-D7jOW` (merged in PR #53)  
+**Date:** 2026-04-16  
 **Toolchain:** rustc 1.94.1 / cargo 1.94.1
 
 ---
 
 ## 1. Verdict: GO-WITH-PATCHES
 
-**mf4-rs is a good WASM candidate.** The dependency tree has zero native C/C++
-libraries, no threading, no crypto, no compression, and no `SystemTime::now()`
-calls.  The sole blocker is that the public API accepts file paths and uses
-`memmap2::Mmap` as its byte-store; both are unavailable inside a browser
-Worker.
+**mf4-rs is a good WASM candidate and is essentially ready.** The dependency
+tree has zero native C/C++ libraries, no threading, no crypto, no compression,
+and no `SystemTime::now()` calls. `memmap2` v0.9.9 ships a pure-Rust stub for
+non-Unix/Windows targets that compiles without errors (all call sites are gated
+behind `#[cfg(not(target_arch = "wasm32"))]`).
 
-A minimal patch set (applied in this branch) adds `from_bytes` / `from_json`
-entry points and gates all filesystem code behind
-`#[cfg(not(target_arch = "wasm32"))]`.  No logic was rewritten; the native API
-is unchanged.  All 50 existing tests continue to pass on the native target.
+Across two spikes, the following has been done:
+
+- **Spike 1 (PR #53):** Added `MDF::from_bytes`, `MdfFile::parse_from_bytes`,
+  `MdfIndex::from_bytes`, `SliceRangeReader`, `to_json` / `from_json`, and
+  `MdfWriter::new_from_writer`. Gated all filesystem I/O, `memmap2` usage,
+  `FileRangeReader`, and `MmapRangeReader` behind
+  `#[cfg(not(target_arch = "wasm32"))]`.
+
+- **Spike 2 (this branch):** Fixed the two remaining compilation blockers:
+  `src/cut.rs` and `src/merge.rs` called `parse_from_file` and `MdfWriter::new`
+  (both cfg-gated) without a cfg guard of their own, producing a compile error
+  on WASM. Fixed by gating `pub mod cut` and `pub mod merge` in `src/lib.rs`.
+  Also delivered the complete `examples/wasm-smoke/` harness.
+
+All 50 existing tests continue to pass on the native target after both patches.
 
 The crate cannot be compiled for `wasm32-unknown-unknown` in this environment
 because the WASM stdlib component (`rust-std-wasm32-unknown-unknown`) could not
-be downloaded (HTTP 503 from `static.rust-lang.org`).  The analysis below is
+be downloaded (HTTP 503 from `static.rust-lang.org`). The analysis below is
 therefore based on static inspection of the full dependency tree plus source
-code review.  An actual `cargo build --target wasm32-unknown-unknown` should be
+code review. An actual `cargo build --target wasm32-unknown-unknown` should be
 run once network access is restored to confirm the verdict.
 
 ---
@@ -153,12 +165,32 @@ The native API is unchanged.
 - **Added `from_json(json: &str) -> Result<Self, MdfError>`** (all targets) —
   deserialises index from JSON string.
 
-### `src/cut.rs` and `src/merge.rs`
+### `src/cut.rs` and `src/merge.rs` (fixed in Spike 2)
 
-No changes needed.  Both use `MdfFile::parse_from_file` and `MdfWriter::new`,
-which are already gated.  On WASM these modules compile but their public
-functions are unavailable — callers would use `MDF::from_bytes` +
-`MdfWriter::new_from_writer` instead.
+Both modules call `MdfFile::parse_from_file` and `MdfWriter::new` from their
+top-level public functions (`cut_mdf_by_time`, `merge_files`) without a cfg
+guard, which causes a compile error on `wasm32` because those symbols are
+`#[cfg(not(target_arch = "wasm32"))]`.
+
+**Fix applied in this spike (`src/lib.rs`):**
+
+```rust
+// Before (both modules compiled on all targets, causing WASM build failure):
+pub mod cut;
+pub mod merge;
+
+// After (modules excluded entirely on wasm32):
+/// File-cutting utilities (native only; not available on `wasm32-unknown-unknown`).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cut;
+/// File-merging utilities (native only; not available on `wasm32-unknown-unknown`).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod merge;
+```
+
+The correct WASM equivalent is to use `MDF::from_bytes` +
+`MdfWriter::new_from_writer(Cursor::new(Vec::new()))` to replicate the
+cut/merge logic in-browser if needed.
 
 ### `examples/wasm-smoke/`
 
@@ -181,18 +213,22 @@ Then serve the repo root with any static file server and open `examples/wasm-smo
 
 ## 5. Patch Set
 
-All changes are on branch `claude/wasm-feasibility-spike-D7jOW` (remote
-`origin/claude/wasm-feasibility-spike-D7jOW`).
+### Spike 1 — merged in PR #53 (branch `claude/wasm-feasibility-spike-D7jOW`)
 
-Commits (in order):
+Commit: `wasm: add parse_from_bytes/from_bytes, gate filesystem code behind cfg(not(wasm32))`
+— covers `mdf_file.rs`, `api/mdf.rs`, `writer/io.rs`, `index.rs`, plus the
+`wasm-smoke` example.
 
-1. `wasm: add parse_from_bytes/from_bytes, gate filesystem code behind cfg(not(wasm32))`
-   — covers all four source changes above plus the wasm-smoke example.
+### Spike 2 — this branch (`claude/wasm-feasibility-spike-Op9Z3`)
+
+One commit: `wasm: gate cut and merge modules; update feasibility report`
+- `src/lib.rs` — gate `pub mod cut` and `pub mod merge` behind `cfg(not wasm32)`
+- `WASM_FEASIBILITY.md` — update with Spike 2 findings
 
 To use in another project before an official release:
 ```toml
 [dependencies]
-mf4-rs = { git = "https://github.com/dmagyar-0/mf4-rs", branch = "claude/wasm-feasibility-spike-D7jOW" }
+mf4-rs = { git = "https://github.com/dmagyar-0/mf4-rs", branch = "claude/wasm-feasibility-spike-Op9Z3" }
 ```
 
 ---
@@ -251,7 +287,7 @@ keep its `memmap2::Mmap` type, preserving the public API for native consumers.
 
 ```toml
 [dependencies]
-mf4-rs = { git = "https://github.com/dmagyar-0/mf4-rs", branch = "claude/wasm-feasibility-spike-D7jOW" }
+mf4-rs = { git = "https://github.com/dmagyar-0/mf4-rs", branch = "claude/wasm-feasibility-spike-Op9Z3" }
 ```
 
 ### Typical WASM usage

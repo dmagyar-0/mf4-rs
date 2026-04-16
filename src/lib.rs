@@ -7,7 +7,11 @@
 pub mod blocks;
 pub mod error;
 pub mod writer;
+/// File-cutting utilities (native only; not available on `wasm32-unknown-unknown`).
+#[cfg(not(target_arch = "wasm32"))]
 pub mod cut;
+/// File-merging utilities (native only; not available on `wasm32-unknown-unknown`).
+#[cfg(not(target_arch = "wasm32"))]
 pub mod merge;
 pub mod index;
 
