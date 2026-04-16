@@ -1,16 +1,23 @@
 // Low level file and block handling utilities for MdfWriter
 use super::*;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Seek, SeekFrom, Write, BufWriter};
-use memmap2::MmapMut;
+use std::io::{Seek, SeekFrom, Write};
 use byteorder::{LittleEndian, WriteBytesExt};
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::fs::File;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::BufWriter;
+#[cfg(not(target_arch = "wasm32"))]
+use memmap2::MmapMut;
+
+#[cfg(not(target_arch = "wasm32"))]
 struct MmapWriter {
     mmap: MmapMut,
     pos: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl MmapWriter {
     fn new(path: &str, size: usize) -> Result<Self, MdfError> {
         use std::fs::OpenOptions;
@@ -21,6 +28,7 @@ impl MmapWriter {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Write for MmapWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let end = self.pos + buf.len();
@@ -36,6 +44,7 @@ impl Write for MmapWriter {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Seek for MmapWriter {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         let new_pos: i64 = match pos {
@@ -52,13 +61,39 @@ impl Seek for MmapWriter {
 }
 
 impl MdfWriter {
+    /// Creates a new MdfWriter from any `Write + Seek` backend.
+    ///
+    /// This is the only constructor available on `wasm32-unknown-unknown`.
+    /// On native targets you can pass a `std::io::Cursor<Vec<u8>>` to produce
+    /// an in-memory MDF file, or a `BufWriter<File>` for on-disk output.
+    pub fn new_from_writer(w: impl Write + Seek + 'static) -> Self {
+        MdfWriter {
+            file: Box::new(w),
+            offset: 0,
+            block_positions: HashMap::new(),
+            open_dts: HashMap::new(),
+            dt_counter: 0,
+            last_dg: None,
+            cg_to_dg: HashMap::new(),
+            cg_offsets: HashMap::new(),
+            cg_channels: HashMap::new(),
+            channel_map: HashMap::new(),
+        }
+    }
+
     /// Creates a new MdfWriter for the given file path using a 1 MB internal
     /// buffer. Use [`new_with_capacity`] to customize the buffer size.
+    ///
+    /// Not available on `wasm32-unknown-unknown`; use [`new_from_writer`] instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(path: &str) -> Result<Self, MdfError> {
         Self::new_with_capacity(path, 1_048_576)
     }
 
     /// Creates a new MdfWriter with the specified `BufWriter` capacity.
+    ///
+    /// Not available on `wasm32-unknown-unknown`; use [`new_from_writer`] instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new_with_capacity(path: &str, capacity: usize) -> Result<Self, MdfError> {
         let file = File::create(path)?;
         let file = BufWriter::with_capacity(capacity, file);
@@ -77,6 +112,9 @@ impl MdfWriter {
     }
 
     /// Creates a new MdfWriter backed by a memory-mapped file of the given size.
+    ///
+    /// Not available on `wasm32-unknown-unknown`; use [`new_from_writer`] instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new_mmap(path: &str, size: usize) -> Result<Self, MdfError> {
         let writer = MmapWriter::new(path, size)?;
         Ok(MdfWriter {
