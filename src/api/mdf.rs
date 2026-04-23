@@ -1,6 +1,7 @@
 use crate::error::MdfError;
 use crate::parsing::mdf_file::MdfFile;
 use crate::api::channel_group::ChannelGroup;
+use crate::block_layout::FileLayout;
 
 #[derive(Debug)]
 /// High level representation of an MDF file.
@@ -61,5 +62,13 @@ impl MDF {
         } else {
             Some(time)
         }
+    }
+
+    /// Build a [`FileLayout`] describing every block in the underlying file.
+    ///
+    /// The layout can be rendered as a flat table, an indented tree or JSON
+    /// for inspecting on-disk structure and link chains.
+    pub fn file_layout(&self) -> Result<FileLayout, MdfError> {
+        FileLayout::from_bytes(&self.raw.mmap)
     }
 }

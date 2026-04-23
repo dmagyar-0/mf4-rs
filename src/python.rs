@@ -17,6 +17,7 @@ use crate::index::{MdfIndex, FileRangeReader, IndexedChannel};
 use crate::blocks::common::DataType;
 use crate::parsing::decoder::DecodedValue;
 use crate::error::MdfError;
+use crate::block_layout::{BlockInfo, FileLayout, GapInfo, LinkInfo};
 
 // Custom exception for MDF errors
 create_exception!(mf4_rs, MdfException, pyo3::exceptions::PyException);
@@ -563,6 +564,15 @@ impl PyMDF {
             }
         }
         Ok(None)
+    }
+
+    /// Build a [`PyFileLayout`] describing every block in this file.
+    ///
+    /// Use this to inspect on-disk byte ranges, link chains and how data
+    /// is stored relative to block definitions.
+    fn file_layout(&self) -> PyResult<PyFileLayout> {
+        let layout = self.mdf.file_layout()?;
+        Ok(PyFileLayout { inner: layout })
     }
 }
 
@@ -1174,6 +1184,206 @@ impl PyMdfIndex {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Block layout visualization
+// ---------------------------------------------------------------------------
+
+/// A named link inside a block (wraps [`LinkInfo`]).
+#[pyclass]
+#[derive(Clone)]
+pub struct PyLinkInfo {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub target: u64,
+    #[pyo3(get)]
+    pub target_type: Option<String>,
+}
+
+#[pymethods]
+impl PyLinkInfo {
+    fn __repr__(&self) -> String {
+        if self.target == 0 {
+            format!("Link({} -> null)", self.name)
+        } else {
+            format!(
+                "Link({} -> 0x{:010x} [{}])",
+                self.name,
+                self.target,
+                self.target_type.as_deref().unwrap_or("?")
+            )
+        }
+    }
+}
+
+impl From<LinkInfo> for PyLinkInfo {
+    fn from(l: LinkInfo) -> Self {
+        PyLinkInfo {
+            name: l.name,
+            target: l.target,
+            target_type: l.target_type,
+        }
+    }
+}
+
+/// A block visited while walking the file (wraps [`BlockInfo`]).
+#[pyclass]
+#[derive(Clone)]
+pub struct PyBlockInfo {
+    #[pyo3(get)]
+    pub offset: u64,
+    #[pyo3(get)]
+    pub end_offset: u64,
+    #[pyo3(get)]
+    pub size: u64,
+    #[pyo3(get)]
+    pub block_type: String,
+    #[pyo3(get)]
+    pub description: String,
+    #[pyo3(get)]
+    pub links: Vec<PyLinkInfo>,
+    #[pyo3(get)]
+    pub extra: Option<String>,
+}
+
+#[pymethods]
+impl PyBlockInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "Block({} @ 0x{:010x}..0x{:010x}, size={}, {})",
+            self.block_type, self.offset, self.end_offset, self.size, self.description
+        )
+    }
+}
+
+impl From<BlockInfo> for PyBlockInfo {
+    fn from(b: BlockInfo) -> Self {
+        PyBlockInfo {
+            offset: b.offset,
+            end_offset: b.end_offset,
+            size: b.size,
+            block_type: b.block_type,
+            description: b.description,
+            links: b.links.into_iter().map(Into::into).collect(),
+            extra: b.extra,
+        }
+    }
+}
+
+/// An unreferenced range of bytes in the file (wraps [`GapInfo`]).
+#[pyclass]
+#[derive(Clone)]
+pub struct PyGapInfo {
+    #[pyo3(get)]
+    pub start: u64,
+    #[pyo3(get)]
+    pub end: u64,
+    #[pyo3(get)]
+    pub size: u64,
+}
+
+#[pymethods]
+impl PyGapInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "Gap(0x{:010x}..0x{:010x}, size={})",
+            self.start, self.end, self.size
+        )
+    }
+}
+
+impl From<GapInfo> for PyGapInfo {
+    fn from(g: GapInfo) -> Self {
+        PyGapInfo {
+            start: g.start,
+            end: g.end,
+            size: g.size,
+        }
+    }
+}
+
+/// Full layout of an MDF file (wraps [`FileLayout`]).
+#[pyclass]
+pub struct PyFileLayout {
+    pub(crate) inner: FileLayout,
+}
+
+#[pymethods]
+impl PyFileLayout {
+    /// Build a layout by parsing an MDF file on disk.
+    #[staticmethod]
+    fn from_file(path: &str) -> PyResult<Self> {
+        let inner = FileLayout::from_file(path)?;
+        Ok(PyFileLayout { inner })
+    }
+
+    /// Total size of the file in bytes.
+    #[getter]
+    fn file_size(&self) -> u64 {
+        self.inner.file_size
+    }
+
+    /// List of all discovered blocks, sorted by offset.
+    #[getter]
+    fn blocks(&self) -> Vec<PyBlockInfo> {
+        self.inner.blocks.iter().cloned().map(Into::into).collect()
+    }
+
+    /// Byte ranges not covered by any visited block.
+    #[getter]
+    fn gaps(&self) -> Vec<PyGapInfo> {
+        self.inner.gaps.iter().cloned().map(Into::into).collect()
+    }
+
+    /// Render the layout as a flat, sorted listing with link details.
+    fn to_text(&self) -> String {
+        self.inner.to_text()
+    }
+
+    /// Render the link graph as an indented tree starting at the ID block.
+    fn to_tree(&self) -> String {
+        self.inner.to_tree()
+    }
+
+    /// Serialize the layout to a pretty JSON string.
+    fn to_json(&self) -> PyResult<String> {
+        Ok(self.inner.to_json()?)
+    }
+
+    /// Write the flat text listing to `path`.
+    fn write_text_to_file(&self, path: &str) -> PyResult<()> {
+        self.inner.write_text_to_file(path)?;
+        Ok(())
+    }
+
+    /// Write the indented tree view to `path`.
+    fn write_tree_to_file(&self, path: &str) -> PyResult<()> {
+        self.inner.write_tree_to_file(path)?;
+        Ok(())
+    }
+
+    /// Write the JSON representation to `path`.
+    fn write_json_to_file(&self, path: &str) -> PyResult<()> {
+        self.inner.write_json_to_file(path)?;
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FileLayout(file_size={}, blocks={}, gaps={})",
+            self.inner.file_size,
+            self.inner.blocks.len(),
+            self.inner.gaps.len()
+        )
+    }
+}
+
+/// Build a [`PyFileLayout`] directly from a file path (free function helper).
+#[pyfunction]
+fn file_layout_from_file(path: &str) -> PyResult<PyFileLayout> {
+    PyFileLayout::from_file(path)
+}
+
 // Helper functions
 
 /// Create a float decoded value
@@ -1228,7 +1438,11 @@ pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyChannelInfo>()?;
     m.add_class::<PyDecodedValue>()?;
     m.add_class::<PyDataType>()?;
-    
+    m.add_class::<PyFileLayout>()?;
+    m.add_class::<PyBlockInfo>()?;
+    m.add_class::<PyLinkInfo>()?;
+    m.add_class::<PyGapInfo>()?;
+
     // Helper functions
     m.add_function(wrap_pyfunction!(create_float_value, m)?)?;
     m.add_function(wrap_pyfunction!(create_uint_value, m)?)?;
@@ -1237,6 +1451,7 @@ pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_data_type_uint_le, m)?)?;
     m.add_function(wrap_pyfunction!(create_data_type_float_le, m)?)?;
     m.add_function(wrap_pyfunction!(create_data_type_string_utf8, m)?)?;
-    
+    m.add_function(wrap_pyfunction!(file_layout_from_file, m)?)?;
+
     Ok(())
 }
