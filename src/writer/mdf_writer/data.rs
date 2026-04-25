@@ -28,6 +28,12 @@ pub(super) enum ChannelEncoder {
     F32 { offset: usize },
     F64 { offset: usize },
     Bytes { offset: usize, bytes: usize },
+    /// VLSD channel: writes a 64-bit running offset into the DT record at
+    /// `offset`, and appends `[u32 length][payload]` to
+    /// `OpenDataBlock::vlsd_payloads[channel_index]`. Encoded by an inline
+    /// loop in `write_record` / `write_records` (not by `encode()` since
+    /// that takes only `&[u8]` and can't access the payload buffer).
+    VlsdOffset { offset: usize, channel_index: usize },
     Skip,
 }
 
@@ -77,6 +83,36 @@ fn encode_values(encoders: &[ChannelEncoder], buf: &mut [u8], values: &[DecodedV
     }
 }
 
+/// Encode a record, handling VLSD channels by appending payloads to the
+/// per-channel buffers in `dt.vlsd_payloads` and writing the running offset
+/// into `dt.record_buf`. Non-VLSD channels are encoded in-place via
+/// `ChannelEncoder::encode`.
+fn encode_record(dt: &mut super::OpenDataBlock, values: &[DecodedValue]) {
+    for (i, val) in values.iter().enumerate() {
+        match &dt.encoders[i] {
+            ChannelEncoder::VlsdOffset { offset, channel_index } => {
+                let off = *offset;
+                let ch_idx = *channel_index;
+                let buf = dt.vlsd_payloads[ch_idx]
+                    .as_mut()
+                    .expect("VLSD encoder requires payload buffer");
+                let cur = buf.len() as u64;
+                dt.record_buf[off..off + 8].copy_from_slice(&cur.to_le_bytes());
+                let bytes: &[u8] = match val {
+                    DecodedValue::ByteArray(b)
+                    | DecodedValue::MimeSample(b)
+                    | DecodedValue::MimeStream(b) => b.as_slice(),
+                    DecodedValue::String(s) => s.as_bytes(),
+                    _ => &[],
+                };
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            enc => enc.encode(&mut dt.record_buf, val),
+        }
+    }
+}
+
 impl MdfWriter {
     /// Start writing a DTBLOCK for the given data group.
     pub fn start_data_block(
@@ -97,6 +133,8 @@ impl MdfWriter {
         }
         let record_size = record_bytes + record_id_len as usize;
 
+        let cg_channel_ids = self.cg_channel_ids.get(cg_id).cloned().unwrap_or_default();
+
         let header = BlockHeader { id: "##DT".to_string(), reserved0: 0, block_len: 24, links_nr: 0 };
         let header_bytes = header.to_bytes()?;
         let dt_id = format!("dt_{}", self.dt_counter);
@@ -109,25 +147,39 @@ impl MdfWriter {
         self.update_block_u32(cg_id, 96, record_bytes as u32)?;
 
         let mut encoders = Vec::new();
-        for ch in channels {
+        let mut vlsd_payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(channels.len());
+        let mut vlsd_channel_ids: Vec<Option<String>> = Vec::with_capacity(channels.len());
+        for (i, ch) in channels.iter().enumerate() {
             let offset = record_id_len as usize + ch.byte_offset as usize;
             let bytes = ((ch.bit_count + 7) / 8) as usize;
-            let enc = match ch.data_type {
-                DataType::UnsignedIntegerLE => ChannelEncoder::UInt { offset, bytes },
-                DataType::SignedIntegerLE => ChannelEncoder::Int { offset, bytes },
-                DataType::FloatLE => {
-                    if ch.bit_count == 32 {
-                        ChannelEncoder::F32 { offset }
-                    } else {
-                        ChannelEncoder::F64 { offset }
+            let is_vlsd = ch.channel_type == 1 && ch.data != 0;
+            let enc = if is_vlsd {
+                ChannelEncoder::VlsdOffset { offset, channel_index: i }
+            } else {
+                match ch.data_type {
+                    DataType::UnsignedIntegerLE => ChannelEncoder::UInt { offset, bytes },
+                    DataType::SignedIntegerLE => ChannelEncoder::Int { offset, bytes },
+                    DataType::FloatLE => {
+                        if ch.bit_count == 32 {
+                            ChannelEncoder::F32 { offset }
+                        } else {
+                            ChannelEncoder::F64 { offset }
+                        }
                     }
+                    DataType::ByteArray | DataType::MimeSample | DataType::MimeStream => {
+                        ChannelEncoder::Bytes { offset, bytes }
+                    }
+                    _ => ChannelEncoder::Skip,
                 }
-                DataType::ByteArray | DataType::MimeSample | DataType::MimeStream => {
-                    ChannelEncoder::Bytes { offset, bytes }
-                }
-                _ => ChannelEncoder::Skip,
             };
             encoders.push(enc);
+            if is_vlsd {
+                vlsd_payloads.push(Some(Vec::new()));
+                vlsd_channel_ids.push(cg_channel_ids.get(i).cloned());
+            } else {
+                vlsd_payloads.push(None);
+                vlsd_channel_ids.push(None);
+            }
         }
 
         self.open_dts.insert(
@@ -146,6 +198,8 @@ impl MdfWriter {
                 record_buf: vec![0u8; record_size],
                 record_template: vec![0u8; record_size],
                 encoders,
+                vlsd_payloads,
+                vlsd_channel_ids,
             },
         );
         Ok(())
@@ -223,7 +277,7 @@ impl MdfWriter {
         }
 
         dt.record_buf.copy_from_slice(&dt.record_template);
-        encode_values(&dt.encoders, &mut dt.record_buf, values);
+        encode_record(dt, values);
 
         self.file.write_all(&dt.record_buf)?;
         dt.record_count += 1;
@@ -310,7 +364,7 @@ impl MdfWriter {
 
             let dt = self.open_dts.get_mut(cg_id).unwrap();
             dt.record_buf.copy_from_slice(&dt.record_template);
-            encode_values(&dt.encoders, &mut dt.record_buf, record);
+            encode_record(dt, record);
             buffer.extend_from_slice(&dt.record_buf);
             dt.record_count += 1;
         }
@@ -660,7 +714,7 @@ impl MdfWriter {
                 ChannelEncoder::UInt { offset, bytes } => (*offset, *bytes),
                 ChannelEncoder::Int { offset, bytes } => (*offset, *bytes),
                 ChannelEncoder::Bytes { offset, bytes } => (*offset, *bytes),
-                ChannelEncoder::Skip => (0, 0),
+                ChannelEncoder::VlsdOffset { .. } | ChannelEncoder::Skip => (0, 0),
             }).collect();
             for &(_, nbytes) in &enc_info {
                 total_channel_bytes += nbytes;
@@ -762,6 +816,27 @@ impl MdfWriter {
             let _pos = self.write_block_with_id(&dl_bytes, &dl_id)?;
             let dg_data_link_offset = 40;
             self.update_block_link(&dt.dg_id, dg_data_link_offset, &dl_id)?;
+        }
+
+        for i in 0..dt.vlsd_payloads.len() {
+            let payload = match dt.vlsd_payloads[i].take() {
+                Some(p) => p,
+                None => continue,
+            };
+            let cn_id = match dt.vlsd_channel_ids[i].clone() {
+                Some(id) => id,
+                None => continue,
+            };
+            let block_len = 24u64 + payload.len() as u64;
+            let header = BlockHeader { id: "##SD".to_string(), reserved0: 0, block_len, links_nr: 0 };
+            let mut sd_bytes = header.to_bytes()?;
+            sd_bytes.extend_from_slice(&payload);
+
+            let sd_count = self.block_positions.keys().filter(|k| k.starts_with("sd_")).count();
+            let sd_id = format!("sd_{}", sd_count);
+            self.write_block_with_id(&sd_bytes, &sd_id)?;
+            let cn_data_offset = 64u64;
+            self.update_block_link(&cn_id, cn_data_offset, &sd_id)?;
         }
         Ok(())
     }

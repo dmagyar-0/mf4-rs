@@ -89,6 +89,7 @@ impl MdfWriter {
         self.cg_to_dg.insert(cg_id.clone(), dg_id);
         self.cg_offsets.insert(cg_id.clone(), 0);
         self.cg_channels.insert(cg_id.clone(), Vec::new());
+        self.cg_channel_ids.insert(cg_id.clone(), Vec::new());
         Ok(cg_id)
     }
 
@@ -184,6 +185,7 @@ impl MdfWriter {
         let entry = self.cg_channels.entry(cg_id.to_string()).or_default();
         entry.push(ch.clone());
         let idx = entry.len() - 1;
+        self.cg_channel_ids.entry(cg_id.to_string()).or_default().push(cn_id.clone());
         self.channel_map.insert(cn_id.clone(), (cg_id.to_string(), idx));
 
         if prev_cn_id.is_none() {
