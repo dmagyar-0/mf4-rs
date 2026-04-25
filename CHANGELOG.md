@@ -1,3 +1,11 @@
+## v1.3.0 — 2026-04-25
+
+### Features
+- expose merge_files in Python bindings
+
+### Fixes
+- support VLSD signal channels and verify byte-array merging
+
 ## v1.2.0 — 2026-04-25
 
 ### Features
