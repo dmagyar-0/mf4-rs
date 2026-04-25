@@ -1,0 +1,363 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  compute-bump:
+    name: Compute SemVer bump from Conventional Commits
+    runs-on: ubuntu-latest
+    outputs:
+      release_needed: ${{ steps.bump.outputs.release_needed }}
+      new_version: ${{ steps.bump.outputs.new_version }}
+      previous_tag: ${{ steps.bump.outputs.previous_tag }}
+      bump: ${{ steps.bump.outputs.bump }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: bump
+        name: Determine next version
+        shell: python
+        run: |
+          import os, re, subprocess
+
+          tags = subprocess.check_output(
+              ["git", "tag", "--list", "v*", "--sort=-v:refname"], text=True
+          ).split()
+          last_tag = tags[0] if tags else "v0.0.0"
+          range_arg = "HEAD" if last_tag == "v0.0.0" else f"{last_tag}..HEAD"
+
+          hashes = subprocess.check_output(
+              ["git", "log", range_arg, "--format=%H"], text=True
+          ).split()
+
+          TYPE_RE = re.compile(
+              r"^(feat|fix|perf|refactor|chore|docs|test|ci|build|style)"
+              r"(\([^)]+\))?(!)?:"
+          )
+          BREAKING_FOOTER = re.compile(r"^BREAKING[ -]CHANGE:", re.M | re.I)
+
+          rank = {"none": 0, "patch": 1, "minor": 2, "major": 3}
+          bump = "none"
+
+          for h in hashes:
+              body = subprocess.check_output(
+                  ["git", "show", "-s", "--format=%B", h], text=True
+              )
+              subject = body.splitlines()[0] if body else ""
+              m = TYPE_RE.match(subject)
+              if (m and m.group(3) == "!") or BREAKING_FOOTER.search(body):
+                  bump = "major"
+                  break
+              if not m:
+                  continue
+              t = m.group(1)
+              if t == "feat" and rank[bump] < rank["minor"]:
+                  bump = "minor"
+              elif t in ("fix", "perf") and rank[bump] < rank["patch"]:
+                  bump = "patch"
+
+          base = last_tag.lstrip("v")
+          major, minor, patch = (int(x) for x in base.split("."))
+          if bump == "major":
+              major, minor, patch = major + 1, 0, 0
+          elif bump == "minor":
+              minor, patch = minor + 1, 0
+          elif bump == "patch":
+              patch += 1
+
+          new_version = f"{major}.{minor}.{patch}" if bump != "none" else ""
+          release_needed = "true" if bump != "none" else "false"
+
+          print(f"Previous tag: {last_tag}")
+          print(f"Commits analyzed: {len(hashes)}")
+          print(f"Bump: {bump}")
+          print(f"New version: {new_version or '(none — skipping release)'}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"previous_tag={last_tag}\n")
+              f.write(f"new_version={new_version}\n")
+              f.write(f"release_needed={release_needed}\n")
+              f.write(f"bump={bump}\n")
+
+  bump-and-tag:
+    name: Bump version, update changelog, tag
+    needs: compute-bump
+    if: needs.compute-bump.outputs.release_needed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ needs.compute-bump.outputs.new_version }}
+      tag: v${{ needs.compute-bump.outputs.new_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git author
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump Cargo.toml
+        run: |
+          sed -i -E 's/^version *= *"[^"]+"/version = "${{ needs.compute-bump.outputs.new_version }}"/' Cargo.toml
+          grep '^version' Cargo.toml
+
+      - name: Bump pyproject.toml
+        run: |
+          python -c "
+          import re, pathlib
+          p = pathlib.Path('pyproject.toml')
+          new = re.sub(r'^version = \".*\"', 'version = \"${{ needs.compute-bump.outputs.new_version }}\"', p.read_text(), count=1, flags=re.M)
+          p.write_text(new)
+          "
+          grep '^version' pyproject.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Refresh Cargo.lock
+        run: cargo update -p mf4-rs
+
+      - name: Generate changelog entry
+        id: changelog
+        env:
+          PREVIOUS_TAG: ${{ needs.compute-bump.outputs.previous_tag }}
+          NEW_VERSION: ${{ needs.compute-bump.outputs.new_version }}
+        shell: python
+        run: |
+          import datetime, os, pathlib, re, subprocess
+
+          prev = os.environ["PREVIOUS_TAG"]
+          new_tag = "v" + os.environ["NEW_VERSION"]
+          range_arg = "HEAD" if prev == "v0.0.0" else f"{prev}..HEAD"
+
+          subjects = subprocess.check_output(
+              ["git", "log", range_arg, "--format=%s"], text=True
+          ).splitlines()
+
+          TYPE = re.compile(r"^([a-z]+)(\([^)]+\))?(!)?:\s*(.+)$")
+          groups = [
+              ("feat",     "Features"),
+              ("fix",      "Fixes"),
+              ("perf",     "Performance"),
+              ("refactor", "Refactors"),
+              ("docs",     "Docs"),
+              ("build",    "Build"),
+              ("ci",       "CI"),
+          ]
+          breaking = []
+          buckets = {t: [] for t, _ in groups}
+          for s in subjects:
+              m = TYPE.match(s)
+              if not m:
+                  continue
+              t, _, bang, desc = m.groups()
+              if bang:
+                  breaking.append(f"- {desc}")
+              if t in buckets:
+                  buckets[t].append(f"- {desc}")
+
+          today = datetime.date.today().isoformat()
+          lines = [f"## {new_tag} — {today}", ""]
+          if breaking:
+              lines += ["### BREAKING CHANGES", *breaking, ""]
+          for t, label in groups:
+              if buckets[t]:
+                  lines += [f"### {label}", *buckets[t], ""]
+
+          new_section = "\n".join(lines).rstrip() + "\n"
+          pathlib.Path("new_section.md").write_text(new_section)
+
+          changelog = pathlib.Path("CHANGELOG.md")
+          if changelog.exists():
+              changelog.write_text(new_section + "\n" + changelog.read_text())
+          else:
+              header = (
+                  "# Changelog\n\n"
+                  "All notable changes to mf4-rs are documented in this file. "
+                  "This project follows Semantic Versioning and Conventional Commits.\n\n"
+              )
+              changelog.write_text(header + new_section)
+
+          print("--- generated changelog section ---")
+          print(new_section)
+
+      - name: Commit, tag, and push
+        run: |
+          set -euo pipefail
+          new='v${{ needs.compute-bump.outputs.new_version }}'
+          git add Cargo.toml Cargo.lock pyproject.toml CHANGELOG.md
+          git commit -m "chore(release): ${new}"
+          git tag -a "${new}" -m "Release ${new}"
+          git push origin HEAD:main
+          git push origin "${new}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ needs.compute-bump.outputs.new_version }}" \
+            --title "v${{ needs.compute-bump.outputs.new_version }}" \
+            --notes-file new_section.md
+
+  build-wheels-linux:
+    name: Build wheels (Linux ${{ matrix.target }})
+    needs: bump-and-tag
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump-and-tag.outputs.tag }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          manylinux: auto
+          sccache: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  build-wheels-macos:
+    name: Build wheels (macOS ${{ matrix.target }})
+    needs: bump-and-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            target: x86_64
+            pythons: |
+              3.8
+              3.9
+              3.10
+              3.11
+              3.12
+          - os: macos-14
+            target: aarch64
+            pythons: |
+              3.10
+              3.11
+              3.12
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump-and-tag.outputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.pythons }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          sccache: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  build-wheels-windows:
+    name: Build wheels (Windows ${{ matrix.target }})
+    needs: bump-and-tag
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump-and-tag.outputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.8
+            3.9
+            3.10
+            3.11
+            3.12
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          sccache: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: dist
+
+  build-sdist:
+    name: Build source distribution
+    needs: bump-and-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump-and-tag.outputs.tag }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs:
+      - build-wheels-linux
+      - build-wheels-macos
+      - build-wheels-windows
+      - build-sdist
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mf4-rs
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List collected artifacts
+        run: ls -la dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: bump-and-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump-and-tag.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Dry-run publish
+        run: cargo publish --dry-run --allow-dirty
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --token "$CARGO_REGISTRY_TOKEN"
