@@ -249,3 +249,28 @@ Releases are fully automated. Every merge to `main` runs `.github/workflows/rele
 5. Publishes the Rust crate to [crates.io](https://crates.io/crates/mf4-rs).
 
 PR titles are linted against the convention by `.github/workflows/pr-title.yml`. Because PRs are squash-merged, **the PR title is the source of truth** for both the changelog and the version bump. See [`CHANGELOG.md`](CHANGELOG.md) for release history.
+
+### How PR titles map to version bumps
+
+| PR title prefix (or footer)                                       | Bump        | Example                                              |
+|-------------------------------------------------------------------|-------------|------------------------------------------------------|
+| `feat!:` / `<type>!:` / body contains `BREAKING CHANGE:`          | **major**   | `feat!: drop Python 3.8 support`                     |
+| `feat:`                                                           | **minor**   | `feat: add ##DZ block decompression for index reads` |
+| `fix:` / `perf:`                                                  | **patch**   | `fix: handle empty CHANGELOG.md on first release`    |
+| `chore:` / `docs:` / `refactor:` / `test:` / `ci:` / `build:` / `style:` | _no release_ | `docs: clarify VLSD record format`                   |
+
+If multiple commits land between releases, the **highest** bump wins. Runs with no qualifying commits are a clean no-op — no tag is created and no artifacts are published, which is why the `chore(release): vX.Y.Z` commit pushed back by the workflow does not trigger another release.
+
+### What gets published
+
+Each successful release run publishes, in parallel, after the tag is pushed:
+
+- **PyPI**: `mf4-rs` wheels for Linux (x86_64, aarch64), macOS (x86_64 on 13, aarch64 on 14), and Windows (x64), plus an sdist. Authentication uses [PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC) — no long-lived API token is stored. The `pypi` GitHub Actions environment gates this job.
+- **crates.io**: the `mf4-rs` Rust crate, gated by a `cargo publish --dry-run` step. Authentication uses the `CARGO_REGISTRY_TOKEN` repository secret.
+- **GitHub Releases**: a release named `vX.Y.Z` whose body is the same changelog section appended to `CHANGELOG.md`.
+
+### Manual triggers and recovery
+
+- **Re-run a release**: the `Release` workflow accepts `workflow_dispatch`, so a maintainer can re-run it from the Actions tab. If the tag already exists, `bump-and-tag` will fail; in that case re-run only the `publish-pypi` / `publish-crates` jobs from the original run.
+- **Skip a release intentionally**: use a non-releasing prefix (`chore:`, `docs:`, `refactor:`, `test:`, `ci:`, `build:`, `style:`) for the PR title. The workflow will run, compute `bump=none`, and exit cleanly without creating a tag.
+- **First-time setup** (already complete for this repo): a PyPI Trusted Publisher entry for `mf4-rs` pointing at `dmagyar-0/mf4-rs` workflow `release.yml`, environment `pypi`; a `CARGO_REGISTRY_TOKEN` secret; and — if branch protection blocks `GITHUB_TOKEN` pushes to `main` — a `RELEASE_PAT` secret with `contents:write`.
