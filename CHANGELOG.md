@@ -1,3 +1,8 @@
+## v1.1.0 — 2026-04-25
+
+### Features
+- use max of latest tag and Cargo.toml version as bump base (#58)
+
 # Changelog
 
 All notable changes to mf4-rs are documented in this file. This project follows Semantic Versioning and Conventional Commits.
