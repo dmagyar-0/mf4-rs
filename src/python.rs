@@ -1384,6 +1384,37 @@ fn file_layout_from_file(path: &str) -> PyResult<PyFileLayout> {
     PyFileLayout::from_file(path)
 }
 
+/// Cut an MDF file by time, copying only records whose master channel value
+/// falls within the inclusive `[start_time, end_time]` window.
+///
+/// The output preserves fixed-length numeric, string, and byte-array
+/// channels, per-record invalidation bytes, and VLSD ("signal-based")
+/// channels (a fresh ##SD chain is written for each kept VLSD channel).
+/// Per-channel conversion / source / metadata blocks are not re-emitted, so
+/// the output channels read as raw values.
+///
+/// Parameters
+/// ----------
+/// input_path : str
+///     Path to the source MF4 file.
+/// output_path : str
+///     Destination path for the trimmed file.
+/// start_time : float
+///     Start of the window in seconds (inclusive).
+/// end_time : float
+///     End of the window in seconds (inclusive).
+#[pyfunction]
+#[pyo3(signature = (input_path, output_path, start_time, end_time))]
+fn cut_mdf_by_time(
+    input_path: &str,
+    output_path: &str,
+    start_time: f64,
+    end_time: f64,
+) -> PyResult<()> {
+    crate::cut::cut_mdf_by_time(input_path, output_path, start_time, end_time)?;
+    Ok(())
+}
+
 // Helper functions
 
 /// Create a float decoded value
@@ -1452,6 +1483,7 @@ pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_data_type_float_le, m)?)?;
     m.add_function(wrap_pyfunction!(create_data_type_string_utf8, m)?)?;
     m.add_function(wrap_pyfunction!(file_layout_from_file, m)?)?;
+    m.add_function(wrap_pyfunction!(cut_mdf_by_time, m)?)?;
 
     Ok(())
 }
