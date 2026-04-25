@@ -2,6 +2,52 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Commit & PR Title Format (MUST FOLLOW)
+
+This repository uses **automated releases driven by Conventional Commits**. Every push to `main` runs `.github/workflows/release.yml`, which inspects commit messages since the last `v*` tag, computes a SemVer bump, updates `Cargo.toml` / `pyproject.toml` / `Cargo.lock` / `CHANGELOG.md`, tags `vX.Y.Z`, and publishes to PyPI and crates.io.
+
+The repo squash-merges PRs, so **the PR title becomes the commit message on `main`** — and that is what the release pipeline parses. PR titles are also linted by `.github/workflows/pr-title.yml` (uses `amannn/action-semantic-pull-request`).
+
+### Required PR title grammar
+
+```
+<type>(<optional scope>)<!>: <description>
+```
+
+- `<type>` must be one of: `feat`, `fix`, `perf`, `chore`, `docs`, `refactor`, `test`, `ci`, `build`, `style`.
+- Append `!` (or include a `BREAKING CHANGE:` footer in the PR body) to flag a breaking change.
+- The description must start with an alphanumeric character and use the imperative mood.
+
+### How types map to version bumps
+
+| Title prefix (or footer) | Bump |
+|---|---|
+| `feat!:` / `fix!:` / any `<type>!:` / body `BREAKING CHANGE:` | **major** |
+| `feat:` | **minor** |
+| `fix:` / `perf:` | **patch** |
+| `chore:` / `docs:` / `refactor:` / `test:` / `ci:` / `build:` / `style:` | **no release** |
+
+The pipeline takes the **highest** bump implied by any commit since the last tag. A run with no qualifying commits is a clean no-op (no tag created), which is why the `chore(release): vX.Y.Z` commit pushed back by the workflow does not loop.
+
+### Examples
+
+- `feat: add ##DZ block decompression for index reads` → minor bump
+- `fix: handle empty CHANGELOG.md on first release` → patch bump
+- `feat!: drop Python 3.8 support` → major bump
+- `chore: bump rand to 0.9` → no release
+- `docs: clarify VLSD record format` → no release
+
+### Rules for Claude sessions
+
+1. **Always set the PR title** to a Conventional Commits–conformant string when opening a PR with `mcp__github__create_pull_request`. Default to:
+   - `feat:` for user-visible additions to the Rust or Python API
+   - `fix:` for bug fixes
+   - `perf:` for performance improvements with no behavior change
+   - `chore:` / `docs:` / `refactor:` / `test:` / `ci:` / `build:` / `style:` for non-shipping changes
+2. Use `!` or a `BREAKING CHANGE:` footer **only** when the public Rust crate API or the Python bindings change incompatibly.
+3. **Never hand-edit the `version` fields** in `Cargo.toml` or `pyproject.toml`, and never manually edit `CHANGELOG.md` to add release sections — the release workflow owns those. Editing them by hand will cause merge conflicts the next time the workflow runs.
+4. When committing within a PR branch, individual commit subjects don't need to be conventional (the squash uses the PR title), but matching the convention still helps reviewers.
+
 ## Project Overview
 
 `mf4-rs` is a Rust library for working with ASAM MDF 4 (Measurement Data Format) files. It implements a subset of the MDF 4.1 specification sufficient for data logging and inspection tasks. The library supports reading existing MDF files, writing new ones, creating lightweight JSON indexes for fast random access, time-based file cutting, and file merging. Optional Python bindings are available via PyO3.

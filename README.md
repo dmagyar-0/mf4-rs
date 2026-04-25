@@ -237,3 +237,15 @@ for group in mdf.channel_groups():
 - `memmap2` - Memory-mapped file I/O
 - `meval` - Mathematical expression evaluation for formula conversions
 - `thiserror` - Error handling derive macros
+
+## Releases
+
+Releases are fully automated. Every merge to `main` runs `.github/workflows/release.yml`, which:
+
+1. Reads commit messages since the last `v*` tag.
+2. Computes a SemVer bump from [Conventional Commits](https://www.conventionalcommits.org/) prefixes (`feat:` → minor, `fix:`/`perf:` → patch, `feat!:` / `BREAKING CHANGE:` → major; other types do not produce a release).
+3. Updates `Cargo.toml`, `pyproject.toml`, `Cargo.lock`, and `CHANGELOG.md`, then tags `vX.Y.Z`.
+4. Builds wheels for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x64), plus an sdist, and publishes them to [PyPI](https://pypi.org/project/mf4-rs/) via OIDC trusted publishing.
+5. Publishes the Rust crate to [crates.io](https://crates.io/crates/mf4-rs).
+
+PR titles are linted against the convention by `.github/workflows/pr-title.yml`. Because PRs are squash-merged, **the PR title is the source of truth** for both the changelog and the version bump. See [`CHANGELOG.md`](CHANGELOG.md) for release history.
