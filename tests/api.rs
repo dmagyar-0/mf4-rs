@@ -208,3 +208,116 @@ fn cut_mdf_file_by_time() -> Result<(), MdfError> {
     std::fs::remove_file(output)?;
     Ok(())
 }
+
+/// Regression: cut should not apply channel conversions during the
+/// decode/encode round-trip. Previously cut decoded → applied conversion →
+/// re-encoded the converted value into the raw slot, so reading the cut file
+/// applied the conversion a second time. This test attaches a linear
+/// conversion to the value channel and verifies the physical values after
+/// cut match the source physical values exactly.
+#[test]
+fn cut_does_not_double_apply_conversions() -> Result<(), MdfError> {
+    use mf4_rs::blocks::common::BlockHeader;
+    use mf4_rs::blocks::conversion::{ConversionBlock, ConversionType};
+
+    let input = std::env::temp_dir().join("cut_conv_input.mf4");
+    let output = std::env::temp_dir().join("cut_conv_output.mf4");
+    if input.exists() { std::fs::remove_file(&input)?; }
+    if output.exists() { std::fs::remove_file(&output)?; }
+
+    let mut writer = MdfWriter::new(input.to_str().unwrap())?;
+    writer.init_mdf_file()?;
+    let cg_id = writer.add_channel_group(None, |_| {})?;
+    let time_id = writer.add_channel(&cg_id, None, |ch| {
+        ch.data_type = DataType::FloatLE;
+        ch.bit_count = 64;
+        ch.name = Some("Time".into());
+    })?;
+    writer.set_time_channel(&time_id)?;
+    let val_id = writer.add_channel(&cg_id, Some(&time_id), |ch| {
+        ch.data_type = DataType::UnsignedIntegerLE;
+        ch.bit_count = 32;
+        ch.name = Some("Val".into());
+    })?;
+
+    // phys = 10 + 2 * raw  →  raw=3 → phys=16, raw=4 → phys=18, raw=5 → phys=20
+    let conv = ConversionBlock {
+        header: BlockHeader { id: "##CC".into(), reserved0: 0, block_len: 0, links_nr: 0 },
+        cc_tx_name: None,
+        cc_md_unit: None,
+        cc_md_comment: None,
+        cc_cc_inverse: None,
+        cc_ref: Vec::new(),
+        cc_type: ConversionType::Linear,
+        cc_precision: 0,
+        cc_flags: 0,
+        cc_ref_count: 0,
+        cc_val_count: 2,
+        cc_phy_range_min: None,
+        cc_phy_range_max: None,
+        cc_val: vec![10.0, 2.0],
+        formula: None,
+        resolved_texts: None,
+        resolved_conversions: None,
+        default_conversion: None,
+    };
+    let cc_bytes = conv.to_bytes()?;
+    let cc_id = "cc_lin".to_string();
+    writer.write_block_with_id(&cc_bytes, &cc_id)?;
+    // Patch val channel's conversion link (offset 56 from cn block start).
+    writer.update_block_link(&val_id, 56, &cc_id)?;
+
+    writer.start_data_block_for_cg(&cg_id, 0)?;
+    for i in 0..10u64 {
+        writer.write_record(
+            &cg_id,
+            &[
+                DecodedValue::Float(i as f64 * 0.1),
+                DecodedValue::UnsignedInteger(i),
+            ],
+        )?;
+    }
+    writer.finish_data_block(&cg_id)?;
+    writer.finalize()?;
+
+    // Sanity: source reads back with conversion applied.
+    {
+        let mdf = MDF::from_file(input.to_str().unwrap())?;
+        let chs = mdf.channel_groups()[0].channels();
+        let vals = chs[1].values()?;
+        assert_eq!(vals.len(), 10);
+        if let Some(DecodedValue::Float(v3)) = vals[3] {
+            assert!((v3 - 16.0).abs() < 1e-9, "source phys[3] = {}", v3);
+        } else {
+            panic!("unexpected source vals[3]: {:?}", vals[3]);
+        }
+    }
+
+    mf4_rs::cut::cut_mdf_by_time(
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+        0.3,
+        0.5,
+    )?;
+
+    // The cut output drops conversion blocks (out of scope per plan), so the
+    // value channel reads as raw u32. The raw values must still equal the
+    // source raw values [3, 4, 5] — i.e. cut must NOT have stored the
+    // physical values [16, 18, 20] in the raw slots.
+    let mdf = MDF::from_file(output.to_str().unwrap())?;
+    let chs = mdf.channel_groups()[0].channels();
+    let vals = chs[1].values()?;
+    assert_eq!(vals.len(), 3);
+    let raws: Vec<u64> = vals
+        .iter()
+        .map(|v| match v {
+            Some(DecodedValue::UnsignedInteger(u)) => *u,
+            other => panic!("unexpected cut vals: {:?}", other),
+        })
+        .collect();
+    assert_eq!(raws, vec![3, 4, 5], "cut stored converted values: {:?}", raws);
+
+    std::fs::remove_file(input)?;
+    std::fs::remove_file(output)?;
+    Ok(())
+}

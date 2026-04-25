@@ -13,6 +13,7 @@ use crate::writer::mdf_writer::data::ChannelEncoder;
 mod io;
 mod init;
 pub mod data;
+mod vlsd;
 
 /// Helper structure tracking an open DTBLOCK during writing
 struct OpenDataBlock {
@@ -43,6 +44,7 @@ struct OpenDataBlock {
     vlsd_channel_ids: Vec<Option<String>>,
 }
 
+
 /// Writer for MDF blocks, ensuring 8-byte alignment and zero padding.
 /// Tracks block positions and supports updating links at a later stage.
 pub struct MdfWriter {
@@ -50,6 +52,11 @@ pub struct MdfWriter {
     offset: u64,
     block_positions: HashMap<String, u64>,
     open_dts: HashMap<String, OpenDataBlock>,
+    /// In-memory VLSD payload buffers keyed by channel id. Each entry holds
+    /// the concatenated `[u32 length][bytes]…` stream collected between
+    /// `start_signal_data_block` and `finish_signal_data_block`. Buffers are
+    /// flushed to ##SD blocks (chained via ##DL when large) on finish.
+    sd_buffers: HashMap<String, Vec<u8>>,
     dt_counter: usize,
     last_dg: Option<String>,
     cg_to_dg: HashMap<String, String>,

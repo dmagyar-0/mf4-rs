@@ -1,3 +1,17 @@
+## v1.2.0 — 2026-04-25
+
+### Features
+- cut by absolute UTC time
+- expose cut_mdf_by_time
+
+### Fixes
+- preserve VLSD, byte-array, and invalidation data when cutting
+
+## v1.1.2 — 2026-04-25
+
+### Fixes
+- drop Intel Mac wheel build to avoid macos-13 runner queue
+
 ## v1.1.1 — 2026-04-25
 
 ### Fixes

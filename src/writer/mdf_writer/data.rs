@@ -216,6 +216,86 @@ impl MdfWriter {
         self.start_data_block(&dg, cg_id, record_id_len, &channels)
     }
 
+    /// Open a DT block for raw byte-level record writing.
+    ///
+    /// Unlike [`start_data_block_for_cg`], this does NOT derive `record_size`
+    /// from the channel layout. Instead the caller supplies the source file's
+    /// `data_bytes` (= `samples_byte_nr` of the source channel group) and
+    /// `invalidation_bytes` (= `invalidation_bytes_nr`). Both fields are
+    /// patched onto the new channel group block, and [`write_raw_record`]
+    /// expects byte slices of length `record_id_len + data_bytes + invalidation_bytes`.
+    ///
+    /// This entry point exists for the cut/merge code paths which copy raw
+    /// records (including invalidation bits and any unencoded layout
+    /// trailers) verbatim from a source file.
+    pub fn start_data_block_for_cg_raw(
+        &mut self,
+        cg_id: &str,
+        record_id_len: u8,
+        data_bytes: u32,
+        invalidation_bytes: u32,
+    ) -> Result<(), MdfError> {
+        if self.open_dts.contains_key(cg_id) {
+            return Err(MdfError::BlockSerializationError(
+                "data block already open for this channel group".into(),
+            ));
+        }
+        let dg_id = self
+            .cg_to_dg
+            .get(cg_id)
+            .ok_or_else(|| MdfError::BlockSerializationError("unknown channel group".into()))?
+            .clone();
+        let channels = self
+            .cg_channels
+            .get(cg_id)
+            .ok_or_else(|| MdfError::BlockSerializationError("no channels for channel group".into()))?
+            .clone();
+
+        let record_size =
+            record_id_len as usize + data_bytes as usize + invalidation_bytes as usize;
+
+        let header = BlockHeader { id: "##DT".to_string(), reserved0: 0, block_len: 24, links_nr: 0 };
+        let header_bytes = header.to_bytes()?;
+        let dt_id = format!("dt_{}", self.dt_counter);
+        self.dt_counter += 1;
+        let dt_pos = self.write_block_with_id(&header_bytes, &dt_id)?;
+
+        let dg_data_link_offset = 40;
+        self.update_block_link(&dg_id, dg_data_link_offset, &dt_id)?;
+        self.update_block_u8(&dg_id, 56, record_id_len)?;
+        // Patch CG.samples_byte_nr (offset 96) and CG.invalidation_bytes_nr (offset 100).
+        self.update_block_u32(cg_id, 96, data_bytes)?;
+        self.update_block_u32(cg_id, 100, invalidation_bytes)?;
+
+        // Encoders are unused on the raw-write path but the OpenDataBlock type
+        // requires the field; populate with `Skip` placeholders for parity.
+        let channel_count = channels.len();
+        let encoders: Vec<ChannelEncoder> =
+            channels.iter().map(|_| ChannelEncoder::Skip).collect();
+
+        self.open_dts.insert(
+            cg_id.to_string(),
+            OpenDataBlock {
+                dg_id,
+                dt_id: dt_id.clone(),
+                start_pos: dt_pos,
+                record_size,
+                record_count: 0,
+                total_record_count: 0,
+                channels,
+                dt_ids: vec![dt_id],
+                dt_positions: vec![dt_pos],
+                dt_sizes: Vec::new(),
+                record_buf: vec![0u8; record_size],
+                record_template: vec![0u8; record_size],
+                encoders,
+                vlsd_payloads: vec![None; channel_count],
+                vlsd_channel_ids: vec![None; channel_count],
+            },
+        );
+        Ok(())
+    }
+
     /// Precomputes constant values for a channel group. The provided slice must
     /// have the same length as the channel list and will be encoded into the
     /// internal record template used for each record.
@@ -282,6 +362,62 @@ impl MdfWriter {
         self.file.write_all(&dt.record_buf)?;
         dt.record_count += 1;
         self.offset += dt.record_buf.len() as u64;
+        Ok(())
+    }
+
+    /// Append one record to the open DTBLOCK as a verbatim byte copy.
+    ///
+    /// Unlike [`write_record`], this bypasses per-channel encoders and writes
+    /// the supplied bytes directly. The slice length must equal the channel
+    /// group's `record_size` (record_id + data + invalidation bytes). This is
+    /// used by the cut/merge code to preserve raw record content (including
+    /// invalidation bits and any unencoded channel layouts) without going
+    /// through the decode/re-encode round trip.
+    pub fn write_raw_record(&mut self, cg_id: &str, raw: &[u8]) -> Result<(), MdfError> {
+        let potential_new_block = {
+            let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+                MdfError::BlockSerializationError(
+                    "no open DT block for this channel group".into(),
+                )
+            })?;
+            if raw.len() != dt.record_size {
+                return Err(MdfError::BlockSerializationError(
+                    "raw record size mismatch".into(),
+                ));
+            }
+            24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
+        };
+
+        if potential_new_block {
+            let (start_pos, record_count, record_size) = {
+                let dt = self.open_dts.get(cg_id).unwrap();
+                (dt.start_pos, dt.record_count, dt.record_size)
+            };
+            let size = 24 + record_size * record_count as usize;
+            self.update_link(start_pos + 8, size as u64)?;
+            {
+                let dt = self.open_dts.get_mut(cg_id).unwrap();
+                dt.total_record_count += record_count;
+                dt.dt_sizes.push(size as u64);
+            }
+            let header = BlockHeader { id: "##DT".to_string(), reserved0: 0, block_len: 24, links_nr: 0 };
+            let header_bytes = header.to_bytes()?;
+            let new_dt_id = format!("dt_{}", self.dt_counter);
+            self.dt_counter += 1;
+            let new_dt_pos = self.write_block_with_id(&header_bytes, &new_dt_id)?;
+
+            let dt = self.open_dts.get_mut(cg_id).unwrap();
+            dt.dt_id = new_dt_id.clone();
+            dt.start_pos = new_dt_pos;
+            dt.record_count = 0;
+            dt.dt_ids.push(new_dt_id);
+            dt.dt_positions.push(new_dt_pos);
+        }
+
+        self.file.write_all(raw)?;
+        let dt = self.open_dts.get_mut(cg_id).unwrap();
+        dt.record_count += 1;
+        self.offset += raw.len() as u64;
         Ok(())
     }
 

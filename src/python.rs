@@ -1384,6 +1384,122 @@ fn file_layout_from_file(path: &str) -> PyResult<PyFileLayout> {
     PyFileLayout::from_file(path)
 }
 
+/// Cut an MDF file by time, copying only records whose master channel value
+/// falls within the inclusive `[start_time, end_time]` window.
+///
+/// The output preserves fixed-length numeric, string, and byte-array
+/// channels, per-record invalidation bytes, and VLSD ("signal-based")
+/// channels (a fresh ##SD chain is written for each kept VLSD channel).
+/// Per-channel conversion / source / metadata blocks are not re-emitted, so
+/// the output channels read as raw values.
+///
+/// Parameters
+/// ----------
+/// input_path : str
+///     Path to the source MF4 file.
+/// output_path : str
+///     Destination path for the trimmed file.
+/// start_time : float
+///     Start of the window in seconds (inclusive).
+/// end_time : float
+///     End of the window in seconds (inclusive).
+#[pyfunction]
+#[pyo3(signature = (input_path, output_path, start_time, end_time))]
+fn cut_mdf_by_time(
+    input_path: &str,
+    output_path: &str,
+    start_time: f64,
+    end_time: f64,
+) -> PyResult<()> {
+    crate::cut::cut_mdf_by_time(input_path, output_path, start_time, end_time)?;
+    Ok(())
+}
+
+/// Convert a Python `datetime`, an ISO 8601 string, or a numeric UNIX
+/// timestamp (seconds, with fractional part) into UNIX-epoch nanoseconds.
+fn coerce_to_unix_ns(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<i64> {
+    let datetime_mod = py.import_bound("datetime")?;
+    let datetime_cls = datetime_mod.getattr("datetime")?;
+
+    // datetime.datetime — call .timestamp() to get seconds since epoch.
+    if value.is_instance(&datetime_cls)? {
+        let dt = ensure_utc_aware(py, value, &datetime_mod)?;
+        let ts: f64 = dt.call_method0("timestamp")?.extract()?;
+        return Ok((ts * 1.0e9).round() as i64);
+    }
+
+    // String: try datetime.fromisoformat (Python ≥ 3.7).
+    if let Ok(s) = value.extract::<String>() {
+        // datetime.fromisoformat in Python 3.11+ accepts trailing 'Z'; for
+        // earlier versions we normalise it to '+00:00' before parsing.
+        let normalized = if s.ends_with('Z') || s.ends_with('z') {
+            format!("{}+00:00", &s[..s.len() - 1])
+        } else {
+            s
+        };
+        let parsed = datetime_cls.call_method1("fromisoformat", (normalized,))?;
+        let dt = ensure_utc_aware(py, &parsed, &datetime_mod)?;
+        let ts: f64 = dt.call_method0("timestamp")?.extract()?;
+        return Ok((ts * 1.0e9).round() as i64);
+    }
+
+    // Numeric timestamp (int or float seconds since epoch). Tried last so a
+    // `datetime` (which is also coercible to a number via __float__ in some
+    // shims) hits the dedicated path above.
+    if let Ok(secs) = value.extract::<f64>() {
+        if !secs.is_finite() {
+            return Err(MdfException::new_err("timestamp is not a finite number"));
+        }
+        return Ok((secs * 1.0e9).round() as i64);
+    }
+
+    Err(MdfException::new_err(
+        "expected datetime.datetime, ISO 8601 string, or numeric UNIX timestamp",
+    ))
+}
+
+/// If `dt` is timezone-naive, attach UTC; otherwise return it unchanged.
+fn ensure_utc_aware<'py>(
+    py: Python<'py>,
+    dt: &Bound<'py, PyAny>,
+    datetime_mod: &Bound<'py, PyModule>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let tzinfo = dt.getattr("tzinfo")?;
+    if !tzinfo.is_none() {
+        return Ok(dt.clone());
+    }
+    let timezone = datetime_mod.getattr("timezone")?;
+    let utc = timezone.getattr("utc")?;
+    let kwargs = [("tzinfo", utc)].into_py_dict_bound(py);
+    dt.call_method("replace", (), Some(&kwargs))
+}
+
+/// Cut an MDF file by absolute UTC time. Accepts ISO 8601 strings (e.g.
+/// `"2024-01-15T12:34:56Z"`), `datetime.datetime` objects (naive values are
+/// assumed to be UTC), or numeric UNIX timestamps in seconds.
+///
+/// The window is inclusive on both ends. The source file must record a
+/// non-zero `HD.abs_time` (set by the writer / asammdf when creating the
+/// file) — without it the relative offset cannot be computed and an
+/// `MdfException` is raised.
+///
+/// Other behaviour matches [`cut_mdf_by_time`]: VLSD payloads, byte-array
+/// channels, and per-record invalidation bytes are preserved verbatim.
+#[pyfunction]
+#[pyo3(signature = (input_path, output_path, start_utc, end_utc))]
+fn cut_mdf_by_utc(
+    py: Python<'_>,
+    input_path: &str,
+    output_path: &str,
+    start_utc: &Bound<'_, PyAny>,
+    end_utc: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let start_ns = coerce_to_unix_ns(py, start_utc)?;
+    let end_ns = coerce_to_unix_ns(py, end_utc)?;
+    crate::cut::cut_mdf_by_utc_ns(input_path, output_path, start_ns, end_ns)?;
+    Ok(())
+}
+
 // Helper functions
 
 /// Create a float decoded value
@@ -1466,6 +1582,8 @@ pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_data_type_string_utf8, m)?)?;
     m.add_function(wrap_pyfunction!(file_layout_from_file, m)?)?;
     m.add_function(wrap_pyfunction!(merge_files, m)?)?;
+    m.add_function(wrap_pyfunction!(cut_mdf_by_time, m)?)?;
+    m.add_function(wrap_pyfunction!(cut_mdf_by_utc, m)?)?;
 
     Ok(())
 }
