@@ -248,7 +248,7 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist
           manylinux: auto
           sccache: "true"
       - uses: actions/upload-artifact@v4
@@ -265,18 +265,8 @@ jobs:
         include:
           - os: macos-13
             target: x86_64
-            pythons: |
-              3.8
-              3.9
-              3.10
-              3.11
-              3.12
           - os: macos-14
             target: aarch64
-            pythons: |
-              3.10
-              3.11
-              3.12
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -284,11 +274,11 @@ jobs:
           ref: ${{ needs.bump-and-tag.outputs.tag }}
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.pythons }}
+          python-version: "3.12"
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist
           sccache: "true"
       - uses: actions/upload-artifact@v4
         with:
@@ -309,16 +299,11 @@ jobs:
           ref: ${{ needs.bump-and-tag.outputs.tag }}
       - uses: actions/setup-python@v5
         with:
-          python-version: |
-            3.8
-            3.9
-            3.10
-            3.11
-            3.12
+          python-version: "3.12"
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist
           sccache: "true"
       - uses: actions/upload-artifact@v4
         with:
