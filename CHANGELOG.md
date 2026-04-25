@@ -1,3 +1,8 @@
+## v1.1.2 — 2026-04-25
+
+### Fixes
+- drop Intel Mac wheel build to avoid macos-13 runner queue
+
 ## v1.1.1 — 2026-04-25
 
 ### Fixes
