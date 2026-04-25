@@ -30,13 +30,29 @@ jobs:
         name: Determine next version
         shell: python
         run: |
-          import os, re, subprocess
+          import os, pathlib, re, subprocess
+
+          def parse(v):
+              return tuple(int(x) for x in v.lstrip("v").split("."))
 
           tags = subprocess.check_output(
               ["git", "tag", "--list", "v*", "--sort=-v:refname"], text=True
           ).split()
           last_tag = tags[0] if tags else "v0.0.0"
           range_arg = "HEAD" if last_tag == "v0.0.0" else f"{last_tag}..HEAD"
+
+          # The bump base is the maximum of the latest v* tag and the
+          # version currently declared in Cargo.toml. This way, a manually
+          # bumped Cargo.toml version (or a version published to a registry
+          # before the workflow was wired up) is honored, and we never
+          # downgrade.
+          cargo_version = re.search(
+              r'^version\s*=\s*"([^"]+)"',
+              pathlib.Path("Cargo.toml").read_text(),
+              re.M,
+          ).group(1)
+          base_v = max(parse(last_tag), parse(cargo_version))
+          base_label = f"v{'.'.join(str(x) for x in base_v)}"
 
           hashes = subprocess.check_output(
               ["git", "log", range_arg, "--format=%H"], text=True
@@ -68,8 +84,7 @@ jobs:
               elif t in ("fix", "perf") and rank[bump] < rank["patch"]:
                   bump = "patch"
 
-          base = last_tag.lstrip("v")
-          major, minor, patch = (int(x) for x in base.split("."))
+          major, minor, patch = base_v
           if bump == "major":
               major, minor, patch = major + 1, 0, 0
           elif bump == "minor":
@@ -80,13 +95,19 @@ jobs:
           new_version = f"{major}.{minor}.{patch}" if bump != "none" else ""
           release_needed = "true" if bump != "none" else "false"
 
-          print(f"Previous tag: {last_tag}")
+          print(f"Latest tag: {last_tag}")
+          print(f"Cargo.toml version: {cargo_version}")
+          print(f"Bump base: {base_label}")
           print(f"Commits analyzed: {len(hashes)}")
           print(f"Bump: {bump}")
           print(f"New version: {new_version or '(none — skipping release)'}")
 
+          # previous_tag stays as the actual latest git tag so the
+          # changelog step can use it as a `git log <prev>..HEAD` range.
+          # bump_base is the synthetic baseline used for SemVer arithmetic.
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"previous_tag={last_tag}\n")
+              f.write(f"bump_base={base_label}\n")
               f.write(f"new_version={new_version}\n")
               f.write(f"release_needed={release_needed}\n")
               f.write(f"bump={bump}\n")
