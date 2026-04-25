@@ -3,6 +3,50 @@ use crate::parsing::mdf_file::MdfFile;
 use crate::parsing::decoder::{decode_channel_value, DecodedValue};
 use crate::writer::MdfWriter;
 
+/// Cut a segment of an MDF file using **absolute** UNIX-epoch timestamps.
+///
+/// Unlike [`cut_mdf_by_time`], which interprets its bounds as seconds
+/// relative to the master channel's zero, this entry point takes nanosecond
+/// timestamps since the UNIX epoch and converts them to relative seconds
+/// using the source file's `HD` block start time. This is convenient when
+/// the caller already has wall-clock timestamps (e.g. parsed from an ISO
+/// 8601 string or a `datetime` object).
+///
+/// Returns an error if the source file does not record an absolute start
+/// time (its `HD.abs_time` is `0`).
+///
+/// # Arguments
+/// * `input_path` - Path to the source MF4 file
+/// * `output_path` - Destination path for the trimmed file
+/// * `start_ns` - Start of the window in UNIX-epoch nanoseconds (inclusive)
+/// * `end_ns` - End of the window in UNIX-epoch nanoseconds (inclusive)
+pub fn cut_mdf_by_utc_ns(
+    input_path: &str,
+    output_path: &str,
+    start_ns: i64,
+    end_ns: i64,
+) -> Result<(), MdfError> {
+    // Peek at the source file just to read its absolute start time. This
+    // mirrors the parse the main cut routine performs immediately after, but
+    // we keep the two parses separate so the time math is self-contained.
+    let mdf_for_anchor = MdfFile::parse_from_file(input_path)?;
+    let file_start_ns: u64 = mdf_for_anchor.header.abs_time;
+    if file_start_ns == 0 {
+        return Err(MdfError::BlockSerializationError(
+            "source file has no absolute start time (HD.abs_time = 0); \
+             cannot cut by UTC timestamps"
+                .into(),
+        ));
+    }
+    drop(mdf_for_anchor);
+
+    let anchor = file_start_ns as i128;
+    let start_rel_s = (start_ns as i128 - anchor) as f64 / 1.0e9;
+    let end_rel_s = (end_ns as i128 - anchor) as f64 / 1.0e9;
+
+    cut_mdf_by_time(input_path, output_path, start_rel_s, end_rel_s)
+}
+
 /// Cut a segment of an MDF file based on time stamps.
 ///
 /// The input file is scanned for a master time channel (channel type `2` and
