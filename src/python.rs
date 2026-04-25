@@ -1426,6 +1426,19 @@ fn create_data_type_string_utf8() -> PyDataType {
     PyDataType { name: "StringUtf8".to_string(), value: 7 }
 }
 
+/// Merge two MDF files into a new file at `output`.
+///
+/// Channel groups whose layouts (record id length and channel list — names,
+/// data types, bit/byte offsets, bit count, channel type, VLSD flag) match
+/// are concatenated; non-matching groups are appended as separate groups.
+/// Supports normal numeric, fixed `ByteArray`, and VLSD signal channels
+/// (variable-length strings and byte arrays stored in `##SD` blocks).
+#[pyfunction]
+fn merge_files(output: &str, first: &str, second: &str) -> PyResult<()> {
+    crate::merge::merge_files(output, first, second)?;
+    Ok(())
+}
+
 /// The main Python module initialization function
 pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("MdfException", m.py().get_type_bound::<MdfException>())?;
@@ -1452,6 +1465,7 @@ pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_data_type_float_le, m)?)?;
     m.add_function(wrap_pyfunction!(create_data_type_string_utf8, m)?)?;
     m.add_function(wrap_pyfunction!(file_layout_from_file, m)?)?;
+    m.add_function(wrap_pyfunction!(merge_files, m)?)?;
 
     Ok(())
 }
