@@ -1,3 +1,8 @@
+## v1.1.1 — 2026-04-25
+
+### Fixes
+- build a single abi3 wheel per OS/arch for Python 3.8+
+
 ## v1.1.0 — 2026-04-25
 
 ### Features

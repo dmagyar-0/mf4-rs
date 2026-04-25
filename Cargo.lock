@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "mf4-rs"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "byteorder",
  "memmap2",
