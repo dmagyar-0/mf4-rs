@@ -1,3 +1,8 @@
+## v1.4.0 — 2026-04-27
+
+### Features
+- preserve source/text/conversion blocks when cutting MDF files
+
 ## v1.3.1 — 2026-04-27
 
 ### Fixes
