@@ -1,3 +1,8 @@
+## v1.5.0 — 2026-04-27
+
+### Features
+- preserve source HD start time when cutting MDF files
+
 ## v1.4.0 — 2026-04-27
 
 ### Features
