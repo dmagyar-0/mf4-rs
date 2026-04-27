@@ -1,7 +1,137 @@
+use std::collections::HashMap;
+
+use crate::blocks::common::{BlockHeader, BlockParse};
+use crate::blocks::conversion::ConversionBlock;
+use crate::blocks::source_block::SourceBlock;
 use crate::error::MdfError;
-use crate::parsing::mdf_file::MdfFile;
 use crate::parsing::decoder::{decode_channel_value, DecodedValue};
+use crate::parsing::mdf_file::MdfFile;
 use crate::writer::MdfWriter;
+
+/// Recursively copy a referenced block (`##TX`, `##MD`, `##SI`, or `##CC`)
+/// from the source MDF mmap into the writer, rewriting any link fields so
+/// the new block points at freshly written copies of its dependencies.
+///
+/// Returns the file offset of the new block, or `Ok(0)` when `src_addr` is
+/// `0`, the offset is out of range, or the block type is not one of the
+/// handled kinds. Already-cloned source addresses are deduplicated through
+/// `cache`.
+fn clone_block_to_writer(
+    writer: &mut MdfWriter,
+    mmap: &[u8],
+    src_addr: u64,
+    cache: &mut HashMap<u64, u64>,
+) -> Result<u64, MdfError> {
+    if src_addr == 0 {
+        return Ok(0);
+    }
+    if let Some(&dst) = cache.get(&src_addr) {
+        return Ok(dst);
+    }
+    let offset = src_addr as usize;
+    if offset + 24 > mmap.len() {
+        return Ok(0);
+    }
+    let header = BlockHeader::from_bytes(&mmap[offset..offset + 24])?;
+    let total_len = header.block_len as usize;
+    if total_len < 24 || offset + total_len > mmap.len() {
+        return Ok(0);
+    }
+
+    let dst = match header.id.as_str() {
+        "##TX" | "##MD" => {
+            // Leaf blocks with no outgoing links: copy raw bytes verbatim.
+            writer.write_block(&mmap[offset..offset + total_len])?
+        }
+        "##SI" => {
+            let src_block = SourceBlock::from_bytes(&mmap[offset..offset + total_len])?;
+            // Reserve the cache slot before recursing to break cycles.
+            cache.insert(src_addr, 0);
+            let new_name = clone_block_to_writer(writer, mmap, src_block.name_addr, cache)?;
+            let new_path = clone_block_to_writer(writer, mmap, src_block.path_addr, cache)?;
+            let new_comment =
+                clone_block_to_writer(writer, mmap, src_block.comment_addr, cache)?;
+            // SourceBlock has no `to_bytes`, so patch the original block's
+            // bytes in place. The link layout is fixed: name/path/comment at
+            // offsets 24/32/40 (only the slots actually referenced by
+            // `header.links_nr` are touched).
+            let mut bytes = mmap[offset..offset + total_len].to_vec();
+            let link_count = header.links_nr as usize;
+            if link_count >= 1 {
+                bytes[24..32].copy_from_slice(&new_name.to_le_bytes());
+            }
+            if link_count >= 2 {
+                bytes[32..40].copy_from_slice(&new_path.to_le_bytes());
+            }
+            if link_count >= 3 {
+                bytes[40..48].copy_from_slice(&new_comment.to_le_bytes());
+            }
+            writer.write_block(&bytes)?
+        }
+        "##CC" => {
+            let src_block = ConversionBlock::from_bytes(&mmap[offset..offset + total_len])?;
+            cache.insert(src_addr, 0);
+            let new_tx_name = clone_block_to_writer(
+                writer,
+                mmap,
+                src_block.cc_tx_name.unwrap_or(0),
+                cache,
+            )?;
+            let new_md_unit = clone_block_to_writer(
+                writer,
+                mmap,
+                src_block.cc_md_unit.unwrap_or(0),
+                cache,
+            )?;
+            let new_md_comment = clone_block_to_writer(
+                writer,
+                mmap,
+                src_block.cc_md_comment.unwrap_or(0),
+                cache,
+            )?;
+            let new_cc_inverse = clone_block_to_writer(
+                writer,
+                mmap,
+                src_block.cc_cc_inverse.unwrap_or(0),
+                cache,
+            )?;
+            let mut new_refs = Vec::with_capacity(src_block.cc_ref.len());
+            for &r in &src_block.cc_ref {
+                new_refs.push(clone_block_to_writer(writer, mmap, r, cache)?);
+            }
+            let new_cc = ConversionBlock {
+                header: src_block.header.clone(),
+                cc_tx_name: (new_tx_name != 0).then_some(new_tx_name),
+                cc_md_unit: (new_md_unit != 0).then_some(new_md_unit),
+                cc_md_comment: (new_md_comment != 0).then_some(new_md_comment),
+                cc_cc_inverse: (new_cc_inverse != 0).then_some(new_cc_inverse),
+                cc_ref: new_refs,
+                cc_type: src_block.cc_type.clone(),
+                cc_precision: src_block.cc_precision,
+                cc_flags: src_block.cc_flags,
+                cc_ref_count: src_block.cc_ref_count,
+                cc_val_count: src_block.cc_val_count,
+                cc_phy_range_min: src_block.cc_phy_range_min,
+                cc_phy_range_max: src_block.cc_phy_range_max,
+                cc_val: src_block.cc_val.clone(),
+                formula: None,
+                resolved_texts: None,
+                resolved_conversions: None,
+                default_conversion: None,
+            };
+            writer.write_block(&new_cc.to_bytes()?)?
+        }
+        _ => 0,
+    };
+
+    if dst != 0 {
+        cache.insert(src_addr, dst);
+    } else {
+        // Drop the cycle-breaker placeholder if cloning ultimately failed.
+        cache.remove(&src_addr);
+    }
+    Ok(dst)
+}
 
 /// Cut a segment of an MDF file using **absolute** UNIX-epoch timestamps.
 ///
@@ -58,11 +188,11 @@ pub fn cut_mdf_by_utc_ns(
 /// * per-record invalidation bytes,
 /// * VLSD ("signal-based") channels — fresh `##SD` blocks are written in the
 ///   output, one entry per kept record, and the channel's `data` link is
-///   patched to point at them.
-///
-/// Per-channel conversion / source / metadata blocks are not re-emitted; the
-/// output channels are written without conversions attached. The master
-/// channel's conversion is still applied internally when filtering by time.
+///   patched to point at them,
+/// * per-channel `##CC` conversion, `##SI` source, and `##TX`/`##MD`
+///   unit / comment blocks (recursively, including nested conversion
+///   chains and source name/path/comment text), as well as the
+///   channel-group acquisition name, source, and comment blocks.
 ///
 /// # Arguments
 /// * `input_path` - Path to the source MF4 file
@@ -82,6 +212,12 @@ pub fn cut_mdf_by_time(
     let mut writer = MdfWriter::new(output_path)?;
     writer.init_mdf_file()?;
 
+    // Cache mapping source-file block addresses to their freshly written
+    // counterparts in the output. Shared across all channels/groups so a
+    // text/source/conversion block referenced from multiple places is only
+    // emitted once.
+    let mut block_cache: HashMap<u64, u64> = HashMap::new();
+
     for dg in &mdf.data_groups {
         let record_id_len = dg.block.record_id_len;
 
@@ -96,10 +232,39 @@ pub fn cut_mdf_by_time(
             let cg_id = writer.add_channel_group(prev_cg.as_deref(), |_| {})?;
             prev_cg = Some(cg_id.clone());
 
+            // Carry over the channel-group acq_name / acq_source / comment
+            // blocks from the source. Link offsets in the ##CG block:
+            //   40 = acq_name_addr, 48 = acq_source_addr, 64 = comment_addr.
+            let cg_pos = writer
+                .get_block_position(&cg_id)
+                .ok_or_else(|| MdfError::BlockLinkError(format!("cg '{}' not found", cg_id)))?;
+            let new_acq_name =
+                clone_block_to_writer(&mut writer, &mdf.mmap, cg.block.acq_name_addr, &mut block_cache)?;
+            if new_acq_name != 0 {
+                writer.update_link(cg_pos + 40, new_acq_name)?;
+            }
+            let new_acq_source = clone_block_to_writer(
+                &mut writer,
+                &mdf.mmap,
+                cg.block.acq_source_addr,
+                &mut block_cache,
+            )?;
+            if new_acq_source != 0 {
+                writer.update_link(cg_pos + 48, new_acq_source)?;
+            }
+            let new_cg_comment =
+                clone_block_to_writer(&mut writer, &mdf.mmap, cg.block.comment_addr, &mut block_cache)?;
+            if new_cg_comment != 0 {
+                writer.update_link(cg_pos + 64, new_cg_comment)?;
+            }
+
             // Re-create channel blocks in the output. Stale link addresses
             // pointing into the source file are zeroed out so the resulting
-            // channel block is self-contained. The VLSD `data` link is
-            // patched later by `finish_signal_data_block`.
+            // channel block is self-contained. After the channel block is
+            // written, source/conversion/unit/comment blocks are cloned from
+            // the source file and the channel's links are patched to point
+            // at the freshly written copies. The VLSD `data` link is patched
+            // later by `finish_signal_data_block`.
             let mut prev_cn: Option<String> = None;
             // (out_cn_id, source_channel_index, is_vlsd)
             let mut out_channels: Vec<(String, usize, bool)> = Vec::new();
@@ -108,6 +273,13 @@ pub fn cut_mdf_by_time(
                 block.resolve_name(&mdf.mmap)?;
 
                 let is_vlsd = block.channel_type == 1 && block.data != 0;
+
+                // Capture the source-file link addresses before zeroing them
+                // on the block we hand to `add_channel`.
+                let src_source_addr = block.source_addr;
+                let src_conversion_addr = block.conversion_addr;
+                let src_unit_addr = block.unit_addr;
+                let src_comment_addr = block.comment_addr;
 
                 // Drop links to source-file blocks we do not re-emit. Without
                 // this, the new file would carry pointers into garbage.
@@ -122,6 +294,39 @@ pub fn cut_mdf_by_time(
                 let cn_id = writer.add_channel(&cg_id, prev_cn.as_deref(), |c| {
                     *c = block.clone();
                 })?;
+
+                // Clone source/conversion/unit/comment blocks (recursively
+                // following nested links) and patch the channel's links.
+                // Channel block link offsets: source 48, conversion 56,
+                // unit 72, comment 80.
+                let cn_pos = writer.get_block_position(&cn_id).ok_or_else(|| {
+                    MdfError::BlockLinkError(format!("cn '{}' not found", cn_id))
+                })?;
+                let new_source =
+                    clone_block_to_writer(&mut writer, &mdf.mmap, src_source_addr, &mut block_cache)?;
+                if new_source != 0 {
+                    writer.update_link(cn_pos + 48, new_source)?;
+                }
+                let new_conv = clone_block_to_writer(
+                    &mut writer,
+                    &mdf.mmap,
+                    src_conversion_addr,
+                    &mut block_cache,
+                )?;
+                if new_conv != 0 {
+                    writer.update_link(cn_pos + 56, new_conv)?;
+                }
+                let new_unit =
+                    clone_block_to_writer(&mut writer, &mdf.mmap, src_unit_addr, &mut block_cache)?;
+                if new_unit != 0 {
+                    writer.update_link(cn_pos + 72, new_unit)?;
+                }
+                let new_comment =
+                    clone_block_to_writer(&mut writer, &mdf.mmap, src_comment_addr, &mut block_cache)?;
+                if new_comment != 0 {
+                    writer.update_link(cn_pos + 80, new_comment)?;
+                }
+
                 prev_cn = Some(cn_id.clone());
                 out_channels.push((cn_id, idx, is_vlsd));
             }

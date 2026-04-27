@@ -300,22 +300,29 @@ fn cut_does_not_double_apply_conversions() -> Result<(), MdfError> {
         0.5,
     )?;
 
-    // The cut output drops conversion blocks (out of scope per plan), so the
-    // value channel reads as raw u32. The raw values must still equal the
-    // source raw values [3, 4, 5] — i.e. cut must NOT have stored the
-    // physical values [16, 18, 20] in the raw slots.
+    // The cut output preserves the linear conversion block, so the value
+    // channel reads back as the same physical values produced by the source
+    // file: phys = 10 + 2*raw → raws [3, 4, 5] map to [16.0, 18.0, 20.0].
+    // The double-apply regression would manifest as cut having stored the
+    // already-converted values in the raw slots; applying the preserved
+    // conversion on top would then produce [42.0, 46.0, 50.0].
     let mdf = MDF::from_file(output.to_str().unwrap())?;
     let chs = mdf.channel_groups()[0].channels();
     let vals = chs[1].values()?;
     assert_eq!(vals.len(), 3);
-    let raws: Vec<u64> = vals
+    let phys: Vec<f64> = vals
         .iter()
         .map(|v| match v {
-            Some(DecodedValue::UnsignedInteger(u)) => *u,
+            Some(DecodedValue::Float(f)) => *f,
             other => panic!("unexpected cut vals: {:?}", other),
         })
         .collect();
-    assert_eq!(raws, vec![3, 4, 5], "cut stored converted values: {:?}", raws);
+    assert_eq!(
+        phys,
+        vec![16.0, 18.0, 20.0],
+        "cut produced unexpected phys values: {:?}",
+        phys,
+    );
 
     std::fs::remove_file(input)?;
     std::fs::remove_file(output)?;
