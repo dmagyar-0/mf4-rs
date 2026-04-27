@@ -2139,7 +2139,24 @@ fn merge_files(output: &str, first: &str, second: &str) -> PyResult<()> {
 
 /// The main Python module initialization function
 pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("MdfException", m.py().get_type_bound::<MdfException>())?;
+    let mdf_exception = m.py().get_type_bound::<MdfException>();
+    mdf_exception.setattr(
+        "__doc__",
+        "Exception raised by mf4_rs for any error originating from the \
+         underlying Rust library: malformed or unsupported MDF files, \
+         out-of-range indices, missing channels, I/O failures, conversion \
+         dependency cycles, attempts to use a finalized writer, missing \
+         optional dependencies (e.g. pandas), and so on.\n\n\
+         All public methods on PyMDF, PyMdfWriter, PyMdfIndex, and the \
+         module-level free functions raise this (or a subclass of \
+         Exception) on failure. Catch it as a single category to handle \
+         every mf4_rs failure path:\n\n\
+         >>> try:\n\
+         ...     mdf = mf4_rs.PyMDF(\"missing.mf4\")\n\
+         ... except mf4_rs.MdfException as e:\n\
+         ...     print(\"could not open:\", e)",
+    )?;
+    m.add("MdfException", mdf_exception)?;
     
     // Classes
     m.add_class::<PyMDF>()?;
