@@ -22,6 +22,37 @@ impl MdfWriter {
         Ok((id_pos, hd_pos))
     }
 
+    /// Overwrite the start-time fields of the file's `##HD` block.
+    ///
+    /// `init_mdf_file` writes default time metadata, which loses the
+    /// wall-clock anchor when authoring a file derived from another (for
+    /// example, [`crate::cut::cut_mdf_by_time`] copying a window out of a
+    /// source MF4). Call this after `init_mdf_file` to anchor the output
+    /// to a specific timestamp.
+    ///
+    /// HD field offsets touched: 72 (`abs_time` u64), 80 (`tz_offset` i16),
+    /// 82 (`daylight_save_time` i16), 84 (`time_flags` u8),
+    /// 85 (`time_quality` u8).
+    pub fn set_start_time(
+        &mut self,
+        abs_time_ns: u64,
+        tz_offset_min: i16,
+        dst_offset_min: i16,
+        time_flags: u8,
+        time_quality: u8,
+    ) -> Result<(), MdfError> {
+        self.update_block_u64("hd_block", 72, abs_time_ns)?;
+        let tz = tz_offset_min.to_le_bytes();
+        let dst = dst_offset_min.to_le_bytes();
+        self.update_block_u8("hd_block", 80, tz[0])?;
+        self.update_block_u8("hd_block", 81, tz[1])?;
+        self.update_block_u8("hd_block", 82, dst[0])?;
+        self.update_block_u8("hd_block", 83, dst[1])?;
+        self.update_block_u8("hd_block", 84, time_flags)?;
+        self.update_block_u8("hd_block", 85, time_quality)?;
+        Ok(())
+    }
+
     /// Adds a data group block to the file and links it from the header block.
     pub fn add_data_group(&mut self, prev_dg_id: Option<&str>) -> Result<String, MdfError> {
         let dg_count = self.block_positions.keys().filter(|k| k.starts_with("dg_")).count();

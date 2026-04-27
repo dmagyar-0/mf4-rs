@@ -212,6 +212,17 @@ pub fn cut_mdf_by_time(
     let mut writer = MdfWriter::new(output_path)?;
     writer.init_mdf_file()?;
 
+    // Anchor the cut output to the same wall-clock as the source. Without this
+    // the writer's default HD timestamp (a fixed non-epoch value) would be
+    // emitted, breaking absolute-time interpretation of the kept records.
+    writer.set_start_time(
+        mdf.header.abs_time,
+        mdf.header.tz_offset,
+        mdf.header.daylight_save_time,
+        mdf.header.time_flags,
+        mdf.header.time_quality,
+    )?;
+
     // Cache mapping source-file block addresses to their freshly written
     // counterparts in the output. Shared across all channels/groups so a
     // text/source/conversion block referenced from multiple places is only

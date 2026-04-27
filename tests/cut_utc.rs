@@ -164,3 +164,115 @@ fn cut_by_utc_ns_errors_without_abs_time() -> Result<(), MdfError> {
     let _ = std::fs::remove_file(&out);
     Ok(())
 }
+
+/// `cut_mdf_by_time` must copy the source file's `HD.abs_time` (and the
+/// related tz / DST / time-flag metadata) into the cut output, so that
+/// kept records retain their wall-clock anchor.
+#[test]
+fn cut_preserves_source_start_time() -> Result<(), MdfError> {
+    use mf4_rs::blocks::common::BlockParse;
+    use mf4_rs::blocks::header_block::HeaderBlock;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let input = std::env::temp_dir().join("cut_preserves_start_input.mf4");
+    let output = std::env::temp_dir().join("cut_preserves_start_output.mf4");
+    for p in [&input, &output] {
+        if p.exists() {
+            std::fs::remove_file(p)?;
+        }
+    }
+
+    // Build a small file with a master + value channel.
+    let mut writer = MdfWriter::new(input.to_str().unwrap())?;
+    writer.init_mdf_file()?;
+    let cg_id = writer.add_channel_group(None, |_| {})?;
+    let time_id = writer.add_channel(&cg_id, None, |ch| {
+        ch.data_type = DataType::FloatLE;
+        ch.bit_count = 64;
+        ch.name = Some("Time".into());
+    })?;
+    writer.set_time_channel(&time_id)?;
+    writer.add_channel(&cg_id, Some(&time_id), |ch| {
+        ch.data_type = DataType::UnsignedIntegerLE;
+        ch.bit_count = 32;
+        ch.name = Some("Val".into());
+    })?;
+    writer.start_data_block_for_cg(&cg_id, 0)?;
+    for i in 0..5u64 {
+        writer.write_record(
+            &cg_id,
+            &[
+                DecodedValue::Float(i as f64 * 0.1),
+                DecodedValue::UnsignedInteger(i),
+            ],
+        )?;
+    }
+    writer.finish_data_block(&cg_id)?;
+    writer.finalize()?;
+
+    // Stamp distinctive timestamp metadata on the HD block so that defaults
+    // can't mask a regression. abs_time u64 at HD+72; tz/dst i16 at HD+80/82;
+    // time_flags u8 at HD+84; time_quality u8 at HD+85. HD lives at file
+    // offset 64 (right after the identification block).
+    let abs_time_ns: u64 = 1_700_000_000_000_000_000; // 2023-11-14T22:13:20Z
+    let tz_offset_min: i16 = 60; // CET
+    let dst_offset_min: i16 = 60;
+    let time_flags: u8 = 0x02;
+    let time_quality: u8 = 0x10;
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)?;
+        f.seek(SeekFrom::Start(64 + 72))?;
+        f.write_all(&abs_time_ns.to_le_bytes())?;
+        f.write_all(&tz_offset_min.to_le_bytes())?;
+        f.write_all(&dst_offset_min.to_le_bytes())?;
+        f.write_all(&[time_flags, time_quality])?;
+    }
+
+    mf4_rs::cut::cut_mdf_by_time(
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+        0.1,
+        0.3,
+    )?;
+
+    // Sanity: the cut actually retained records (so we know the new HD wasn't
+    // skipped because of a degenerate code path).
+    let cut_mdf = MDF::from_file(output.to_str().unwrap())?;
+    let chs = cut_mdf.channel_groups()[0].channels();
+    let vals: Vec<u64> = chs[1]
+        .values()?
+        .iter()
+        .map(|v| match v {
+            Some(DecodedValue::UnsignedInteger(u)) => *u,
+            other => panic!("unexpected value: {:?}", other),
+        })
+        .collect();
+    assert_eq!(vals, vec![1, 2, 3]);
+    drop(cut_mdf);
+
+    // Re-read the cut output's HD block raw to confirm every preserved field.
+    let mut f = std::fs::File::open(&output)?;
+    let mut buf = [0u8; 104];
+    f.seek(SeekFrom::Start(64))?;
+    f.read_exact(&mut buf)?;
+    let hd = HeaderBlock::from_bytes(&buf)?;
+    assert_eq!(hd.abs_time, abs_time_ns, "abs_time must be carried over");
+    assert_eq!(hd.tz_offset, tz_offset_min, "tz_offset must be carried over");
+    assert_eq!(
+        hd.daylight_save_time, dst_offset_min,
+        "daylight_save_time must be carried over"
+    );
+    assert_eq!(hd.time_flags, time_flags, "time_flags must be carried over");
+    assert_eq!(
+        hd.time_quality, time_quality,
+        "time_quality must be carried over"
+    );
+
+    for p in [&input, &output] {
+        std::fs::remove_file(p)?;
+    }
+    Ok(())
+}
