@@ -1,3 +1,11 @@
+## v1.3.1 — 2026-04-27
+
+### Fixes
+- attach docstring to MdfException so help() works
+
+### Docs
+- expand Python API docstrings for pip-package users
+
 ## v1.3.0 — 2026-04-25
 
 ### Features
