@@ -363,13 +363,40 @@ pub fn cut_mdf_by_time(
                 writer.start_signal_data_block(cn_id)?;
             }
 
-            // Build VLSD source iterators (lockstep with parent records).
-            let mut vlsd_iters: Vec<(String, Box<dyn Iterator<Item = Result<&[u8], MdfError>>>)> =
-                Vec::new();
+            // Build VLSD source iterators (lockstep with parent records). For
+            // each VLSD channel we also record the inline-slot location and
+            // size in the parent record, plus a running offset into the new
+            // ##SD block. The inline slot in MDF4 is the byte offset within
+            // the SD data section where this entry lives — readers (e.g.
+            // asammdf) use it to look up the entry. Since we are writing a
+            // freshly numbered SD block, we must overwrite the source-file
+            // offsets with offsets valid in the output.
+            //
+            // Per spec, the slot starts at `record_id_len + byte_offset` and
+            // is `bit_count / 8` bytes wide. mf4-rs writes VLSD entries
+            // sequentially as `[u32 length][bytes]`, so each entry advances
+            // the running offset by `4 + payload.len()`.
+            struct VlsdState<'a> {
+                cn_id: String,
+                slot_off: usize,
+                slot_size: usize,
+                next_offset: u64,
+                iter: Box<dyn Iterator<Item = Result<&'a [u8], MdfError>> + 'a>,
+            }
+            let mut vlsd_states: Vec<VlsdState> = Vec::new();
             for (cn_id, src_idx, is_vlsd) in &out_channels {
                 if *is_vlsd {
+                    let ch_block = &cg.raw_channels[*src_idx].block;
+                    let slot_size = (ch_block.bit_count / 8) as usize;
+                    let slot_off = record_id_len as usize + ch_block.byte_offset as usize;
                     let it = cg.raw_channels[*src_idx].records(dg, cg, &mdf.mmap)?;
-                    vlsd_iters.push((cn_id.clone(), it));
+                    vlsd_states.push(VlsdState {
+                        cn_id: cn_id.clone(),
+                        slot_off,
+                        slot_size,
+                        next_offset: 0,
+                        iter: it,
+                    });
                 }
             }
 
@@ -391,9 +418,9 @@ pub fn cut_mdf_by_time(
                     // Pull one VLSD entry per VLSD channel in lockstep with
                     // the parent record, regardless of whether we keep the
                     // record. This keeps the iterators aligned.
-                    let mut vlsd_payloads: Vec<Vec<u8>> = Vec::with_capacity(vlsd_iters.len());
-                    for (_, iter) in vlsd_iters.iter_mut() {
-                        match iter.next() {
+                    let mut vlsd_payloads: Vec<Vec<u8>> = Vec::with_capacity(vlsd_states.len());
+                    for state in vlsd_states.iter_mut() {
+                        match state.iter.next() {
                             Some(Ok(slice)) => vlsd_payloads.push(slice.to_vec()),
                             Some(Err(e)) => return Err(e),
                             None => {
@@ -440,11 +467,45 @@ pub fn cut_mdf_by_time(
                     };
 
                     if keep {
-                        writer.write_raw_record(&cg_id, record_chunk)?;
-                        for ((cn_id, _), payload) in
-                            vlsd_iters.iter().zip(vlsd_payloads.iter())
-                        {
-                            writer.write_signal_data(cn_id, payload)?;
+                        // Patch each VLSD inline slot in the parent record so
+                        // the offset points at the entry's location in the
+                        // freshly written ##SD block. Without this fix-up,
+                        // mf4-rs's own reader still works (it walks SD entries
+                        // sequentially) but spec-conformant readers like
+                        // asammdf — which use the inline offset to locate the
+                        // entry — will produce wrong/short results.
+                        let needs_patch = vlsd_states
+                            .iter()
+                            .any(|s| s.slot_size > 0 && s.slot_off + s.slot_size <= record_chunk.len());
+                        if needs_patch {
+                            let mut patched: Vec<u8> = record_chunk.to_vec();
+                            for (state, payload) in vlsd_states.iter().zip(vlsd_payloads.iter()) {
+                                if state.slot_size == 0 {
+                                    continue;
+                                }
+                                let end = state.slot_off + state.slot_size;
+                                if end > patched.len() {
+                                    continue;
+                                }
+                                let off_bytes = state.next_offset.to_le_bytes();
+                                let copy_len = state.slot_size.min(off_bytes.len());
+                                patched[state.slot_off..state.slot_off + copy_len]
+                                    .copy_from_slice(&off_bytes[..copy_len]);
+                                // Zero any trailing bytes when the slot is
+                                // wider than 8 (extremely unusual for VLSD).
+                                for b in &mut patched[state.slot_off + copy_len..end] {
+                                    *b = 0;
+                                }
+                                let _ = payload; // not used here; advance below
+                            }
+                            writer.write_raw_record(&cg_id, &patched)?;
+                        } else {
+                            writer.write_raw_record(&cg_id, record_chunk)?;
+                        }
+                        for (state, payload) in vlsd_states.iter_mut().zip(vlsd_payloads.iter()) {
+                            writer.write_signal_data(&state.cn_id, payload)?;
+                            state.next_offset =
+                                state.next_offset.saturating_add(4 + payload.len() as u64);
                         }
                     }
                 }
