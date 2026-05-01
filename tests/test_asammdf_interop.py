@@ -502,6 +502,73 @@ def test_performance_write():
         cleanup(path)
 
 
+def test_cut_asammdf_vlsd_string():
+    """Cut an asammdf-written file with a VLSD string channel using mf4-rs,
+    then read the cut output back with both libraries.
+
+    Asammdf populates the inline VLSD slot in each parent record with the
+    byte offset of the entry in the linked ##SD block, and uses that offset
+    to locate entries when reading. A naive cut that copies parent records
+    verbatim leaves stale offsets pointing into the source SD layout — mf4-rs
+    can still read it (it walks SD entries sequentially) but asammdf reports
+    a length mismatch. This test exercises the rewrite path.
+    """
+    src = tmp("asammdf_vlsd_src")
+    out = tmp("asammdf_vlsd_cut")
+    try:
+        # Asammdf maps S<n> bytes arrays to channel_type=1 (VLSD), data_type=7
+        # (UTF-8 string). Use a fixed S20 so payload bytes vary in their
+        # null-padded form but the VLSD entry size stays predictable.
+        n = 10
+        t = np.arange(n, dtype=np.float64) * 0.1
+        strings = np.array(
+            [f"event-{i}-payload".encode() for i in range(n)], dtype="S20"
+        )
+        nums = np.arange(n, dtype=np.int32) * 10
+        mdf = AsamMDF(version="4.10")
+        mdf.append(
+            [
+                Signal(samples=strings, timestamps=t, name="Message", encoding="utf-8"),
+                Signal(samples=nums, timestamps=t, name="Counter"),
+            ],
+            common_timebase=True,
+        )
+        mdf.save(src, overwrite=True)
+        mdf.close()
+
+        # Sanity: confirm asammdf actually emitted a VLSD string channel.
+        with AsamMDF(src) as m:
+            ch = next(c for c in m.groups[0].channels if c.name == "Message")
+            assert ch.channel_type == 1, f"expected VLSD channel_type=1, got {ch.channel_type}"
+            assert ch.data_type == 7, f"expected UTF-8 string data_type=7, got {ch.data_type}"
+
+        # Cut a window covering records 2..=6.
+        mf4_rs.cut_mdf_by_time(src, out, 0.2, 0.6)
+
+        # mf4-rs reads numeric channels of the cut output correctly. (The
+        # Python binding's f64 fast path can't return strings — strings round
+        # through native Rust APIs and through asammdf below.)
+        cut_mdf = mf4_rs.PyMDF(out)
+        ctrs = cut_mdf.get_channel_values("Counter")
+        assert ctrs is not None, "Counter not found in cut file"
+        assert [int(c) for c in ctrs] == [20, 30, 40, 50, 60], list(ctrs)
+
+        # asammdf reads the cut output correctly — this is the regression
+        # check. With stale inline offsets it would raise
+        # "samples and timestamps length mismatch".
+        with AsamMDF(out) as m:
+            msg = m.get("Message")
+            ctr = m.get("Counter")
+            assert len(msg.samples) == 5, f"asammdf saw {len(msg.samples)} samples"
+            assert len(msg.timestamps) == 5
+            assert [s.decode().rstrip("\x00") for s in msg.samples.tolist()] == [
+                f"event-{i}-payload" for i in range(2, 7)
+            ]
+            assert ctr.samples.tolist() == [20, 30, 40, 50, 60]
+    finally:
+        cleanup(src, out)
+
+
 def test_performance_read():
     """Performance sanity check for mf4-rs Python read (should complete in < 10s)."""
     import time
@@ -540,6 +607,7 @@ if __name__ == "__main__":
         ("data block splitting cross-read", test_data_block_splitting_cross_read),
         ("value-to-text conversion cross-read", test_value_to_text_conversion_cross_read),
         ("units and comments readable", test_units_and_comments_readable),
+        ("cut preserves asammdf VLSD strings", test_cut_asammdf_vlsd_string),
         ("performance: write", test_performance_write),
         ("performance: read", test_performance_read),
     ]
