@@ -1,3 +1,8 @@
+## v1.5.2 — 2026-05-01
+
+### Fixes
+- emit variable-length DL for multi-fragment VLSD chains
+
 ## v1.5.1 — 2026-05-01
 
 ### Fixes
