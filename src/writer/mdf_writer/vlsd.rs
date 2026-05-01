@@ -119,9 +119,22 @@ impl MdfWriter {
         if sd_positions.len() == 1 {
             self.update_link(cn_pos + cn_data_link_offset, sd_positions[0])?;
         } else {
-            let common_len = *sd_sizes.first().unwrap();
+            // SD fragments have variable sizes (split at entry boundaries to
+            // keep entries from straddling fragments), so we cannot use the
+            // equal-length form. Emit `flags = 0` with a per-fragment virtual
+            // offset list — this is what spec-conformant random-access readers
+            // (e.g. asammdf, Vector) use to resolve the inline VLSD offsets in
+            // parent records back to a fragment + intra-fragment position.
+            let mut virtual_offsets: Vec<u64> = Vec::with_capacity(sd_sizes.len());
+            let mut acc: u64 = 0;
+            for &block_len in &sd_sizes {
+                virtual_offsets.push(acc);
+                // Each fragment contributes (block_len - 24) bytes of data
+                // section to the concatenated stream.
+                acc = acc.saturating_add(block_len.saturating_sub(24));
+            }
             let dl_id = self.next_dl_id();
-            let dl_block = DataListBlock::new_equal(sd_positions, common_len);
+            let dl_block = DataListBlock::new_variable(sd_positions, virtual_offsets);
             let dl_bytes = dl_block.to_bytes()?;
             let _ = self.write_block_with_id(&dl_bytes, &dl_id)?;
             let dl_pos = self.get_block_position(&dl_id).unwrap();

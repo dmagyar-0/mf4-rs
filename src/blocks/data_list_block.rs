@@ -114,6 +114,44 @@ impl DataListBlock {
         }
     }
 
+    /// Create a new `DataListBlock` for variable-length data blocks (flags=0).
+    ///
+    /// The `offsets` vector must provide, for each entry in `data_links`, the
+    /// virtual byte position of that fragment's data section in the concatenated
+    /// logical data section. By convention `offsets[0] == 0` and
+    /// `offsets[i] == offsets[i-1] + (data_section_size_of_fragment_{i-1})`.
+    ///
+    /// Use this form when fragment sizes differ — for example, ##SD chains
+    /// where entries are variable-length and fragment splits land at entry
+    /// boundaries. Lying to a spec-conformant reader with the equal-length
+    /// form (`flags=1`) when fragment sizes actually differ causes random-
+    /// access lookups (as performed by VLSD inline-offset readers) to land in
+    /// the wrong fragment or out of bounds.
+    ///
+    /// # Panics
+    /// Panics in debug builds if `data_links.len() != offsets.len()`.
+    pub fn new_variable(data_links: Vec<u64>, offsets: Vec<u64>) -> Self {
+        debug_assert_eq!(data_links.len(), offsets.len());
+        let links_nr = data_links.len() as u64 + 1; // +1 for 'next'
+        let block_len = 24 + links_nr * 8 + 1 + 3 + 4 + offsets.len() as u64 * 8;
+        let header = BlockHeader {
+            id: "##DL".to_string(),
+            reserved0: 0,
+            block_len,
+            links_nr,
+        };
+        Self {
+            header,
+            next: 0,
+            data_links,
+            flags: 0,
+            reserved1: [0; 3],
+            data_block_nr: links_nr as u32 - 1,
+            data_block_len: None,
+            offsets: Some(offsets),
+        }
+    }
+
     /// Serialize this DLBLOCK to bytes.
     ///
     /// # Returns
