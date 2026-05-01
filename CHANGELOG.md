@@ -1,3 +1,8 @@
+## v1.5.1 — 2026-05-01
+
+### Fixes
+- rewrite VLSD inline offsets when cutting
+
 ## v1.5.0 — 2026-04-27
 
 ### Features
