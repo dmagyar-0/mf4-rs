@@ -93,6 +93,17 @@ pip install .
 uv pip install .
 ```
 
+#### Regenerating Type Stubs
+
+The Python wheel ships `.pyi` type stubs (`python/mf4_rs/_mf4_rs.pyi` and `python/mf4_rs/__init__.pyi`) so IDEs can show parameter names, types, and `///` docstrings on hover. They are generated from the `#[gen_stub_*]` macros in `src/python.rs` by a `stub_gen` binary. **Commit the regenerated stubs whenever you change a Python-facing signature or docstring.**
+
+```bash
+# Regenerate python/mf4_rs/_mf4_rs.pyi
+cargo run --features pyo3 --bin stub_gen
+```
+
+When adding a new `#[pyclass]`, `#[pymethods]`, or `#[pyfunction]`, place a matching `#[gen_stub_pyclass]` / `#[gen_stub_pymethods]` / `#[gen_stub_pyfunction]` (or `#[gen_stub_pyclass_enum]` for complex enums) **immediately above** the pyo3 attribute. `#[gen_stub_pymethods]` cannot be combined with `#[gen_stub_pyclass_enum]` in pyo3-stub-gen 0.7 — leave the `#[pymethods]` impl for a complex enum unannotated (its variants still appear in the stub).
+
 ## Architecture
 
 The codebase is organized into distinct layers. The module structure is defined inline in `src/lib.rs` (not via `mod.rs` files for the top-level `api` and `parsing` modules).

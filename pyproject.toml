@@ -35,3 +35,9 @@ documentation = "https://github.com/dmagyar-0/mf4-rs"
 
 [tool.maturin]
 features = ["pyo3"]
+python-source = "python"
+# Place the compiled native module inside the `mf4_rs` package as
+# `mf4_rs._mf4_rs`. The `python/mf4_rs/__init__.py` re-exports its symbols so
+# `import mf4_rs` continues to work. Splitting the package and the cdylib
+# this way is what lets us ship `__init__.pyi` and `py.typed` for IDE hover.
+module-name = "mf4_rs._mf4_rs"

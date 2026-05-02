@@ -81,6 +81,6 @@ use pyo3::prelude::*;
 /// All errors raised by this module are subclasses of :class:`MdfException`.
 #[cfg(feature = "pyo3")]
 #[pymodule]
-fn mf4_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _mf4_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     python::init_mf4_rs_module(m)
 }
