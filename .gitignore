@@ -14,6 +14,10 @@ target/
 **/mutants.out*/
 
 # Python
+# Compiled extension modules dropped in by `maturin develop`
+python/mf4_rs/*.so
+python/mf4_rs/*.pyd
+python/mf4_rs/*.dylib
 # Virtual environments
 .venv/
 venv/

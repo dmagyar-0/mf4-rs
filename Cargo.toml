@@ -11,6 +11,11 @@ readme = "README.md"
 name = "mf4_rs"
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "stub_gen"
+path = "src/bin/stub_gen.rs"
+required-features = ["pyo3"]
+
 [dependencies]
 nom = "8"  # Used for parsing binary MDF data
 byteorder = "1.5"  # Helps with reading binary data
@@ -23,7 +28,8 @@ serde_json = "1.0"
 # Python bindings
 pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"], optional = true }
 numpy = { version = "0.21", optional = true }
+pyo3-stub-gen = { version = "0.7", optional = true }
 
 [features]
 default = []
-pyo3 = ["dep:pyo3", "dep:numpy"]
+pyo3 = ["dep:pyo3", "dep:numpy", "dep:pyo3-stub-gen"]

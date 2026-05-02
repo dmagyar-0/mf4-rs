@@ -9,6 +9,10 @@ use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 use pyo3::{create_exception, wrap_pyfunction};
 use numpy::{PyArray1, PyReadonlyArray1};
+use pyo3_stub_gen::derive::{
+    gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pyfunction, gen_stub_pymethods,
+};
+use pyo3_stub_gen::define_stub_info_gatherer;
 use std::collections::HashMap;
 
 use crate::api::mdf::MDF;
@@ -41,6 +45,7 @@ impl From<MdfError> for PyErr {
 ///     Symbolic name, e.g. ``"FloatLE"``, ``"UnsignedIntegerLE"``.
 /// value : int
 ///     The MDF spec numeric code (0-16, or 255 for unknown).
+#[gen_stub_pyclass]
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct PyDataType {
@@ -50,6 +55,7 @@ pub struct PyDataType {
     pub value: u8,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyDataType {
     fn __str__(&self) -> String {
@@ -131,6 +137,7 @@ impl From<PyDataType> for DataType {
 /// - ``String(value: str)``
 /// - ``ByteArray(value: bytes)``
 /// - ``Unknown()`` — undecodable / not yet supported
+#[gen_stub_pyclass_enum]
 #[pyclass]
 #[derive(Debug, Clone)]
 pub enum PyDecodedValue {
@@ -142,6 +149,11 @@ pub enum PyDecodedValue {
     Unknown { },
 }
 
+// NOTE: `gen_stub_pymethods` is intentionally not applied here. Combining
+// it with `gen_stub_pyclass_enum` on a complex enum trips an internal
+// assertion in pyo3-stub-gen 0.7. The runtime methods (`__str__`,
+// `__repr__`, `value` getter) still work — they're just not described in
+// the generated stub. Enum variants and the class itself are.
 #[pymethods]
 impl PyDecodedValue {
     fn __str__(&self) -> String {
@@ -241,12 +253,13 @@ fn decoded_value_to_pyobject(dv: DecodedValue, py: Python) -> PyObject {
 ///     The MDF data type of the raw samples.
 /// bit_count : int
 ///     Width of the raw value in bits (e.g. 32 for f32, 64 for f64/u64).
+#[gen_stub_pyclass]
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct PyChannelInfo {
     #[pyo3(get)]
     pub name: Option<String>,
-    #[pyo3(get)] 
+    #[pyo3(get)]
     pub unit: Option<String>,
     #[pyo3(get)]
     pub comment: Option<String>,
@@ -256,6 +269,7 @@ pub struct PyChannelInfo {
     pub bit_count: u32,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyChannelInfo {
     fn __str__(&self) -> String {
@@ -282,6 +296,7 @@ impl PyChannelInfo {
 ///     Number of channels in this group.
 /// record_count : int
 ///     Number of records (cycles) recorded for this group.
+#[gen_stub_pyclass]
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct PyChannelGroupInfo {
@@ -295,6 +310,7 @@ pub struct PyChannelGroupInfo {
     pub record_count: u64,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyChannelGroupInfo {
     fn __str__(&self) -> String {
@@ -436,11 +452,13 @@ fn create_datetime_index(
 /// >>> for group in mdf.channel_groups():
 /// ...     print(group.name, group.record_count)
 /// >>> values = mdf.get_channel_values("Temperature")  # numpy.ndarray
+#[gen_stub_pyclass]
 #[pyclass]
 pub struct PyMDF {
     mdf: Box<MDF>,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyMDF {
     /// Open and parse an MDF 4 file from disk.
@@ -778,6 +796,7 @@ impl PyMDF {
 /// ...     ])
 /// >>> w.finish_data_block(cg)
 /// >>> w.finalize()
+#[gen_stub_pyclass]
 #[pyclass(unsendable)]
 pub struct PyMdfWriter {
     writer: Option<MdfWriter>,
@@ -813,6 +832,7 @@ impl PyMdfWriter {
     }
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyMdfWriter {
     /// Create a writer that will produce a new MDF file at ``path``.
@@ -1201,11 +1221,13 @@ impl PyMdfWriter {
 /// >>> # Later, possibly on another machine that has the same file:
 /// >>> idx2 = mf4_rs.PyMdfIndex.load_from_file("recording.idx.json")
 /// >>> values = idx2.read_channel_values_by_name_as_f64("Speed", "recording.mf4")
+#[gen_stub_pyclass]
 #[pyclass]
 pub struct PyMdfIndex {
     index: MdfIndex,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyMdfIndex {
     /// Build a fresh index by parsing an MDF file from disk.
@@ -1704,6 +1726,7 @@ impl PyMdfIndex {
 ///     Absolute file offset of the target block (0 means null link).
 /// target_type : Optional[str]
 ///     Block type at the target offset, when known (e.g. ``"##DG"``).
+#[gen_stub_pyclass]
 #[pyclass]
 #[derive(Clone)]
 pub struct PyLinkInfo {
@@ -1715,6 +1738,7 @@ pub struct PyLinkInfo {
     pub target_type: Option<String>,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyLinkInfo {
     fn __repr__(&self) -> String {
@@ -1755,6 +1779,7 @@ impl From<LinkInfo> for PyLinkInfo {
 ///     Outbound links to other blocks.
 /// extra : Optional[str]
 ///     Block-type-specific extra information, when applicable.
+#[gen_stub_pyclass]
 #[pyclass]
 #[derive(Clone)]
 pub struct PyBlockInfo {
@@ -1774,6 +1799,7 @@ pub struct PyBlockInfo {
     pub extra: Option<String>,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyBlockInfo {
     fn __repr__(&self) -> String {
@@ -1806,6 +1832,7 @@ impl From<BlockInfo> for PyBlockInfo {
 /// Attributes
 /// ----------
 /// start, end, size : int
+#[gen_stub_pyclass]
 #[pyclass]
 #[derive(Clone)]
 pub struct PyGapInfo {
@@ -1817,6 +1844,7 @@ pub struct PyGapInfo {
     pub size: u64,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyGapInfo {
     fn __repr__(&self) -> String {
@@ -1842,11 +1870,13 @@ impl From<GapInfo> for PyGapInfo {
 /// Build one with :py:meth:`from_file` or :py:meth:`PyMDF.file_layout`. Use
 /// it to debug file structure, audit storage efficiency, or render a
 /// human-readable map of an MDF.
+#[gen_stub_pyclass]
 #[pyclass]
 pub struct PyFileLayout {
     pub(crate) inner: FileLayout,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyFileLayout {
     /// Build a layout by parsing an MDF file from disk.
@@ -1935,6 +1965,7 @@ impl PyFileLayout {
 /// Returns
 /// -------
 /// PyFileLayout
+#[gen_stub_pyfunction]
 #[pyfunction]
 fn file_layout_from_file(path: &str) -> PyResult<PyFileLayout> {
     PyFileLayout::from_file(path)
@@ -1959,6 +1990,7 @@ fn file_layout_from_file(path: &str) -> PyResult<PyFileLayout> {
 ///     Start of the window in seconds (inclusive).
 /// end_time : float
 ///     End of the window in seconds (inclusive).
+#[gen_stub_pyfunction]
 #[pyfunction]
 #[pyo3(signature = (input_path, output_path, start_time, end_time))]
 fn cut_mdf_by_time(
@@ -2041,6 +2073,7 @@ fn ensure_utc_aware<'py>(
 ///
 /// Other behaviour matches [`cut_mdf_by_time`]: VLSD payloads, byte-array
 /// channels, and per-record invalidation bytes are preserved verbatim.
+#[gen_stub_pyfunction]
 #[pyfunction]
 #[pyo3(signature = (input_path, output_path, start_utc, end_utc))]
 fn cut_mdf_by_utc(
@@ -2063,6 +2096,7 @@ fn cut_mdf_by_utc(
 /// Use this to feed values into :py:meth:`PyMdfWriter.write_record` for any
 /// floating-point channel (32- or 64-bit; the value is truncated to the
 /// channel's declared bit width on encode).
+#[gen_stub_pyfunction]
 #[pyfunction]
 fn create_float_value(value: f64) -> PyDecodedValue {
     PyDecodedValue::Float { value }
@@ -2072,12 +2106,14 @@ fn create_float_value(value: f64) -> PyDecodedValue {
 ///
 /// Suitable for any unsigned integer channel; the value is truncated to the
 /// channel's bit width on encode.
+#[gen_stub_pyfunction]
 #[pyfunction]
 fn create_uint_value(value: u64) -> PyDecodedValue {
     PyDecodedValue::UnsignedInteger { value }
 }
 
 /// Wrap a Python ``int`` in a ``SignedInteger`` :class:`PyDecodedValue`.
+#[gen_stub_pyfunction]
 #[pyfunction]
 fn create_int_value(value: i64) -> PyDecodedValue {
     PyDecodedValue::SignedInteger { value }
@@ -2087,6 +2123,7 @@ fn create_int_value(value: i64) -> PyDecodedValue {
 ///
 /// For string channels (``StringUtf8`` etc.). Encoding into the file is
 /// done according to the channel's declared string data type.
+#[gen_stub_pyfunction]
 #[pyfunction]
 fn create_string_value(value: String) -> PyDecodedValue {
     PyDecodedValue::String { value }
@@ -2097,6 +2134,7 @@ fn create_string_value(value: String) -> PyDecodedValue {
 /// Pair with :py:meth:`PyMdfWriter.add_channel` when you need an unsigned
 /// integer channel of non-default width (otherwise see
 /// :py:meth:`PyMdfWriter.add_int_channel`).
+#[gen_stub_pyfunction]
 #[pyfunction]
 fn create_data_type_uint_le() -> PyDataType {
     PyDataType { name: "UnsignedIntegerLE".to_string(), value: 0 }
@@ -2106,12 +2144,14 @@ fn create_data_type_uint_le() -> PyDataType {
 ///
 /// Pair with :py:meth:`PyMdfWriter.add_channel`. Defaults to 32 bits when
 /// passed to ``add_channel`` — for f64 use :py:meth:`PyMdfWriter.add_float_channel`.
+#[gen_stub_pyfunction]
 #[pyfunction]
 fn create_data_type_float_le() -> PyDataType {
     PyDataType { name: "FloatLE".to_string(), value: 4 }
 }
 
 /// Return the :class:`PyDataType` for UTF-8 encoded string channels.
+#[gen_stub_pyfunction]
 #[pyfunction]
 fn create_data_type_string_utf8() -> PyDataType {
     PyDataType { name: "StringUtf8".to_string(), value: 7 }
@@ -2131,6 +2171,7 @@ fn create_data_type_string_utf8() -> PyDataType {
 ///     Destination path for the merged file.
 /// first, second : str
 ///     Source file paths. Must be uncompressed MDF 4.10+ files.
+#[gen_stub_pyfunction]
 #[pyfunction]
 fn merge_files(output: &str, first: &str, second: &str) -> PyResult<()> {
     crate::merge::merge_files(output, first, second)?;
@@ -2186,3 +2227,9 @@ pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     Ok(())
 }
+
+// Generates `pub fn stub_info() -> pyo3_stub_gen::Result<StubInfo>`, used by
+// `src/bin/stub_gen.rs` to walk the gathered `#[gen_stub_*]` declarations and
+// emit the .pyi file. No runtime cost — the gathering only runs when the
+// stub-gen binary is invoked.
+define_stub_info_gatherer!(stub_info);
