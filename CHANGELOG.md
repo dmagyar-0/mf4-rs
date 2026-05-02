@@ -1,3 +1,8 @@
+## v1.6.0 — 2026-05-02
+
+### Features
+- ship .pyi type stubs for IDE hover docs in Python wheel
+
 ## v1.5.2 — 2026-05-01
 
 ### Fixes
