@@ -40,4 +40,4 @@ tempfile = "3"
 [features]
 default = []
 http = ["dep:ureq"]
-pyo3 = ["dep:pyo3", "dep:numpy", "dep:pyo3-stub-gen"]
+pyo3 = ["dep:pyo3", "dep:numpy", "dep:pyo3-stub-gen", "http"]

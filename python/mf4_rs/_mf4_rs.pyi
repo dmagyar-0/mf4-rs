@@ -442,6 +442,39 @@ class PyMdfIndex:
         """
         ...
 
+    @staticmethod
+    def from_url(url:builtins.str, chunk_size:typing.Optional[builtins.int]) -> PyMdfIndex:
+        r"""
+        Build an index from an MDF file served over HTTP / S3 using range
+        requests, without downloading the whole file.
+        
+        Issues range reads only for metadata blocks (``##ID``, ``##HD``,
+        ``##DG``, ``##CG``, ``##CN``, name / unit / comment ``##TX``,
+        conversion ``##CC`` plus its ``cc_ref`` chain, and ``##DT``/``##DV``/
+        ``##DZ``/``##DL`` headers). Sample data is never fetched. With the
+        default 1 MiB read-ahead chunk, a typical file collapses to a handful
+        of underlying HTTP requests regardless of file size.
+        
+        Parameters
+        ----------
+        url : str
+            ``http://`` or ``https://`` URL of the ``.mf4`` resource. The
+            server must honour single-range ``Range: bytes=A-B`` requests.
+        chunk_size : int, optional
+            Read-ahead chunk size in bytes for the metadata phase
+            (default 1 MiB). Smaller values reduce wasted bytes when
+            metadata is densely packed near the file head; larger values
+            reduce the number of HTTP round-trips when metadata is
+            scattered across the file.
+        
+        Raises
+        ------
+        MdfException
+            If the URL cannot be reached, the server does not honour
+            range requests, or the response is not a valid MDF file.
+        """
+        ...
+
     def save_to_file(self, path:builtins.str) -> None:
         r"""
         Serialize the index to JSON at ``path``.
@@ -516,6 +549,37 @@ class PyMdfIndex:
         See :py:meth:`read_channel_values` for the return / error contract.
         If multiple groups contain the same channel name, prefer
         :py:meth:`read_channel_values_by_group_and_name`.
+        """
+        ...
+
+    def read_channel_values_from_url(self, group_index:builtins.int, channel_index:builtins.int, url:builtins.str) -> builtins.list[typing.Optional[typing.Any]]:
+        r"""
+        Read every sample of a channel via HTTP range requests.
+        
+        Issues one HTTP request per data block holding this channel. Cache
+        is bypassed because data-block payloads are typically far larger
+        than any sensible chunk size; one ranged ``GET`` per block is the
+        cheapest pattern.
+        
+        Parameters
+        ----------
+        group_index : int
+        channel_index : int
+        url : str
+            URL of the same MDF file the index was built from.
+        
+        Returns
+        -------
+        list[Optional[Union[float, int, str, bytes]]]
+            One entry per record. ``None`` indicates an invalid sample.
+        """
+        ...
+
+    def read_channel_values_by_name_from_url(self, channel_name:builtins.str, url:builtins.str) -> builtins.list[typing.Optional[typing.Any]]:
+        r"""
+        Read every sample of a channel by name via HTTP range requests.
+        
+        See :py:meth:`read_channel_values_from_url` for the I/O contract.
         """
         ...
 
@@ -781,15 +845,24 @@ class PyMdfWriter:
         Parameters
         ----------
         name : Optional[str]
-            Group name. **Currently ignored** — the underlying writer does
-            not yet emit ``acq_name`` / metadata for groups. Pass any value
-            (or ``None``) for forward compatibility.
+            Group acquisition name. Written as a ``##TX`` block referenced
+            from the new ``##CG`` via ``acq_name_addr``. Pass ``None`` to
+            leave it unset.
         
         Returns
         -------
         str
             Opaque group ID (e.g. ``"cg_0"``) — pass to subsequent
             ``add_channel`` / ``write_record`` / ``finish_data_block`` calls.
+        """
+        ...
+
+    def set_channel_group_comment(self, group_id:builtins.str, comment:builtins.str) -> None:
+        r"""
+        Attach a comment / description to a channel group.
+        
+        Writes a ``##TX`` block holding ``comment`` and links it from the
+        group's ``comment_addr`` field.
         """
         ...
 

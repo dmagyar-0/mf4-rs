@@ -509,9 +509,20 @@ impl ByteRangeReader for HttpRangeReader {
             .map_err(|e| MdfError::BlockSerializationError(format!("HTTP GET error: {e}")))?;
         self.request_count += 1;
 
-        let mut buf = Vec::with_capacity(length as usize);
+        // Trust the server's Content-Length over our requested length: when
+        // the requested range extends past EOF the server caps the response,
+        // and in that case `take(length)` would block waiting for bytes the
+        // server is never going to send if keep-alive semantics confuse the
+        // underlying reader.
+        let content_length = resp
+            .header("Content-Length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(length);
+        let to_read = content_length.min(length);
+
+        let mut buf = Vec::with_capacity(to_read as usize);
         resp.into_reader()
-            .take(length)
+            .take(to_read)
             .read_to_end(&mut buf)
             .map_err(MdfError::IOError)?;
         Ok(buf)
