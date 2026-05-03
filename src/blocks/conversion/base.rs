@@ -285,6 +285,114 @@ impl ConversionBlock {
         Ok(())
     }
     
+    /// Resolve all dependencies via a [`crate::index::ByteRangeReader`].
+    ///
+    /// Mirrors [`Self::resolve_all_dependencies`] but fetches referenced text
+    /// and conversion blocks through a range reader instead of a memory-mapped
+    /// slice. Used when constructing an [`crate::index::MdfIndex`] from a
+    /// remote source over HTTP range requests.
+    pub fn resolve_all_dependencies_via_reader<R>(
+        &mut self,
+        reader: &mut R,
+        current_address: u64,
+    ) -> Result<(), MdfError>
+    where
+        R: crate::index::ByteRangeReader<Error = MdfError>,
+    {
+        use std::collections::HashSet;
+
+        let mut visited = HashSet::new();
+        self.resolve_recursive_via_reader(reader, 0, &mut visited, current_address)
+    }
+
+    fn resolve_recursive_via_reader<R>(
+        &mut self,
+        reader: &mut R,
+        depth: usize,
+        visited: &mut std::collections::HashSet<u64>,
+        current_address: u64,
+    ) -> Result<(), MdfError>
+    where
+        R: crate::index::ByteRangeReader<Error = MdfError>,
+    {
+        use crate::blocks::common::{read_string_block_via_reader, BlockHeader};
+        use std::collections::HashMap;
+
+        const MAX_DEPTH: usize = 20;
+
+        if depth > MAX_DEPTH {
+            return Err(MdfError::ConversionChainTooDeep { max_depth: MAX_DEPTH });
+        }
+
+        visited.insert(current_address);
+
+        // Algebraic formula resolution
+        self.resolve_formula_via_reader(reader)?;
+
+        let mut resolved_texts = HashMap::new();
+        let mut resolved_conversions = HashMap::new();
+        let mut default_conversion = None;
+
+        let has_default_conversion = matches!(
+            self.cc_type,
+            crate::blocks::conversion::types::ConversionType::RangeToText
+        );
+
+        let default_ref_index = if has_default_conversion && self.cc_ref.len() > 2 {
+            Some(self.cc_ref.len() - 1)
+        } else {
+            None
+        };
+
+        let cc_ref_snapshot: Vec<u64> = self.cc_ref.clone();
+        for (i, &link_addr) in cc_ref_snapshot.iter().enumerate() {
+            if link_addr == 0 {
+                continue;
+            }
+
+            if visited.contains(&link_addr) {
+                return Err(MdfError::ConversionChainCycle { address: link_addr });
+            }
+
+            let header_bytes = reader.read_range(link_addr, 24)?;
+            let header = BlockHeader::from_bytes(&header_bytes)?;
+
+            match header.id.as_str() {
+                "##TX" => {
+                    if let Some(text) = read_string_block_via_reader(reader, link_addr)? {
+                        resolved_texts.insert(i, text);
+                    }
+                }
+                "##CC" => {
+                    let block_bytes = reader.read_range(link_addr, header.block_len)?;
+                    let mut nested = ConversionBlock::from_bytes(&block_bytes)?;
+                    nested.resolve_recursive_via_reader(reader, depth + 1, visited, link_addr)?;
+
+                    if Some(i) == default_ref_index {
+                        default_conversion = Some(Box::new(nested));
+                    } else {
+                        resolved_conversions.insert(i, Box::new(nested));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !resolved_texts.is_empty() {
+            self.resolved_texts = Some(resolved_texts);
+        }
+        if !resolved_conversions.is_empty() {
+            self.resolved_conversions = Some(resolved_conversions);
+        }
+        if default_conversion.is_some() {
+            self.default_conversion = default_conversion;
+        }
+
+        visited.remove(&current_address);
+
+        Ok(())
+    }
+
     /// Get a resolved text string for a given cc_ref index.
     /// Returns the text if it was resolved during dependency resolution.
     pub fn get_resolved_text(&self, ref_index: usize) -> Option<&String> {
