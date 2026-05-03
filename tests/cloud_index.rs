@@ -32,12 +32,13 @@ fn build_fixture(path: &Path) -> Result<(), MdfError> {
     let mut writer = MdfWriter::new(path.to_str().unwrap())?;
     writer.init_mdf_file()?;
 
-    let mut prev_cg: Option<String> = None;
     let mut cg_ids: Vec<String> = Vec::new();
     let mut cn_ids_per_group: Vec<Vec<String>> = Vec::new();
 
     for g in 0..GROUPS {
-        let cg_id = writer.add_channel_group(prev_cg.as_deref(), |_| {})?;
+        // Each add_channel_group creates a new ##DG, so prev_cg_id stays None
+        // (it would chain CGs *within* a DG, which is not what we want).
+        let cg_id = writer.add_channel_group(None, |_| {})?;
         writer.set_channel_group_name(&cg_id, &format!("Group {g}"))?;
         writer.set_channel_group_comment(&cg_id, &format!("Comment for group {g}"))?;
 
@@ -73,9 +74,8 @@ fn build_fixture(path: &Path) -> Result<(), MdfError> {
             writer.add_value_to_text_conversion(&[(0, "OK"), (1, "WARN")], "UNK", Some(&target))?;
         }
 
-        cg_ids.push(cg_id.clone());
+        cg_ids.push(cg_id);
         cn_ids_per_group.push(cn_ids);
-        prev_cg = Some(cg_id);
         let _ = group_name;
     }
 
@@ -311,6 +311,189 @@ fn cloud_index_round_trips_within_budget() -> Result<(), MdfError> {
     assert!(
         total_requests <= 10,
         "underlying HTTP requests = {total_requests} (>10)"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cloud_index_handles_scattered_metadata() -> Result<(), MdfError> {
+    // Scenario: each channel group's data is written *before* the next group is
+    // created, so each CG's metadata cluster (DG + CG + CN + TX blocks) sits
+    // past the previous CG's data block on disk. With a 1 MiB read-ahead
+    // cache, the first chunk no longer covers all metadata: the walk must
+    // pull additional chunks as it follows the next_dg_addr chain.
+    //
+    // Demonstrates that:
+    //   - the index still builds correctly when metadata is scattered,
+    //   - the cache still collapses many small reads into a handful of
+    //     underlying requests,
+    //   - both the metric and wall-time stay within a documented budget.
+    const SCATTER_GROUPS: usize = 5;
+    const SCATTER_CHANNELS_PER_GROUP: usize = 5; // 1 master + 4 data, all f64
+    const SCATTER_RECORDS: usize = 30_000;       // 30k * 40 B = 1.2 MiB per DT
+
+    let tmp = tempfile::tempdir().map_err(MdfError::IOError)?;
+    let mf4 = tmp.path().join("scattered.mf4");
+
+    // Build the fixture: for each group, fully configure it AND write its
+    // data block before moving on to the next group. This forces the
+    // writer to interleave large DT blocks with small metadata clusters.
+    {
+        let mut writer = MdfWriter::new(mf4.to_str().unwrap())?;
+        writer.init_mdf_file()?;
+
+        for g in 0..SCATTER_GROUPS {
+            // Each add_channel_group creates a new ##DG, so prev_cg_id stays None.
+            let cg_id = writer.add_channel_group(None, |_| {})?;
+            writer.set_channel_group_name(&cg_id, &format!("Group {g}"))?;
+            writer.set_channel_group_comment(&cg_id, &format!("Comment for group {g}"))?;
+
+            let time_id = writer.add_channel(&cg_id, None, |ch| {
+                ch.data_type = DataType::FloatLE;
+                ch.name = Some(format!("t_{g}"));
+                ch.bit_count = 64;
+            })?;
+            writer.set_time_channel(&time_id)?;
+
+            let mut prev_cn = time_id;
+            for j in 1..SCATTER_CHANNELS_PER_GROUP {
+                let cn = writer.add_channel(&cg_id, Some(&prev_cn), |ch| {
+                    ch.data_type = DataType::FloatLE;
+                    ch.bit_count = 64;
+                    ch.name = Some(format!("ch_{g}_{j}"));
+                })?;
+                prev_cn = cn;
+            }
+
+            // Write data BEFORE creating the next CG.
+            writer.start_data_block_for_cg(&cg_id, 0)?;
+            for r in 0..SCATTER_RECORDS {
+                let mut record: Vec<DecodedValue> =
+                    Vec::with_capacity(SCATTER_CHANNELS_PER_GROUP);
+                record.push(DecodedValue::Float(r as f64 * 0.001));
+                for j in 1..SCATTER_CHANNELS_PER_GROUP {
+                    record.push(DecodedValue::Float((g * 1_000_000 + r * j) as f64));
+                }
+                writer.write_record(&cg_id, &record)?;
+            }
+            writer.finish_data_block(&cg_id)?;
+        }
+        writer.finalize()?;
+    }
+
+    let file_size = std::fs::metadata(&mf4).map_err(MdfError::IOError)?.len();
+    // Sanity: file should be > 5 MiB so CGs land in distinct 1 MiB chunks.
+    assert!(
+        file_size >= 5 * 1024 * 1024,
+        "fixture too small to scatter metadata: {file_size} bytes"
+    );
+
+    let (url, _server) = spawn_range_server(mf4.clone())?;
+    thread::sleep(Duration::from_millis(50));
+
+    let started = Instant::now();
+    let http = HttpRangeReader::new(&url)?;
+    let mut cached = CachingRangeReader::with_chunk_size(http, 1 << 20);
+
+    let index = MdfIndex::from_range_reader(&mut cached, file_size)?;
+
+    // Correctness: all groups, names, comments, channel names recovered.
+    assert_eq!(index.channel_groups.len(), SCATTER_GROUPS);
+    for (i, g) in index.channel_groups.iter().enumerate() {
+        assert_eq!(g.channels.len(), SCATTER_CHANNELS_PER_GROUP);
+        assert_eq!(g.name.as_deref(), Some(format!("Group {i}").as_str()));
+        assert_eq!(
+            g.comment.as_deref(),
+            Some(format!("Comment for group {i}").as_str())
+        );
+        assert_eq!(g.record_count, SCATTER_RECORDS as u64);
+        assert_eq!(g.channels[0].name.as_deref(), Some(format!("t_{i}").as_str()));
+        for (j, ch) in g.channels.iter().enumerate().skip(1) {
+            assert_eq!(
+                ch.name.as_deref(),
+                Some(format!("ch_{i}_{j}").as_str()),
+                "group {i} channel {j} name"
+            );
+        }
+    }
+
+    let metadata_requests = cached.underlying_requests();
+
+    // The interesting assertion: scattered metadata REQUIRES > 1 underlying
+    // request (the first 1 MiB chunk cannot cover all groups), but the
+    // cache should still keep total fetches in single digits.
+    assert!(
+        metadata_requests >= 2,
+        "expected scattered metadata to require >=2 chunks, got {metadata_requests}"
+    );
+    assert!(
+        metadata_requests <= SCATTER_GROUPS as u64 + 2,
+        "metadata cache too inefficient: {metadata_requests} requests for {SCATTER_GROUPS} groups"
+    );
+
+    // Read 5 channels via bypass mode.
+    cached.set_bypass(true);
+    let targets: &[(&str, &str)] = &[
+        ("Group 0", "t_0"),
+        ("Group 1", "ch_1_2"),
+        ("Group 2", "ch_2_4"),
+        ("Group 3", "ch_3_1"),
+        ("Group 4", "ch_4_3"),
+    ];
+    for (gn, cn) in targets {
+        let g = index.find_channel_group_by_name(gn).unwrap();
+        let c = index.find_channel_by_name(g, cn).unwrap();
+        let vals = index.read_channel_values(g, c, &mut cached)?;
+        assert_eq!(vals.len(), SCATTER_RECORDS, "{gn}/{cn}");
+        // Spot-check decoded value matches what was written.
+        let group_idx: usize = gn
+            .strip_prefix("Group ")
+            .and_then(|s| s.parse().ok())
+            .unwrap();
+        if let Some(DecodedValue::Float(actual)) = vals[10].as_ref() {
+            // master = r * 0.001; data = (group * 1_000_000 + r * j) as f64
+            if cn.starts_with("t_") {
+                assert!((actual - 10.0 * 0.001).abs() < 1e-9);
+            } else {
+                let j: usize = cn
+                    .rsplit('_')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap();
+                let expected = (group_idx * 1_000_000 + 10 * j) as f64;
+                assert!(
+                    (actual - expected).abs() < 1e-3,
+                    "{gn}/{cn}[10]: got {actual}, want {expected}"
+                );
+            }
+        } else {
+            panic!("{gn}/{cn} missing decoded value at index 10");
+        }
+    }
+
+    let elapsed = started.elapsed();
+    let total_requests = cached.underlying_requests();
+    let value_requests = total_requests - metadata_requests;
+
+    eprintln!(
+        "[scattered] file_size={file_size} metadata_requests={metadata_requests} \
+         value_requests={value_requests} total={total_requests} \
+         elapsed={:?} cache_hits={}",
+        elapsed,
+        cached.cache_hits()
+    );
+
+    // Loose budget: each scattered group might pull its own chunk, plus
+    // 5 value reads. Assert single-digit-per-group worst case.
+    assert!(
+        total_requests <= (SCATTER_GROUPS as u64 + 2) + targets.len() as u64,
+        "total HTTP requests {total_requests} exceeds budget"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "scattered scenario took {:?} — over 5s budget",
+        elapsed
     );
 
     Ok(())
