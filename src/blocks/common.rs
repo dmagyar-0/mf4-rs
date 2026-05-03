@@ -242,3 +242,35 @@ pub fn read_string_block(mmap: &[u8], address: u64) -> Result<Option<String>, Md
         _ => Ok(None),
     }
 }
+
+/// Read a text or metadata block via a [`ByteRangeReader`].
+///
+/// Mirrors [`read_string_block`] but fetches the block bytes through a range
+/// reader instead of a memory-mapped slice. Returns `Ok(None)` for `address ==
+/// 0` or non-text block IDs.
+pub fn read_string_block_via_reader<R>(
+    reader: &mut R,
+    address: u64,
+) -> Result<Option<String>, MdfError>
+where
+    R: crate::index::ByteRangeReader<Error = MdfError>,
+{
+    if address == 0 {
+        return Ok(None);
+    }
+
+    let header_bytes = reader.read_range(address, 24)?;
+    let header = BlockHeader::from_bytes(&header_bytes)?;
+
+    match header.id.as_str() {
+        "##TX" => {
+            let bytes = reader.read_range(address, header.block_len)?;
+            Ok(Some(TextBlock::from_bytes(&bytes)?.text))
+        }
+        "##MD" => {
+            let bytes = reader.read_range(address, header.block_len)?;
+            Ok(Some(MetadataBlock::from_bytes(&bytes)?.xml))
+        }
+        _ => Ok(None),
+    }
+}

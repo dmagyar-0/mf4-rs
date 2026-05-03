@@ -180,6 +180,41 @@ impl MdfWriter {
         Ok((cc_id, pos))
     }
 
+    /// Write a `##TX` block holding `name` and link it as the channel group's
+    /// `acq_name_addr`.
+    ///
+    /// The MDF 4 specification places the acquisition name link at offset 40
+    /// (the third link slot) inside the `##CG` block.
+    pub fn set_channel_group_name(
+        &mut self,
+        cg_id: &str,
+        name: &str,
+    ) -> Result<(), MdfError> {
+        let tx_id = format!("tx_cg_name_{cg_id}");
+        let tx_block = TextBlock::new(name);
+        let tx_bytes = tx_block.to_bytes()?;
+        self.write_block_with_id(&tx_bytes, &tx_id)?;
+        let acq_name_link_offset = 40;
+        self.update_block_link(cg_id, acq_name_link_offset, &tx_id)
+    }
+
+    /// Write a `##TX` block holding `comment` and link it as the channel
+    /// group's `comment_addr`.
+    ///
+    /// The comment link is at offset 64 inside the `##CG` block.
+    pub fn set_channel_group_comment(
+        &mut self,
+        cg_id: &str,
+        comment: &str,
+    ) -> Result<(), MdfError> {
+        let tx_id = format!("tx_cg_comment_{cg_id}");
+        let tx_block = TextBlock::new(comment);
+        let tx_bytes = tx_block.to_bytes()?;
+        self.write_block_with_id(&tx_bytes, &tx_id)?;
+        let comment_link_offset = 64;
+        self.update_block_link(cg_id, comment_link_offset, &tx_id)
+    }
+
     /// Adds a channel block to the specified channel group and links it.
     pub fn add_channel<F>(
         &mut self,

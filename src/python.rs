@@ -17,7 +17,10 @@ use std::collections::HashMap;
 
 use crate::api::mdf::MDF;
 use crate::writer::{MdfWriter, ColumnData};
-use crate::index::{MdfIndex, FileRangeReader, IndexedChannel};
+use crate::index::{
+    ByteRangeReader, CachingRangeReader, FileRangeReader, HttpRangeReader, IndexedChannel,
+    MdfIndex,
+};
 use crate::blocks::common::DataType;
 use crate::parsing::decoder::DecodedValue;
 use crate::error::MdfError;
@@ -878,9 +881,9 @@ impl PyMdfWriter {
     /// Parameters
     /// ----------
     /// name : Optional[str]
-    ///     Group name. **Currently ignored** — the underlying writer does
-    ///     not yet emit ``acq_name`` / metadata for groups. Pass any value
-    ///     (or ``None``) for forward compatibility.
+    ///     Group acquisition name. Written as a ``##TX`` block referenced
+    ///     from the new ``##CG`` via ``acq_name_addr``. Pass ``None`` to
+    ///     leave it unset.
     ///
     /// Returns
     /// -------
@@ -889,18 +892,37 @@ impl PyMdfWriter {
     ///     ``add_channel`` / ``write_record`` / ``finish_data_block`` calls.
     fn add_channel_group(&mut self, name: Option<String>) -> PyResult<String> {
         if let Some(ref mut writer) = self.writer {
-            let cg_id = writer.add_channel_group(None, |_cg| {
-                // Could set channel group properties here
-            })?;
-            
+            let cg_id = writer.add_channel_group(None, |_cg| {})?;
+            if let Some(n) = &name {
+                writer.set_channel_group_name(&cg_id, n)?;
+            }
+
             let py_id = format!("cg_{}", self.next_id);
             self.next_id += 1;
             self.channel_groups.insert(py_id.clone(), cg_id);
-            
+
             Ok(py_id)
         } else {
             Err(MdfException::new_err("Writer has been finalized"))
         }
+    }
+
+    /// Attach a comment / description to a channel group.
+    ///
+    /// Writes a ``##TX`` block holding ``comment`` and links it from the
+    /// group's ``comment_addr`` field.
+    fn set_channel_group_comment(&mut self, group_id: &str, comment: &str) -> PyResult<()> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| MdfException::new_err("Writer has been finalized"))?;
+        let rust_id = self
+            .channel_groups
+            .get(group_id)
+            .ok_or_else(|| MdfException::new_err(format!("Unknown group_id: {}", group_id)))?
+            .clone();
+        writer.set_channel_group_comment(&rust_id, comment)?;
+        Ok(())
     }
     
     /// Add a generic channel to a channel group, using the data type's
@@ -1261,6 +1283,49 @@ impl PyMdfIndex {
         Ok(PyMdfIndex { index })
     }
 
+    /// Build an index from an MDF file served over HTTP / S3 using range
+    /// requests, without downloading the whole file.
+    ///
+    /// Issues range reads only for metadata blocks (``##ID``, ``##HD``,
+    /// ``##DG``, ``##CG``, ``##CN``, name / unit / comment ``##TX``,
+    /// conversion ``##CC`` plus its ``cc_ref`` chain, and ``##DT``/``##DV``/
+    /// ``##DZ``/``##DL`` headers). Sample data is never fetched. With the
+    /// default 1 MiB read-ahead chunk, a typical file collapses to a handful
+    /// of underlying HTTP requests regardless of file size.
+    ///
+    /// Parameters
+    /// ----------
+    /// url : str
+    ///     ``http://`` or ``https://`` URL of the ``.mf4`` resource. The
+    ///     server must honour single-range ``Range: bytes=A-B`` requests.
+    /// chunk_size : int, optional
+    ///     Read-ahead chunk size in bytes for the metadata phase
+    ///     (default 1 MiB). Smaller values reduce wasted bytes when
+    ///     metadata is densely packed near the file head; larger values
+    ///     reduce the number of HTTP round-trips when metadata is
+    ///     scattered across the file.
+    ///
+    /// Raises
+    /// ------
+    /// MdfException
+    ///     If the URL cannot be reached, the server does not honour
+    ///     range requests, or the response is not a valid MDF file.
+    #[staticmethod]
+    fn from_url(py: Python, url: &str, chunk_size: Option<u64>) -> PyResult<Self> {
+        // Release the GIL: ureq does blocking socket I/O and any HTTP server
+        // running in the same Python interpreter (e.g. a `http.server` test
+        // fixture) needs the GIL to handle requests.
+        let url = url.to_string();
+        let chunk = chunk_size.unwrap_or(1 << 20);
+        let index = py.allow_threads(move || -> Result<MdfIndex, MdfError> {
+            let mut http = HttpRangeReader::new(&url)?;
+            let file_size = http.probe_size()?;
+            let mut cached = CachingRangeReader::with_chunk_size(http, chunk);
+            MdfIndex::from_range_reader(&mut cached, file_size)
+        })?;
+        Ok(PyMdfIndex { index })
+    }
+
     /// Serialize the index to JSON at ``path``.
     ///
     /// Output is dependency-free (no references back to the source MDF) and
@@ -1349,7 +1414,70 @@ impl PyMdfIndex {
             opt_val.map(|dv| decoded_value_to_pyobject(dv, py))
         }).collect())
     }
-    
+
+    /// Read every sample of a channel via HTTP range requests.
+    ///
+    /// Issues one HTTP request per data block holding this channel. Cache
+    /// is bypassed because data-block payloads are typically far larger
+    /// than any sensible chunk size; one ranged ``GET`` per block is the
+    /// cheapest pattern.
+    ///
+    /// Parameters
+    /// ----------
+    /// group_index : int
+    /// channel_index : int
+    /// url : str
+    ///     URL of the same MDF file the index was built from.
+    ///
+    /// Returns
+    /// -------
+    /// list[Optional[Union[float, int, str, bytes]]]
+    ///     One entry per record. ``None`` indicates an invalid sample.
+    fn read_channel_values_from_url(
+        &self,
+        py: Python,
+        group_index: usize,
+        channel_index: usize,
+        url: &str,
+    ) -> PyResult<Vec<Option<PyObject>>> {
+        let url = url.to_string();
+        let values = py.allow_threads(move || -> Result<_, MdfError> {
+            let http = HttpRangeReader::new(&url)?;
+            let mut cached = CachingRangeReader::new(http);
+            cached.set_bypass(true);
+            self.index
+                .read_channel_values(group_index, channel_index, &mut cached)
+        })?;
+        Ok(values
+            .into_iter()
+            .map(|opt_val| opt_val.map(|dv| decoded_value_to_pyobject(dv, py)))
+            .collect())
+    }
+
+    /// Read every sample of a channel by name via HTTP range requests.
+    ///
+    /// See :py:meth:`read_channel_values_from_url` for the I/O contract.
+    fn read_channel_values_by_name_from_url(
+        &self,
+        py: Python,
+        channel_name: &str,
+        url: &str,
+    ) -> PyResult<Vec<Option<PyObject>>> {
+        let url = url.to_string();
+        let channel_name = channel_name.to_string();
+        let values = py.allow_threads(move || -> Result<_, MdfError> {
+            let http = HttpRangeReader::new(&url)?;
+            let mut cached = CachingRangeReader::new(http);
+            cached.set_bypass(true);
+            self.index
+                .read_channel_values_by_name(&channel_name, &mut cached)
+        })?;
+        Ok(values
+            .into_iter()
+            .map(|opt_val| opt_val.map(|dv| decoded_value_to_pyobject(dv, py)))
+            .collect())
+    }
+
     /// Fast path: read a numeric channel as a list of ``float`` values.
     ///
     /// Several times faster than :py:meth:`read_channel_values` for numeric

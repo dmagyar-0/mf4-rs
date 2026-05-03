@@ -24,4 +24,23 @@ impl ConversionBlock {
 
         Ok(())
     }
+
+    /// Resolve the algebraic formula via a [`crate::index::ByteRangeReader`].
+    pub fn resolve_formula_via_reader<R>(&mut self, reader: &mut R) -> Result<(), MdfError>
+    where
+        R: crate::index::ByteRangeReader<Error = MdfError>,
+    {
+        use crate::blocks::common::read_string_block_via_reader;
+
+        if self.cc_type != ConversionType::Algebraic || self.cc_ref.is_empty() {
+            return Ok(());
+        }
+
+        let addr = self.cc_ref[0];
+        if let Some(formula) = read_string_block_via_reader(reader, addr)? {
+            self.formula = Some(formula);
+        }
+
+        Ok(())
+    }
 }

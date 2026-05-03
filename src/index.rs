@@ -278,51 +278,256 @@ impl ByteRangeReader for SliceRangeReader {
     }
 }
 
-/// Example HTTP range reader (would be implemented in production)
-/// ```rust,ignore
-/// use mf4_rs::index::ByteRangeReader;
-/// use mf4_rs::error::MdfError;
-/// 
-/// pub struct HttpRangeReader {
-///     client: reqwest::blocking::Client,
-///     url: String,
-/// }
-/// 
-/// impl HttpRangeReader {
-///     pub fn new(url: String) -> Self {
-///         Self {
-///             client: reqwest::blocking::Client::new(),
-///             url,
-///         }
-///     }
-/// }
-/// 
-/// impl ByteRangeReader for HttpRangeReader {
-///     type Error = MdfError;
-///     
-///     fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, Self::Error> {
-///         let range_header = format!("bytes={}-{}", offset, offset + length - 1);
-///         
-///         let response = self.client
-///             .get(&self.url)
-///             .header("Range", range_header)
-///             .send()
-///             .map_err(|e| MdfError::BlockSerializationError(format!("HTTP error: {}", e)))?;
-///         
-///         if !response.status().is_success() {
-///             return Err(MdfError::BlockSerializationError(
-///                 format!("HTTP error: {}", response.status())
-///             ));
-///         }
-///         
-///         let bytes = response.bytes()
-///             .map_err(|e| MdfError::BlockSerializationError(format!("Response error: {}", e)))?;
-///         
-///         Ok(bytes.to_vec())
-///     }
-/// }
-/// ```
-pub struct _HttpRangeReaderExample;
+/// Caching wrapper around any [`ByteRangeReader`].
+///
+/// During the metadata phase of building an [`MdfIndex`], the parser issues
+/// many small reads (block headers, channel metadata, text blocks). Without
+/// caching, each becomes a round-trip on a remote backend. `CachingRangeReader`
+/// fetches in larger aligned chunks (default 1 MiB) and serves overlapping
+/// reads from memory, collapsing hundreds of small reads into a handful of
+/// underlying requests.
+///
+/// For value reads — which span large slices of data blocks — call
+/// [`CachingRangeReader::set_bypass`] to forward each read directly to the
+/// underlying reader without populating the cache.
+pub struct CachingRangeReader<R: ByteRangeReader<Error = MdfError>> {
+    inner: R,
+    chunks: std::collections::BTreeMap<u64, Vec<u8>>,
+    chunk_size: u64,
+    bypass: bool,
+    underlying_requests: u64,
+    cache_hits: u64,
+}
+
+impl<R: ByteRangeReader<Error = MdfError>> CachingRangeReader<R> {
+    /// Wrap a reader with the default chunk size (1 MiB).
+    pub fn new(inner: R) -> Self {
+        Self::with_chunk_size(inner, 1 << 20)
+    }
+
+    /// Wrap a reader with a custom chunk size in bytes.
+    pub fn with_chunk_size(inner: R, chunk_size: u64) -> Self {
+        assert!(chunk_size > 0, "chunk_size must be > 0");
+        Self {
+            inner,
+            chunks: std::collections::BTreeMap::new(),
+            chunk_size,
+            bypass: false,
+            underlying_requests: 0,
+            cache_hits: 0,
+        }
+    }
+
+    /// When set, every read forwards directly to the underlying reader.
+    /// Use during value-read phases so large data-block fetches do not
+    /// populate the cache.
+    pub fn set_bypass(&mut self, bypass: bool) {
+        self.bypass = bypass;
+    }
+
+    /// Number of read calls forwarded to the underlying reader.
+    pub fn underlying_requests(&self) -> u64 {
+        self.underlying_requests
+    }
+
+    /// Number of read calls fully satisfied from cache.
+    pub fn cache_hits(&self) -> u64 {
+        self.cache_hits
+    }
+
+    /// Pre-fetch a contiguous range into the cache.
+    pub fn prefetch(&mut self, offset: u64, length: u64) -> Result<(), MdfError> {
+        if length == 0 {
+            return Ok(());
+        }
+        self.read_range(offset, length).map(|_| ())
+    }
+
+    fn ensure_chunks(&mut self, first: u64, last: u64) -> Result<(), MdfError> {
+        // Walk [first..=last], find each contiguous run of missing chunks,
+        // issue one read per run.
+        let mut idx = first;
+        while idx <= last {
+            if self.chunks.contains_key(&idx) {
+                idx += 1;
+                continue;
+            }
+            let run_start = idx;
+            while idx <= last && !self.chunks.contains_key(&idx) {
+                idx += 1;
+            }
+            let run_end = idx - 1;
+            let read_offset = run_start * self.chunk_size;
+            let read_len = (run_end - run_start + 1) * self.chunk_size;
+            let bytes = self.inner.read_range(read_offset, read_len)?;
+            self.underlying_requests += 1;
+
+            // Split the response into chunk-sized pieces. The last chunk
+            // may be short if the file ends partway through it.
+            for (i, slot) in (run_start..=run_end).enumerate() {
+                let start = i * self.chunk_size as usize;
+                if start >= bytes.len() {
+                    self.chunks.insert(slot, Vec::new());
+                    continue;
+                }
+                let end = std::cmp::min(start + self.chunk_size as usize, bytes.len());
+                self.chunks.insert(slot, bytes[start..end].to_vec());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: ByteRangeReader<Error = MdfError>> ByteRangeReader for CachingRangeReader<R> {
+    type Error = MdfError;
+
+    fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        if self.bypass {
+            let bytes = self.inner.read_range(offset, length)?;
+            self.underlying_requests += 1;
+            return Ok(bytes);
+        }
+
+        let first = offset / self.chunk_size;
+        let last = (offset + length - 1) / self.chunk_size;
+
+        // Track cache-hit metric only when no underlying read is required.
+        let need_fetch = (first..=last).any(|i| !self.chunks.contains_key(&i));
+        self.ensure_chunks(first, last)?;
+        if !need_fetch {
+            self.cache_hits += 1;
+        }
+
+        let mut out = Vec::with_capacity(length as usize);
+        let mut remaining = length as usize;
+        let mut cursor = offset;
+        while remaining > 0 {
+            let chunk_index = cursor / self.chunk_size;
+            let chunk_offset = (cursor % self.chunk_size) as usize;
+            let chunk = self.chunks.get(&chunk_index).expect("chunk fetched above");
+            if chunk_offset >= chunk.len() {
+                return Err(MdfError::TooShortBuffer {
+                    actual: chunk.len(),
+                    expected: chunk_offset + 1,
+                    file: file!(),
+                    line: line!(),
+                });
+            }
+            let take = std::cmp::min(remaining, chunk.len() - chunk_offset);
+            out.extend_from_slice(&chunk[chunk_offset..chunk_offset + take]);
+            cursor += take as u64;
+            remaining -= take;
+            if take == 0 {
+                break;
+            }
+        }
+
+        if out.len() != length as usize {
+            return Err(MdfError::TooShortBuffer {
+                actual: out.len(),
+                expected: length as usize,
+                file: file!(),
+                line: line!(),
+            });
+        }
+
+        Ok(out)
+    }
+}
+
+/// HTTP range-request reader using the synchronous [`ureq`] client.
+///
+/// Each [`ByteRangeReader::read_range`] call issues a single
+/// `Range: bytes=A-B` GET request and expects an HTTP 206 response. The
+/// underlying `ureq::Agent` is reused across calls so TCP keep-alive applies.
+///
+/// Wrap this in [`CachingRangeReader`] when building an index, otherwise the
+/// many small metadata reads will each become a separate round-trip.
+#[cfg(feature = "http")]
+pub struct HttpRangeReader {
+    agent: ureq::Agent,
+    url: String,
+    request_count: u64,
+}
+
+#[cfg(feature = "http")]
+impl HttpRangeReader {
+    pub fn new(url: impl Into<String>) -> Result<Self, MdfError> {
+        let agent = ureq::AgentBuilder::new().build();
+        Ok(Self {
+            agent,
+            url: url.into(),
+            request_count: 0,
+        })
+    }
+
+    /// Issue a HEAD request to learn the resource's `Content-Length`.
+    pub fn probe_size(&mut self) -> Result<u64, MdfError> {
+        let resp = self
+            .agent
+            .head(&self.url)
+            .call()
+            .map_err(|e| MdfError::BlockSerializationError(format!("HTTP HEAD error: {e}")))?;
+        self.request_count += 1;
+        let len = resp
+            .header("Content-Length")
+            .ok_or_else(|| {
+                MdfError::BlockSerializationError("HEAD response missing Content-Length".into())
+            })?
+            .parse::<u64>()
+            .map_err(|e| {
+                MdfError::BlockSerializationError(format!("invalid Content-Length: {e}"))
+            })?;
+        Ok(len)
+    }
+
+    /// Total number of HTTP requests issued by this reader.
+    pub fn request_count(&self) -> u64 {
+        self.request_count
+    }
+}
+
+#[cfg(feature = "http")]
+impl ByteRangeReader for HttpRangeReader {
+    type Error = MdfError;
+
+    fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
+        use std::io::Read;
+
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let range_header = format!("bytes={}-{}", offset, offset + length - 1);
+        let resp = self
+            .agent
+            .get(&self.url)
+            .set("Range", &range_header)
+            .call()
+            .map_err(|e| MdfError::BlockSerializationError(format!("HTTP GET error: {e}")))?;
+        self.request_count += 1;
+
+        // Trust the server's Content-Length over our requested length: when
+        // the requested range extends past EOF the server caps the response,
+        // and in that case `take(length)` would block waiting for bytes the
+        // server is never going to send if keep-alive semantics confuse the
+        // underlying reader.
+        let content_length = resp
+            .header("Content-Length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(length);
+        let to_read = content_length.min(length);
+
+        let mut buf = Vec::with_capacity(to_read as usize);
+        resp.into_reader()
+            .take(to_read)
+            .read_to_end(&mut buf)
+            .map_err(MdfError::IOError)?;
+        Ok(buf)
+    }
+}
 
 impl MdfIndex {
     /// Create an index from an MDF file on disk.
@@ -472,6 +677,148 @@ impl MdfIndex {
         let file_size = data.len() as u64;
         let mdf = MDF::from_bytes(data)?;
         Self::build_index(mdf, file_size)
+    }
+
+    /// Build an [`MdfIndex`] using only [`ByteRangeReader`] calls.
+    ///
+    /// Issues range reads for the file's metadata structures (identification,
+    /// header, data groups, channel groups, channels, text and conversion
+    /// blocks, and data-block headers) but never reads the sample data
+    /// itself. Intended for remote sources such as HTTP-served files; wrap
+    /// the underlying reader in [`CachingRangeReader`] to keep the number of
+    /// underlying requests low.
+    ///
+    /// `file_size` is stored on the resulting index for use by later byte-range
+    /// calculations. Callers should obtain it from a HEAD request (e.g.
+    /// [`HttpRangeReader::probe_size`]) or other out-of-band metadata.
+    pub fn from_range_reader<R>(
+        reader: &mut R,
+        file_size: u64,
+    ) -> Result<Self, MdfError>
+    where
+        R: ByteRangeReader<Error = MdfError>,
+    {
+        use crate::parsing::reader_walk;
+
+        let walk = reader_walk::walk(reader)?;
+
+        let start_time_ns = if walk.header.abs_time == 0 {
+            None
+        } else {
+            Some(walk.header.abs_time)
+        };
+
+        let mut indexed_groups = Vec::with_capacity(walk.groups.len());
+        for group in walk.groups {
+            let mut indexed_channels = Vec::with_capacity(group.channels.len());
+            for ch in group.channels {
+                let block = ch.block;
+                indexed_channels.push(IndexedChannel {
+                    name: ch.name,
+                    unit: ch.unit,
+                    data_type: block.data_type.clone(),
+                    byte_offset: block.byte_offset,
+                    bit_offset: block.bit_offset,
+                    bit_count: block.bit_count,
+                    channel_type: block.channel_type,
+                    flags: block.flags,
+                    pos_invalidation_bit: block.pos_invalidation_bit,
+                    conversion: ch.conversion,
+                    vlsd_data_address: if block.channel_type == 1 && block.data != 0 {
+                        Some(block.data)
+                    } else {
+                        None
+                    },
+                });
+            }
+
+            let data_blocks =
+                Self::extract_data_blocks_via_reader(reader, group.data_block_addr)?;
+
+            indexed_groups.push(IndexedChannelGroup {
+                name: group.cg_name,
+                comment: group.cg_comment,
+                record_id_len: group.record_id_len,
+                record_size: group.cg.samples_byte_nr,
+                invalidation_bytes: group.cg.invalidation_bytes_nr,
+                record_count: group.cg.cycles_nr,
+                channels: indexed_channels,
+                data_blocks,
+            });
+        }
+
+        Ok(MdfIndex {
+            file_size,
+            start_time_ns,
+            channel_groups: indexed_groups,
+        })
+    }
+
+    /// Mirror of [`Self::extract_data_blocks`] that fetches headers via a
+    /// [`ByteRangeReader`] instead of slicing into a memory map.
+    fn extract_data_blocks_via_reader<R>(
+        reader: &mut R,
+        data_block_addr: u64,
+    ) -> Result<Vec<DataBlockInfo>, MdfError>
+    where
+        R: ByteRangeReader<Error = MdfError>,
+    {
+        let mut data_blocks = Vec::new();
+        let mut current_block_address = data_block_addr;
+
+        while current_block_address != 0 {
+            let header_bytes = reader.read_range(current_block_address, 24)?;
+            let block_header =
+                crate::blocks::common::BlockHeader::from_bytes(&header_bytes)?;
+
+            match block_header.id.as_str() {
+                "##DT" | "##DV" => {
+                    data_blocks.push(DataBlockInfo {
+                        file_offset: current_block_address,
+                        size: block_header.block_len,
+                        is_compressed: false,
+                    });
+                    current_block_address = 0;
+                }
+                "##DZ" => {
+                    data_blocks.push(DataBlockInfo {
+                        file_offset: current_block_address,
+                        size: block_header.block_len,
+                        is_compressed: true,
+                    });
+                    current_block_address = 0;
+                }
+                "##DL" => {
+                    let dl_bytes =
+                        reader.read_range(current_block_address, block_header.block_len)?;
+                    let data_list_block =
+                        crate::blocks::data_list_block::DataListBlock::from_bytes(&dl_bytes)?;
+
+                    for &fragment_address in &data_list_block.data_links {
+                        let frag_header_bytes = reader.read_range(fragment_address, 24)?;
+                        let fragment_header = crate::blocks::common::BlockHeader::from_bytes(
+                            &frag_header_bytes,
+                        )?;
+                        let is_compressed = fragment_header.id == "##DZ";
+                        data_blocks.push(DataBlockInfo {
+                            file_offset: fragment_address,
+                            size: fragment_header.block_len,
+                            is_compressed,
+                        });
+                    }
+
+                    current_block_address = data_list_block.next;
+                }
+                unexpected_id => {
+                    return Err(MdfError::BlockIDError {
+                        actual: unexpected_id.to_string(),
+                        expected: "##DT / ##DV / ##DL / ##DZ".to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(data_blocks)
     }
 
     /// Save the index to a JSON file.

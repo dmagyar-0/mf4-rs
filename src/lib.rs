@@ -23,6 +23,7 @@ pub mod parsing {
     pub mod raw_data_group;
     pub mod raw_channel;
     pub mod source_info;
+    pub(crate) mod reader_walk;
 }
 
 pub mod api {
