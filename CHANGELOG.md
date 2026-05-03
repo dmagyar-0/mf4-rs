@@ -1,3 +1,9 @@
+## v1.7.0 — 2026-05-03
+
+### Features
+- expose cloud index creation and channel reads from URL
+- build MdfIndex over HTTP range requests (cloud indexing)
+
 ## v1.6.0 — 2026-05-02
 
 ### Features
