@@ -1,0 +1,136 @@
+name: Build wheels
+
+# Mirror of the wheel/sdist matrix in release.yml, run on every PR
+# touching code that affects packaging. Lets us iterate on
+# cross-compile / build-script fixes without consuming a release
+# version each attempt. No publish step — artifacts are uploaded for
+# inspection but never pushed to PyPI.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pyproject.toml"
+      - "src/**"
+      - ".github/workflows/build-wheels.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: build-wheels-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheels-linux:
+    name: Build wheels (Linux ${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 needs the AlmaLinux 8-based manylinux_2_28 image:
+          # its newer binutils handles the AVX-512 assembly in
+          # openssl-src 300.6 (OpenSSL 3.6.2), which fails to assemble
+          # on the CentOS 7-based manylinux2014_x86_64 image. Wheels
+          # will require glibc 2.28+, which covers RHEL 8+, Ubuntu
+          # 18.10+, Debian 10+ — RHEL 7 is already EOL.
+          - target: x86_64
+            manylinux: "2_28"
+          # aarch64 keeps `auto`, which selects the Debian-based
+          # rust-cross/manylinux2014-cross image. Its host toolchain
+          # is modern enough to assemble OpenSSL 3.6, and cross-build
+          # is much faster than QEMU-emulated native builds.
+          - target: aarch64
+            manylinux: "auto"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: ${{ matrix.manylinux }}
+          sccache: "true"
+          # openssl-src (vendored OpenSSL) drives the build via perl's
+          # Configure script, which needs FindBin and IPC::Cmd. The
+          # native x86_64 manylinux2014 image is CentOS 7 (yum), while
+          # the aarch64 cross image is Debian-based (apt-get); detect
+          # the package manager and install the right modules.
+          # On CentOS 7 (post-EOL vault mirrors) perl-FindBin is no
+          # longer a separately-installable subpackage but ships with
+          # the main perl package; perl-core also bundles many core
+          # modules. perl-IPC-Cmd is still standalone.
+          before-script-linux: |
+            set -e
+            if command -v yum >/dev/null 2>&1; then
+              yum install -y perl-core perl-IPC-Cmd
+            elif command -v apt-get >/dev/null 2>&1; then
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends perl
+            fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  build-wheels-macos:
+    name: Build wheels (macOS ${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          sccache: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  build-wheels-windows:
+    name: Build wheels (Windows ${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          sccache: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: dist
+
+  build-sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
