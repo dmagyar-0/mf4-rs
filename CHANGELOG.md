@@ -1,3 +1,8 @@
+## v1.7.6 — 2026-05-28
+
+### Fixes
+- get wheel builds green and add PR mirror workflow
+
 ## v1.7.5 — 2026-05-28
 
 ### Fixes
