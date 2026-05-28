@@ -1,3 +1,8 @@
+## v1.7.1 — 2026-05-28
+
+### Fixes
+- disable sccache for aarch64 Linux wheel build (#72)
+
 ## v1.7.0 — 2026-05-03
 
 ### Features
