@@ -251,6 +251,12 @@ jobs:
           args: --release --out dist
           manylinux: auto
           sccache: "true"
+          # openssl-src (vendored OpenSSL) drives the build via perl's
+          # Configure script, which needs FindBin and IPC::Cmd. The
+          # CentOS 7-based manylinux2014 image's minimal perl install
+          # lacks them; install before maturin invokes cargo.
+          before-script-linux: |
+            yum install -y perl-FindBin perl-IPC-Cmd
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
