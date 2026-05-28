@@ -1,3 +1,8 @@
+## v1.7.5 — 2026-05-28
+
+### Fixes
+- install perl-FindBin and perl-IPC-Cmd for vendored OpenSSL build (#76)
+
 ## v1.7.4 — 2026-05-28
 
 ### Fixes
