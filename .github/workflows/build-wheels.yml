@@ -38,8 +38,24 @@ jobs:
           args: --release --out dist
           manylinux: auto
           sccache: "true"
+          # openssl-src (vendored OpenSSL) drives the build via perl's
+          # Configure script, which needs FindBin and IPC::Cmd. The
+          # native x86_64 manylinux2014 image is CentOS 7 (yum), while
+          # the aarch64 cross image is Debian-based (apt-get); detect
+          # the package manager and install the right modules.
+          # On CentOS 7 (post-EOL vault mirrors) perl-FindBin is no
+          # longer a separately-installable subpackage but ships with
+          # the main perl package; perl-core also bundles many core
+          # modules. perl-IPC-Cmd is still standalone.
           before-script-linux: |
-            yum install -y perl-FindBin perl-IPC-Cmd
+            set -e
+            if command -v yum >/dev/null 2>&1; then
+              yum install -y perl-core perl-IPC-Cmd
+            elif command -v apt-get >/dev/null 2>&1; then
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends perl
+            fi
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
