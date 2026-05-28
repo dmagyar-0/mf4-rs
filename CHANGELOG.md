@@ -1,3 +1,8 @@
+## v1.7.2 — 2026-05-28
+
+### Fixes
+- set -march=armv8-a for aarch64 Linux wheel build (#73)
+
 ## v1.7.1 — 2026-05-28
 
 ### Fixes
