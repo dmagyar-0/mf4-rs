@@ -31,6 +31,13 @@ serde_json = "1.0"
 # under the manylinux2014 aarch64 toolchain (gcc fails to define __ARM_ARCH).
 ureq = { version = "2", default-features = false, features = ["native-tls"], optional = true }
 
+# Force openssl to be built from source rather than linked against the
+# host system. The manylinux2014 aarch64 cross-toolchain image ships
+# /usr/aarch64-unknown-linux-gnu/ but no OpenSSL development headers for
+# that sysroot, so dynamic linking fails at build time. Vendoring also
+# means the resulting wheel has no runtime libssl dependency.
+openssl = { version = "0.10", features = ["vendored"], optional = true }
+
 # Python bindings
 pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"], optional = true }
 numpy = { version = "0.21", optional = true }
@@ -42,5 +49,5 @@ tempfile = "3"
 
 [features]
 default = []
-http = ["dep:ureq"]
+http = ["dep:ureq", "dep:openssl"]
 pyo3 = ["dep:pyo3", "dep:numpy", "dep:pyo3-stub-gen", "http"]
