@@ -1,3 +1,8 @@
+## v1.7.3 — 2026-05-28
+
+### Fixes
+- switch ureq to native-tls to fix aarch64 Linux wheel build (#74)
+
 ## v1.7.2 — 2026-05-28
 
 ### Fixes
