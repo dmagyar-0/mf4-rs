@@ -1,3 +1,8 @@
+## v1.7.4 — 2026-05-28
+
+### Fixes
+- vendor OpenSSL so aarch64 Linux wheels build without sysroot headers (#75)
+
 ## v1.7.3 — 2026-05-28
 
 ### Fixes
