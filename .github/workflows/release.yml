@@ -240,28 +240,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64
-            sccache: "true"
-          - target: aarch64
-            sccache: "false"
+        target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.bump-and-tag.outputs.tag }}
       - uses: PyO3/maturin-action@v1
-        # The manylinux2014 aarch64 cross-gcc doesn't auto-define __ARM_ARCH,
-        # which ring 0.17's pre-generated ARMv8 .S files require. Forcing
-        # -march=armv8-a makes gcc emit __ARM_ARCH=8. maturin-action forwards
-        # CFLAGS_* env vars into the build container. Harmless on x86_64
-        # (CFLAGS_aarch64_* is ignored there).
-        env:
-          CFLAGS_aarch64_unknown_linux_gnu: "-march=armv8-a"
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
-          sccache: ${{ matrix.sccache }}
+          sccache: "true"
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
