@@ -240,7 +240,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64, aarch64]
+        include:
+          - target: x86_64
+            sccache: "true"
+          # sccache's preprocessor-cache path strips target-predefined
+          # macros when forwarding ring's .S files through the aarch64
+          # cross-gcc, breaking the ARMv8 asm build (__ARM_ARCH undefined).
+          - target: aarch64
+            sccache: "false"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -250,7 +257,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
-          sccache: "true"
+          sccache: ${{ matrix.sccache }}
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
