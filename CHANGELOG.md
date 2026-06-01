@@ -1,3 +1,8 @@
+## v1.7.7 — 2026-06-01
+
+### Fixes
+- configure native-tls backend for HTTPS range reads (#78)
+
 ## v1.7.6 — 2026-05-28
 
 ### Fixes
