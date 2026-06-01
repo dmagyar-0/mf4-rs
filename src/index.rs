@@ -472,24 +472,54 @@ impl HttpRangeReader {
         })
     }
 
-    /// Issue a HEAD request to learn the resource's `Content-Length`.
+    /// Learn the resource's total size with a single-byte ranged GET.
+    ///
+    /// Uses `GET` with `Range: bytes=0-0` and parses the total length out of
+    /// the `Content-Range: bytes 0-0/<total>` header, rather than issuing a
+    /// `HEAD`. Presigned URLs (e.g. AWS S3) are signed for one specific HTTP
+    /// method, so a `HEAD` against a GET-signed URL is rejected with 403; a
+    /// ranged `GET` matches the method the data reads use.
     pub fn probe_size(&mut self) -> Result<u64, MdfError> {
+        use std::io::Read;
+
         let resp = self
             .agent
-            .head(&self.url)
+            .get(&self.url)
+            .set("Range", "bytes=0-0")
             .call()
-            .map_err(|e| MdfError::BlockSerializationError(format!("HTTP HEAD error: {e}")))?;
+            .map_err(|e| MdfError::BlockSerializationError(format!("HTTP GET error: {e}")))?;
         self.request_count += 1;
-        let len = resp
+
+        // Preferred: total size from the Content-Range header of a 206 response.
+        let total = resp
+            .header("Content-Range")
+            .and_then(|cr| cr.rsplit('/').next().map(|s| s.trim().to_string()))
+            .filter(|s| s != "*")
+            .and_then(|s| s.parse::<u64>().ok());
+
+        // Fallback: a server that ignores the Range header replies 200 with the
+        // full body, in which case Content-Length is the total size. Drain the
+        // body so the connection can be reused for keep-alive.
+        let content_length = resp
             .header("Content-Length")
-            .ok_or_else(|| {
-                MdfError::BlockSerializationError("HEAD response missing Content-Length".into())
-            })?
-            .parse::<u64>()
-            .map_err(|e| {
-                MdfError::BlockSerializationError(format!("invalid Content-Length: {e}"))
-            })?;
-        Ok(len)
+            .and_then(|s| s.parse::<u64>().ok());
+        let status = resp.status();
+        let mut sink = Vec::new();
+        let _ = resp.into_reader().take(1).read_to_end(&mut sink);
+
+        if let Some(len) = total {
+            Ok(len)
+        } else if status == 200 {
+            content_length.ok_or_else(|| {
+                MdfError::BlockSerializationError(
+                    "size probe: server ignored Range and sent no Content-Length".into(),
+                )
+            })
+        } else {
+            Err(MdfError::BlockSerializationError(
+                "size probe: 206 response missing Content-Range total".into(),
+            ))
+        }
     }
 
     /// Total number of HTTP requests issued by this reader.
