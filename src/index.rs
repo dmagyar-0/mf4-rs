@@ -456,7 +456,15 @@ pub struct HttpRangeReader {
 #[cfg(feature = "http")]
 impl HttpRangeReader {
     pub fn new(url: impl Into<String>) -> Result<Self, MdfError> {
-        let agent = ureq::AgentBuilder::new().build();
+        // ureq's native-tls feature is not auto-wired (unlike rustls): the
+        // connector must be constructed and attached explicitly, otherwise
+        // HTTPS requests fail with "no TLS backend is configured".
+        let connector = native_tls::TlsConnector::new().map_err(|e| {
+            MdfError::BlockSerializationError(format!("failed to init TLS backend: {e}"))
+        })?;
+        let agent = ureq::AgentBuilder::new()
+            .tls_connector(std::sync::Arc::new(connector))
+            .build();
         Ok(Self {
             agent,
             url: url.into(),

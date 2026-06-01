@@ -541,6 +541,7 @@ dependencies = [
  "byteorder",
  "memmap2",
  "meval",
+ "native-tls",
  "nom 8.0.0",
  "numpy",
  "openssl",

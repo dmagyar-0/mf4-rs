@@ -31,6 +31,11 @@ serde_json = "1.0"
 # under the manylinux2014 aarch64 toolchain (gcc fails to define __ARM_ARCH).
 ureq = { version = "2", default-features = false, features = ["native-tls"], optional = true }
 
+# ureq's native-tls backend is not auto-configured: the connector must be
+# built explicitly and handed to the AgentBuilder, so we depend on native-tls
+# directly. Vendored so the manylinux aarch64 wheel needs no system libssl.
+native-tls = { version = "0.2", features = ["vendored"], optional = true }
+
 # Force openssl to be built from source rather than linked against the
 # host system. The manylinux2014 aarch64 cross-toolchain image ships
 # /usr/aarch64-unknown-linux-gnu/ but no OpenSSL development headers for
@@ -49,5 +54,5 @@ tempfile = "3"
 
 [features]
 default = []
-http = ["dep:ureq", "dep:openssl"]
+http = ["dep:ureq", "dep:openssl", "dep:native-tls"]
 pyo3 = ["dep:pyo3", "dep:numpy", "dep:pyo3-stub-gen", "http"]
