@@ -1,3 +1,8 @@
+## v1.7.8 — 2026-06-01
+
+### Fixes
+- probe remote file size with ranged GET instead of HEAD (#79)
+
 ## v1.7.7 — 2026-06-01
 
 ### Fixes
