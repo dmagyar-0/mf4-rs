@@ -1,9 +1,9 @@
 """Python integration test for cloud (HTTP) MDF indexing.
 
-Builds a fixture MF4 file using ``mf4_rs.PyMdfWriter``, serves it from a
+Builds a fixture MF4 file using ``mf4_rs.MdfWriter``, serves it from a
 local HTTP server with single-range ``Range: bytes=A-B`` support, then
-exercises ``PyMdfIndex.from_url`` and the ``*_from_url`` value-read
-methods.
+exercises ``MdfIndex.from_url`` and the ``MdfData`` reads bound to a URL
+source.
 
 Exits 0 (skip) if the bindings are not importable so this can sit in CI
 without forcing a maturin build on every runner.
@@ -34,7 +34,7 @@ RECORDS = 200
 
 
 def build_fixture(path: str) -> None:
-    w = mf4_rs.PyMdfWriter(path)
+    w = mf4_rs.MdfWriter(path)
     w.init_mdf_file()
     cg_ids: list[str] = []
     cn_ids_per_group: list[list[str]] = []
@@ -151,17 +151,19 @@ def main() -> int:
             time.sleep(0.05)
 
             t0 = time.perf_counter()
-            idx = mf4_rs.PyMdfIndex.from_url(url)
+            idx = mf4_rs.MdfIndex.from_url(url)
             print(f"index built in {(time.perf_counter() - t0)*1000:.1f} ms")
 
-            groups = idx.list_channel_groups()
+            groups = idx.groups
             assert len(groups) == GROUPS, f"got {len(groups)} groups, want {GROUPS}"
-            for i, (gi, name, count) in enumerate(groups):
-                assert gi == i
-                assert name == f"Group {i}", f"group {i} name = {name!r}"
-                assert count == CHANNELS_PER_GROUP
+            for i, g in enumerate(groups):
+                assert g.name == f"Group {i}", f"group {i} name = {g.name!r}"
+                assert g.channel_count == CHANNELS_PER_GROUP
 
-            # Read 5 channels via URL.
+            # Bind sources once: a local file and the same file over HTTP.
+            local = idx.open(str(mf4_path))
+            remote = idx.open_url(url)
+
             t0 = time.perf_counter()
             targets = [
                 ("Group 0", "t_0"),
@@ -171,8 +173,8 @@ def main() -> int:
                 ("Group 4", "ch_4_3"),
             ]
             for gn, cn in targets:
-                vals = idx.read_channel_values_by_group_and_name(gn, cn, str(mf4_path))
-                vals_url = idx.read_channel_values_by_name_from_url(cn, url)
+                vals = local.read_raw(cn, group=gn)
+                vals_url = remote.read_raw(cn)
                 assert len(vals) == RECORDS, f"{gn}/{cn} local len {len(vals)}"
                 assert len(vals_url) == RECORDS, f"{gn}/{cn} url len {len(vals_url)}"
                 # Spot-check one decoded value matches between local and URL paths.
@@ -184,10 +186,10 @@ def main() -> int:
             # Round-trip via JSON to confirm the index is self-contained after
             # being built over HTTP.
             json_path = tmp_path / "fixture.idx.json"
-            idx.save_to_file(str(json_path))
-            idx2 = mf4_rs.PyMdfIndex.load_from_file(str(json_path))
-            vals_a = idx.read_channel_values_by_name_from_url("ch_2_4", url)
-            vals_b = idx2.read_channel_values_by_name_from_url("ch_2_4", url)
+            idx.save(str(json_path))
+            idx2 = mf4_rs.MdfIndex.load(str(json_path))
+            vals_a = remote.read_raw("ch_2_4")
+            vals_b = idx2.open_url(url).read_raw("ch_2_4")
             assert vals_a == vals_b, "JSON round-trip changed decoded values"
             print(f"index json: {json_path.stat().st_size} bytes")
 

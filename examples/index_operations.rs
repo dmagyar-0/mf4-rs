@@ -1,6 +1,6 @@
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::error::MdfError;
-use mf4_rs::index::{FileRangeReader, MdfIndex};
+use mf4_rs::index::MdfIndex;
 use mf4_rs::parsing::decoder::DecodedValue;
 use mf4_rs::writer::MdfWriter;
 
@@ -25,20 +25,22 @@ fn main() -> Result<(), MdfError> {
     println!("🔄 Loading index and testing self-contained conversions...");
     let loaded_index = MdfIndex::load_from_file(index_file)?;
 
-    // Step 4: Read and convert data using only the index (no file access for conversions!)
+    // Step 4: Read and convert data using only the index + a bound data source.
     println!("📊 Reading channel values via enhanced index...");
-    let mut reader = FileRangeReader::new(mdf_file)?;
 
-    // List available channels
+    // List available channels by navigating the index by name
     println!("\nAvailable channels:");
-    if let Some(channels) = loaded_index.list_channels(0) {
-        for (idx, name, data_type) in channels {
-            println!("  Channel {}: {} ({:?})", idx, name, data_type);
-        }
+    for channel in &loaded_index.groups()[0].channels {
+        println!(
+            "  {} ({:?})",
+            channel.name.as_deref().unwrap_or("<unnamed>"),
+            channel.data_type
+        );
     }
 
-    // Read channel data
-    let values = loaded_index.read_channel_values(0, 0, &mut reader)?;
+    // Bind the data source once, then read by channel name.
+    let mut data = loaded_index.open_file(mdf_file)?;
+    let values = data.values("Time")?;
 
     println!("\nChannel values read from enhanced index:");
     for (i, value) in values.iter().enumerate().take(10) {
@@ -50,37 +52,21 @@ fn main() -> Result<(), MdfError> {
 
     // Step 5: Demonstrate byte range efficiency
     println!("\n🎯 Byte Range Analysis (Partial Reading):");
-    let byte_ranges = loaded_index.get_channel_byte_ranges(0, 0)?;
-    let (total_bytes, range_count) = loaded_index.get_channel_byte_summary(0, 0)?;
+    let byte_ranges = loaded_index.byte_ranges("Time")?;
+    let total_bytes: u64 = byte_ranges.iter().map(|(_, len)| len).sum();
 
     println!("  Total bytes needed: {}", total_bytes);
-    println!("  Number of byte ranges: {}", range_count);
+    println!("  Number of byte ranges: {}", byte_ranges.len());
     println!("  Ranges: {:?}", byte_ranges);
 
-    // Step 6: Compare with name-based access
-    println!("\n🏷️  Testing name-based access:");
-    if let Some(channels) = loaded_index.list_channels(0) {
-        if let Some((_, channel_name, _)) = channels.first() {
-            let values_by_name =
-                loaded_index.read_channel_values_by_name(channel_name, &mut reader)?;
-            println!(
-                "  Read {} values for channel '{}'",
-                values_by_name.len(),
-                channel_name
-            );
-
-            // Verify consistency
-            if values == values_by_name {
-                println!("  ✅ Index-based and name-based access produce identical results");
-            } else {
-                println!("  ❌ Mismatch between access methods");
-            }
-        }
-    }
+    // Step 6: Read another channel by name
+    println!("\n🏷️  Reading 'Temperature' by name:");
+    let temp_values = data.values("Temperature")?;
+    println!("  Read {} values for channel 'Temperature'", temp_values.len());
 
     // Step 7: Show resolved conversion information
     println!("\n🔧 Conversion Resolution Status:");
-    let group = &loaded_index.channel_groups[0];
+    let group = &loaded_index.groups()[0];
     for (i, channel) in group.channels.iter().enumerate() {
         println!(
             "  Channel {}: {}",

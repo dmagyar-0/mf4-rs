@@ -181,11 +181,12 @@ The codebase is organized into distinct layers. The module structure is defined 
 - `IndexedChannel` - Channel metadata including fully resolved `ConversionBlock` (serializable via serde)
 - `ByteRangeReader` trait - Abstraction for data sources: `read_range(offset, length) -> Vec<u8>`
 - `FileRangeReader` - Built-in local file implementation
+- Public API is **name-based**; positional `(group_index, channel_index)` reads exist only as `pub(crate)` internals.
 - Key capabilities:
-  - `from_file()` / `save_to_file()` / `load_from_file()` - Create, persist, and reload JSON indexes
-  - `read_channel_values()` / `read_channel_values_by_name()` - Read data using index + byte range reader
-  - `get_channel_byte_ranges()` / `get_channel_byte_ranges_for_records()` - Calculate exact byte ranges for partial reads
-  - `find_channel_by_name_global()` / `find_all_channels_by_name()` - Channel name lookups across all groups
+  - `from_file()` / `from_bytes()` / `from_range_reader()` / `save_to_file()` / `load_from_file()` / `to_json()` / `from_json()` - Create, persist, and reload JSON indexes
+  - Metadata navigation: `groups()`, `group(name)`, `channel(name)`, `channel_in(group, name)`, `channel_names()`, `find_channels(name)`; `IndexedChannelGroup::channel(name)` / `channel_names()` / `master_channel()`; `IndexedChannel::is_master()` / `is_vlsd()`
+  - Reading: bind a source once with `open(reader)` / `open_file(path)` → returns an `MdfReader`, then `values(name)` / `values_in(group, name)` / `values_f64(name)` / `values_f64_in(group, name)`; `reader_mut()` / `into_inner()` expose the underlying `ByteRangeReader`
+  - Byte ranges (power-user / partial reads): `byte_ranges(name)`, `byte_ranges_in(group, name)`, `byte_ranges_for_records(name, start, count)`
   - Conversions are resolved during index creation, enabling reads with empty `file_data` (`&[]`)
 
 ### 6. File Operations
@@ -204,11 +205,13 @@ The codebase is organized into distinct layers. The module structure is defined 
 ### 8. Python Bindings (`src/python.rs`)
 - Built only when `pyo3` feature is enabled (configured in `pyproject.toml` via `[tool.maturin] features = ["pyo3"]`)
 - Uses PyO3 0.21 with extension-module feature
+- The Python-visible names drop the `Py` prefix (set via `#[pyclass(name = "…")]`); the Rust struct names keep the `Py` prefix internally. **All navigation is by name — there are no `(group_index, channel_index)` arguments in the Python API.**
 - Main classes:
-  - `PyMDF` - Wraps `MDF`; methods: `channel_groups()`, `get_channel_values()`, `get_channel_values_by_group_and_name()`, `get_channel_as_series()` (pandas DatetimeIndex support)
-  - `PyMdfWriter` - Wraps `MdfWriter` with simplified Python API; manages ID mapping between Python and Rust IDs; provides `add_time_channel()`, `add_float_channel()`, `add_int_channel()` convenience methods
-  - `PyMdfIndex` - Wraps `MdfIndex`; supports index-based reads, name lookups, byte range calculations, pandas Series output, conversion info inspection
-  - `PyChannelInfo`, `PyChannelGroupInfo`, `PyDecodedValue`, `PyDataType` - Data transfer types
+  - `Mdf` (struct `PyMDF`) - Wraps `MDF`; `groups` property (each `GroupInfo` carries its `channels`), `group(name)`, `channel(name)`, `channel_names`; reads: `read(name, group=None)` → numpy f64, `read_raw(name, group=None)` → list with conversions, `series(name, group=None)` → pandas Series, `__getitem__` (= `read`), `file_layout()`
+  - `MdfWriter` (struct `PyMdfWriter`) - Wraps `MdfWriter`; manages ID mapping between Python and Rust IDs; provides `add_time_channel()`, `add_float_channel()`, `add_int_channel()` convenience methods (writer API unchanged in the redesign)
+  - `MdfIndex` (struct `PyMdfIndex`) - Wraps `MdfIndex`; `from_file()` / `load()` / `from_url()` / `save()`; navigation (`groups`, `group`, `channel`, `channel_names`, `groups_with_channel`); `byte_ranges()` / `byte_ranges_for_records()`; `conversion_info(name)`; **`open(path)` / `open_url(url)` return an `MdfData`** (bind the source once)
+  - `MdfData` (struct `PyMdfData`) - A reader bound to an index + one source. `read(name, group=None)` → numpy f64, `read_raw(...)` → list + conversions, `series(...)`, `__getitem__`, `byte_ranges(...)`, plus navigation delegations
+  - `ChannelInfo`, `GroupInfo`, `DecodedValue`, `DataType`, `FileLayout`/`BlockInfo`/`LinkInfo`/`GapInfo` - Data transfer / inspection types
 - Helper functions: `create_float_value()`, `create_uint_value()`, `create_int_value()`, `create_string_value()`, `create_data_type_*()` factory functions
 - Custom `MdfException` Python exception type
 - Returns native Python types (float, int, str, bytes) via `decoded_value_to_pyobject()` for zero-copy efficiency
@@ -443,9 +446,9 @@ This section documents tested interoperability and differences between `mf4-rs` 
 
 | Class | mf4-rs | asammdf |
 |-------|--------|---------|
-| Reader | `PyMDF` - 7 methods | `MDF` - 58+ methods |
-| Writer | `PyMdfWriter` - 11 methods | `MDF.append()` + `Signal` (numpy-based) |
-| Index | `PyMdfIndex` - 19 methods | No equivalent |
+| Reader | `Mdf` - name-based (`groups`, `group`, `channel`, `read`, `read_raw`, `series`, `__getitem__`) | `MDF` - 58+ methods |
+| Writer | `MdfWriter` - 11 methods | `MDF.append()` + `Signal` (numpy-based) |
+| Index | `MdfIndex` + `MdfData` - name-based (bind source once via `open`/`open_url`) | No equivalent |
 
 ### Performance (100K records, 4 x f64 channels)
 

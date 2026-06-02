@@ -261,9 +261,10 @@ fn cloud_index_round_trips_within_budget() -> Result<(), MdfError> {
 
     let metadata_requests = cached.underlying_requests();
 
-    // Switch to bypass for value reads — large DT bodies should not
-    // pollute the chunk cache.
-    cached.set_bypass(true);
+    // Bind the same reader to the index for value reads. Switch to bypass —
+    // large DT bodies should not pollute the chunk cache.
+    let mut data = index.open(cached);
+    data.reader_mut().set_bypass(true);
 
     let targets: &[(&str, &str)] = &[
         ("Group 0", "ch_0_9"), // value-to-text conversion
@@ -274,13 +275,7 @@ fn cloud_index_round_trips_within_budget() -> Result<(), MdfError> {
     ];
 
     for (gn, cn) in targets {
-        let g = index
-            .find_channel_group_by_name(gn)
-            .unwrap_or_else(|| panic!("group {gn} not found"));
-        let c = index
-            .find_channel_by_name(g, cn)
-            .unwrap_or_else(|| panic!("channel {cn} not found in {gn}"));
-        let vals = index.read_channel_values(g, c, &mut cached)?;
+        let vals = data.values_in(gn, cn)?;
         assert_eq!(vals.len(), RECORDS, "{gn}/{cn} record count");
 
         if *gn == "Group 0" && *cn == "ch_0_9" {
@@ -292,6 +287,7 @@ fn cloud_index_round_trips_within_budget() -> Result<(), MdfError> {
         }
     }
 
+    let cached = data.into_inner();
     let elapsed = started.elapsed();
     let total_requests = cached.underlying_requests();
     let value_requests = total_requests - metadata_requests;
@@ -432,8 +428,9 @@ fn cloud_index_handles_scattered_metadata() -> Result<(), MdfError> {
         "metadata cache too inefficient: {metadata_requests} requests for {SCATTER_GROUPS} groups"
     );
 
-    // Read 5 channels via bypass mode.
-    cached.set_bypass(true);
+    // Read 5 channels via bypass mode through a bound reader.
+    let mut data = index.open(cached);
+    data.reader_mut().set_bypass(true);
     let targets: &[(&str, &str)] = &[
         ("Group 0", "t_0"),
         ("Group 1", "ch_1_2"),
@@ -442,9 +439,7 @@ fn cloud_index_handles_scattered_metadata() -> Result<(), MdfError> {
         ("Group 4", "ch_4_3"),
     ];
     for (gn, cn) in targets {
-        let g = index.find_channel_group_by_name(gn).unwrap();
-        let c = index.find_channel_by_name(g, cn).unwrap();
-        let vals = index.read_channel_values(g, c, &mut cached)?;
+        let vals = data.values_in(gn, cn)?;
         assert_eq!(vals.len(), SCATTER_RECORDS, "{gn}/{cn}");
         // Spot-check decoded value matches what was written.
         let group_idx: usize = gn
@@ -472,6 +467,7 @@ fn cloud_index_handles_scattered_metadata() -> Result<(), MdfError> {
         }
     }
 
+    let cached = data.into_inner();
     let elapsed = started.elapsed();
     let total_requests = cached.underlying_requests();
     let value_requests = total_requests - metadata_requests;

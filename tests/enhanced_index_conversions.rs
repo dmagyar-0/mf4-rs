@@ -2,7 +2,7 @@ use mf4_rs::writer::MdfWriter;
 use mf4_rs::blocks::common::{DataType, BlockHeader};
 use mf4_rs::blocks::conversion::{ConversionBlock, ConversionType};
 use mf4_rs::parsing::decoder::DecodedValue;
-use mf4_rs::index::{MdfIndex, FileRangeReader, IndexedChannel, IndexedChannelGroup};
+use mf4_rs::index::{MdfIndex, IndexedChannel, IndexedChannelGroup};
 use mf4_rs::api::mdf::MDF;
 use mf4_rs::error::MdfError;
 use std::fs;
@@ -63,8 +63,8 @@ fn test_enhanced_index_with_text_conversions() -> Result<(), MdfError> {
     
     // Test 3: Read channel values via enhanced index
     println!("=== Test 3: Reading Values via Enhanced Index ===");
-    let mut reader = FileRangeReader::new(mdf_path.to_str().unwrap())?;
-    let status_values_via_index = loaded_index.read_channel_values(0, 0, &mut reader)?;
+    let mut data = loaded_index.open_file(mdf_path.to_str().unwrap())?;
+    let status_values_via_index = data.values("Status")?;
     
     assert_eq!(status_values_via_index.len(), status_values.len());
     
@@ -81,7 +81,7 @@ fn test_enhanced_index_with_text_conversions() -> Result<(), MdfError> {
     // Test 4: Compare with direct MDF reading
     println!("=== Test 4: Comparing with Direct MDF Reading ===");
     let mdf = MDF::from_file(mdf_path.to_str().unwrap())?;
-    let direct_values = mdf.channel_groups()[0].channels()[0].values()?;
+    let direct_values = mdf.channel("Status").unwrap().values()?;
     
     assert_eq!(direct_values.len(), status_values_via_index.len());
     
@@ -91,7 +91,7 @@ fn test_enhanced_index_with_text_conversions() -> Result<(), MdfError> {
 
     // Test 5: Test name-based access
     println!("=== Test 5: Testing Name-based Access ===");
-    let status_by_name = loaded_index.read_channel_values_by_name("Status", &mut reader)?;
+    let status_by_name = data.values("Status")?;
     assert_eq!(status_by_name.len(), status_values.len());
     
     for (i, (expected, actual)) in status_values.iter().zip(status_by_name.iter()).enumerate() {
@@ -104,12 +104,11 @@ fn test_enhanced_index_with_text_conversions() -> Result<(), MdfError> {
 
     // Test 6: Test byte range calculations
     println!("=== Test 6: Testing Byte Range Calculations ===");
-    let byte_ranges = loaded_index.get_channel_byte_ranges(0, 0)?;
+    let byte_ranges = loaded_index.byte_ranges("Status")?;
     assert!(!byte_ranges.is_empty(), "Should have at least one byte range");
-    
-    let (total_bytes, range_count) = loaded_index.get_channel_byte_summary(0, 0)?;
+
+    let total_bytes: u64 = byte_ranges.iter().map(|(_, len)| len).sum();
     assert!(total_bytes > 0, "Should have positive total bytes");
-    assert_eq!(range_count, byte_ranges.len(), "Range count should match");
     
     // Clean up
     fs::remove_file(mdf_path)?;
@@ -278,6 +277,7 @@ fn test_index_serialization_with_resolved_data() -> Result<(), MdfError> {
     
     let index = MdfIndex {
         file_size: 1024,
+        start_time_ns: None,
         channel_groups: vec![indexed_group],
     };
     

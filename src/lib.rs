@@ -43,22 +43,27 @@ use pyo3::prelude::*;
 /// Python bindings for the ``mf4-rs`` crate: a minimal reader/writer for
 /// ASAM MDF 4 measurement files.
 ///
+/// Everything is addressed by **name** — channel-group and channel names —
+/// never by numeric index.
+///
 /// Quick tour
 /// ----------
 ///
 /// Read::
 ///
 ///     import mf4_rs
-///     mdf = mf4_rs.PyMDF("recording.mf4")
-///     for g in mdf.channel_groups():
-///         print(g.name, g.record_count)
-///     speed = mdf.get_channel_values("Speed")  # numpy.ndarray[float64]
+///     mdf = mf4_rs.Mdf("recording.mf4")
+///     for g in mdf.groups:
+///         print(g.name, g.record_count, g.channel_names)
+///     speed = mdf["Speed"]                 # numpy.ndarray[float64]
+///     rpm   = mdf.read("RPM", group="Engine")
+///     s     = mdf.series("Speed")          # pandas Series, datetime index
 ///
 /// Write::
 ///
-///     w = mf4_rs.PyMdfWriter("out.mf4")
+///     w = mf4_rs.MdfWriter("out.mf4")
 ///     w.init_mdf_file()
-///     cg = w.add_channel_group("group_0")
+///     cg = w.add_channel_group("Engine")
 ///     t  = w.add_time_channel(cg, "Time")
 ///     y  = w.add_float_channel(cg, "Speed")
 ///     w.start_data_block(cg)
@@ -69,14 +74,17 @@ use pyo3::prelude::*;
 ///     w.finish_data_block(cg)
 ///     w.finalize()
 ///
-/// Index (HTTP-friendly random access)::
+/// Index (HTTP-friendly random access) — bind the data source once::
 ///
-///     idx = mf4_rs.PyMdfIndex.from_file("recording.mf4")
-///     idx.save_to_file("recording.idx.json")
-///     vals = idx.read_channel_values_by_name_as_f64("Speed", "recording.mf4")
+///     idx = mf4_rs.MdfIndex.from_file("recording.mf4")
+///     idx.save("recording.idx.json")
+///     idx = mf4_rs.MdfIndex.load("recording.idx.json")
+///     data = idx.open("recording.mf4")     # or idx.open_url("https://…")
+///     speed = data["Speed"]                # numpy.ndarray[float64]
+///     status = data.read_raw("Status")     # native values + conversions
 ///
 /// Other utilities: :func:`merge_files`, :func:`cut_mdf_by_time`,
-/// :func:`cut_mdf_by_utc`, and the :class:`PyFileLayout` block-layout
+/// :func:`cut_mdf_by_utc`, and the :class:`FileLayout` block-layout
 /// inspector.
 ///
 /// All errors raised by this module are subclasses of :class:`MdfException`.
