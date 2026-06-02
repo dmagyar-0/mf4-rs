@@ -305,9 +305,12 @@ class Mdf:
         """
         ...
 
-    def __getitem__(self, name:builtins.str) -> typing.Any:
+    def __getitem__(self, key:typing.Any) -> typing.Any:
         r"""
         ``mdf["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).
+        
+        Pass a ``(name, group)`` tuple to disambiguate a channel name shared by
+        several groups, e.g. ``mdf["Speed", "Engine"]``.
         """
         ...
 
@@ -498,9 +501,12 @@ class MdfIndex:
         """
         ...
 
-    def __getitem__(self, name:builtins.str) -> typing.Any:
+    def __getitem__(self, key:typing.Any) -> typing.Any:
         r"""
         ``index["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).
+        
+        Pass a ``(name, group)`` tuple to disambiguate a channel name shared by
+        several groups, e.g. ``index["Speed", "Engine"]``.
         """
         ...
 

@@ -414,6 +414,22 @@ fn check_pandas_available(py: Python) -> PyResult<PyObject> {
         ))
 }
 
+/// Parse a ``__getitem__`` key into ``(channel_name, optional_group_name)``.
+///
+/// Accepts a plain ``str`` (``obj["Speed"]``) or a ``(name, group)`` tuple
+/// (``obj["Speed", "Engine"]``) for disambiguating duplicate channel names.
+fn parse_lookup_key(key: &Bound<'_, PyAny>) -> PyResult<(String, Option<String>)> {
+    if let Ok((name, group)) = key.extract::<(String, String)>() {
+        Ok((name, Some(group)))
+    } else if let Ok(name) = key.extract::<String>() {
+        Ok((name, None))
+    } else {
+        Err(MdfException::new_err(
+            "channel key must be a name string or a (name, group) tuple",
+        ))
+    }
+}
+
 /// Build a ``pandas.Series`` from a decoded [`Signal`].
 ///
 /// `values` becomes the data; `timestamps` (master values in seconds) becomes
@@ -646,8 +662,12 @@ impl PyMDF {
     }
 
     /// ``mdf["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).
-    fn __getitem__(&self, py: Python, name: &str) -> PyResult<PyObject> {
-        self.read(py, name, None)
+    ///
+    /// Pass a ``(name, group)`` tuple to disambiguate a channel name shared by
+    /// several groups, e.g. ``mdf["Speed", "Engine"]``.
+    fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let (name, group) = parse_lookup_key(key)?;
+        self.read(py, &name, group.as_deref())
     }
 
     /// Build a :class:`FileLayout` describing every block in this file.
@@ -1384,8 +1404,12 @@ impl PyMdfIndex {
     }
 
     /// ``index["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).
-    fn __getitem__(&self, py: Python, name: &str) -> PyResult<PyObject> {
-        self.read(py, name, None)
+    ///
+    /// Pass a ``(name, group)`` tuple to disambiguate a channel name shared by
+    /// several groups, e.g. ``index["Speed", "Engine"]``.
+    fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let (name, group) = parse_lookup_key(key)?;
+        self.read(py, &name, group.as_deref())
     }
 }
 
