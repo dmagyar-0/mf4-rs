@@ -1,3 +1,11 @@
+## v2.0.0 — 2026-06-02
+
+### BREAKING CHANGES
+- redesign reader/index APIs around name-based navigation and signals (#80)
+
+### Features
+- redesign reader/index APIs around name-based navigation and signals (#80)
+
 ## v1.7.8 — 2026-06-01
 
 ### Fixes
