@@ -162,12 +162,12 @@ def verify_columns_correctness():
 
     # Read back with mf4-rs
     reader = mf4_rs.Mdf(path)
-    vals = reader.read("ch_0")
+    vals = reader.values("ch_0")
     assert vals is not None, "Channel ch_0 not found"
     assert len(vals) == n, f"Expected {n} values, got {len(vals)}"
     np.testing.assert_allclose(vals, ch0, rtol=1e-10)
 
-    vals1 = reader.read("ch_1")
+    vals1 = reader.values("ch_1")
     np.testing.assert_allclose(vals1, ch1, rtol=1e-10)
 
     print("  -> Correctness verified!")

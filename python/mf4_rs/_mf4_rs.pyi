@@ -267,12 +267,13 @@ class Mdf:
 
     def read(self, name:builtins.str, group:typing.Optional[builtins.str]) -> typing.Any:
         r"""
-        Read a numeric channel by name as a numpy ``float64`` array.
+        Read a channel as a ``pandas.Series`` of values indexed by timestamps.
         
-        This is the fast path: values are decoded directly into a numpy buffer,
-        invalid / non-decodable samples become ``NaN``. It does **not** apply
-        non-linear conversions — use :py:meth:`read_raw` for text / table /
-        value-to-text channels.
+        This is the primary read: the channel's samples (with all conversions
+        applied) are the data, and the group's master/time channel is the index
+        — a ``DatetimeIndex`` when the file has a start time, otherwise the raw
+        master seconds. If there is no master, or the requested channel *is* the
+        master, a default integer index is used.
         
         Parameters
         ----------
@@ -285,51 +286,28 @@ class Mdf:
         Raises
         ------
         MdfException
-            If no matching channel exists.
+            If no matching channel exists or pandas is not installed.
         """
         ...
 
-    def read_raw(self, name:builtins.str, group:typing.Optional[builtins.str]) -> builtins.list[typing.Optional[typing.Any]]:
+    def values(self, name:builtins.str, group:typing.Optional[builtins.str]) -> typing.Any:
         r"""
-        Read a channel by name, returning native Python values with conversions.
+        Read a numeric channel by name as a plain numpy ``float64`` array.
         
-        Slower than :py:meth:`read` but faithful to every conversion type
-        (linear, rational, table, value-to-text, …). ``None`` entries mark
-        invalid samples; valid samples are ``float`` / ``int`` / ``str`` /
-        ``bytes`` matching the channel.
+        The fast, pandas-free path — just the values, no timestamp index.
+        Invalid / non-numeric samples are ``NaN``. Use :py:meth:`read` when you
+        want the timestamp-indexed Series and faithful (text / table) conversions.
         
         Parameters
         ----------
         name : str
         group : Optional[str]
-        """
-        ...
-
-    def series(self, name:builtins.str, group:typing.Optional[builtins.str]) -> typing.Any:
-        r"""
-        Read a channel as a ``pandas.Series`` indexed by absolute timestamps.
-        
-        The series is indexed by the channel's group master (channel-type 2)
-        converted to a ``DatetimeIndex`` (relative seconds added to the file's
-        ``HD.abs_time``). If there is no master, or the requested channel *is*
-        the master, a default integer index is used; if the file has no start
-        time, master values are kept as a numeric index.
-        
-        Parameters
-        ----------
-        name : str
-        group : Optional[str]
-        
-        Raises
-        ------
-        MdfException
-            If the channel is not found or pandas is not installed.
         """
         ...
 
     def __getitem__(self, name:builtins.str) -> typing.Any:
         r"""
-        ``mdf["Speed"]`` — shorthand for :py:meth:`read` (numpy float64).
+        ``mdf["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).
         """
         ...
 
@@ -343,119 +321,33 @@ class Mdf:
         ...
 
 
-class MdfData:
-    r"""
-    A reader bound to an :class:`MdfIndex` and a single data source.
-    
-    Obtained from :py:meth:`MdfIndex.open` / :py:meth:`MdfIndex.open_url`. The
-    source (file path or URL) is given once; afterwards you read channels by
-    **name**:
-    
-    >>> data = idx.open("recording.mf4")
-    >>> speed = data["Speed"]                  # numpy float64 (fast path)
-    >>> status = data.read_raw("Status")       # native values + conversions
-    >>> s = data.series("Speed")               # pandas Series, datetime index
-    """
-    groups: builtins.list[GroupInfo]
-    channel_names: builtins.list[builtins.str]
-    def read(self, name:builtins.str, group:typing.Optional[builtins.str]) -> typing.Any:
-        r"""
-        Read a numeric channel by name as a numpy ``float64`` array (fast path).
-        
-        Invalid / non-decodable samples become ``NaN``. Linear conversions are
-        applied inline; for text / table conversions use :py:meth:`read_raw`.
-        
-        Parameters
-        ----------
-        name : str
-        group : Optional[str]
-            Disambiguate by group when the channel name is not unique.
-        """
-        ...
-
-    def read_raw(self, name:builtins.str, group:typing.Optional[builtins.str]) -> builtins.list[typing.Optional[typing.Any]]:
-        r"""
-        Read a channel by name, returning native Python values + conversions.
-        
-        ``None`` marks invalid samples; valid samples are ``float`` / ``int`` /
-        ``str`` / ``bytes``. Faithful to every conversion type.
-        
-        Parameters
-        ----------
-        name : str
-        group : Optional[str]
-        """
-        ...
-
-    def series(self, name:builtins.str, group:typing.Optional[builtins.str]) -> typing.Any:
-        r"""
-        Read a channel as a ``pandas.Series`` indexed by absolute timestamps.
-        
-        Indexed by the channel's group master converted to a ``DatetimeIndex``
-        (relative seconds added to the index's stored start time). Falls back to
-        a numeric / default index when there is no master or no start time.
-        
-        Parameters
-        ----------
-        name : str
-        group : Optional[str]
-        
-        Raises
-        ------
-        MdfException
-            If the channel is not found or pandas is not installed.
-        """
-        ...
-
-    def __getitem__(self, name:builtins.str) -> typing.Any:
-        r"""
-        ``data["Speed"]`` — shorthand for :py:meth:`read` (numpy float64).
-        """
-        ...
-
-    def byte_ranges(self, name:builtins.str, group:typing.Optional[builtins.str]) -> builtins.list[tuple[builtins.int, builtins.int]]:
-        r"""
-        Byte ranges ``[(offset, length), ...]`` for a channel (escape hatch).
-        """
-        ...
-
-    def group(self, name:builtins.str) -> typing.Optional[GroupInfo]:
-        r"""
-        Find a channel group by name (first match), or ``None``.
-        """
-        ...
-
-    def channel(self, name:builtins.str) -> typing.Optional[ChannelInfo]:
-        r"""
-        Find a channel by name across all groups (first match), or ``None``.
-        """
-        ...
-
-
 class MdfIndex:
     r"""
     Lightweight, self-contained index over an MDF 4 file.
     
     An index records the byte ranges of each channel, fully resolves every
     conversion block, and serialises to JSON. Navigate it by **name**
-    (:py:attr:`groups`, :py:meth:`group`, :py:meth:`channel`); to read sample
-    data, bind a source once with :py:meth:`open` / :py:meth:`open_url`, which
-    return an :class:`MdfData` you index by channel name.
+    (:py:attr:`groups`, :py:meth:`group`, :py:meth:`channel`). It also remembers
+    its data :py:attr:`source` (file path or URL); reading is lazy — the
+    byte-range request happens on :py:meth:`read` / :py:meth:`values`, never at
+    build time.
     
     **Limitation:** compressed (``##DZ``) data blocks are not supported.
     
     Example
     -------
-    >>> idx = mf4_rs.MdfIndex.from_file("recording.mf4")
+    >>> idx = mf4_rs.MdfIndex.from_url("https://host/recording.mf4")  # only metadata fetched
+    >>> speed = idx.read("Speed")            # pandas Series; range request happens now
+    >>> rpm   = idx.values("RPM")            # numpy float64, no timestamp index
     >>> idx.save("recording.idx.json")
     >>> idx = mf4_rs.MdfIndex.load("recording.idx.json")
-    >>> data = idx.open("recording.mf4")     # bind the data source once
-    >>> speed = data["Speed"]                # numpy float64
-    >>> rpm   = data.read("RPM", group="Engine")
+    >>> idx.source = "recording.mf4"         # re-attach a source after load
+    >>> t = idx.read("Speed")
     """
     groups: builtins.list[GroupInfo]
     channel_names: builtins.list[builtins.str]
     file_size: builtins.int
+    source: typing.Optional[builtins.str]
     @staticmethod
     def from_file(path:builtins.str) -> MdfIndex:
         r"""
@@ -523,7 +415,7 @@ class MdfIndex:
         Names of the groups that contain a channel called ``name``.
         
         Use this to disambiguate a channel name shared by several groups, then
-        pass the chosen group to :py:meth:`MdfData.read`.
+        pass the chosen group to :py:meth:`read` / :py:meth:`values`.
         """
         ...
 
@@ -558,19 +450,57 @@ class MdfIndex:
         """
         ...
 
-    def open(self, path:builtins.str) -> MdfData:
+    def set_source_prop(self, value:typing.Optional[builtins.str]) -> None:
+        ...
+
+    def set_source(self, value:typing.Optional[builtins.str]) -> None:
         r"""
-        Bind this index to a local MDF file for reading sample data.
+        Attach (or clear) the data source used by :py:meth:`read` / :py:meth:`values`.
         
-        Returns an :class:`MdfData`; the file path is supplied once here and
-        reused for every subsequent read.
+        A value starting with ``http://`` or ``https://`` is treated as a URL;
+        anything else as a local file path. Pass ``None`` to clear.
         """
         ...
 
-    def open_url(self, url:builtins.str) -> MdfData:
+    def read(self, name:builtins.str, group:typing.Optional[builtins.str]) -> typing.Any:
         r"""
-        Bind this index to an HTTP / S3 URL for reading sample data via range
-        requests. Returns an :class:`MdfData`.
+        Read a channel as a ``pandas.Series`` of values indexed by timestamps.
+        
+        **Lazy:** the byte-range request to the attached source happens now, not
+        when the index was built. Values carry all conversions; the index is the
+        group master converted to a ``DatetimeIndex`` (or raw seconds / default
+        index when there is no start time / master).
+        
+        Parameters
+        ----------
+        name : str
+        group : Optional[str]
+            Disambiguate by group when the channel name is not unique.
+        
+        Raises
+        ------
+        MdfException
+            If no source is attached, the channel is missing, or pandas is absent.
+        """
+        ...
+
+    def values(self, name:builtins.str, group:typing.Optional[builtins.str]) -> typing.Any:
+        r"""
+        Read a numeric channel by name as a plain numpy ``float64`` array.
+        
+        Lazy fast path — just the values, no timestamp index, pandas-free.
+        Invalid / non-numeric samples are ``NaN``.
+        
+        Parameters
+        ----------
+        name : str
+        group : Optional[str]
+        """
+        ...
+
+    def __getitem__(self, name:builtins.str) -> typing.Any:
+        r"""
+        ``index["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).
         """
         ...
 

@@ -182,12 +182,15 @@ The codebase is organized into distinct layers. The module structure is defined 
 - `ByteRangeReader` trait - Abstraction for data sources: `read_range(offset, length) -> Vec<u8>`
 - `FileRangeReader` - Built-in local file implementation
 - Public API is **name-based**; positional `(group_index, channel_index)` reads exist only as `pub(crate)` internals.
+- The index remembers its data `Source` (`File(path)` / `Url(url)`), set by `from_file` / `from_url`. The source is **not** serialized (`#[serde(skip)]`) — re-attach after `load_from_file` with `set_file()` / `set_url()` / `set_source()`. Building an index never reads sample data; byte-range reads happen lazily on `read()`.
 - Key capabilities:
-  - `from_file()` / `from_bytes()` / `from_range_reader()` / `save_to_file()` / `load_from_file()` / `to_json()` / `from_json()` - Create, persist, and reload JSON indexes
+  - `from_file()` / `from_bytes()` / `from_range_reader()` / `from_url()` (http) / `save_to_file()` / `load_from_file()` / `to_json()` / `from_json()` - Create, persist, and reload JSON indexes
   - Metadata navigation: `groups()`, `group(name)`, `channel(name)`, `channel_in(group, name)`, `channel_names()`, `find_channels(name)`; `IndexedChannelGroup::channel(name)` / `channel_names()` / `master_channel()`; `IndexedChannel::is_master()` / `is_vlsd()`
-  - Reading: bind a source once with `open(reader)` / `open_file(path)` → returns an `MdfReader`, then `values(name)` / `values_in(group, name)` / `values_f64(name)` / `values_f64_in(group, name)`; `reader_mut()` / `into_inner()` expose the underlying `ByteRangeReader`
+  - Lazy reads via the attached source: `read(name)` / `read_in(group, name)` return a [`Signal`](src/signal.rs) (values paired with the group master/time axis); `source()` / `set_file()` / `set_url()` / `set_source()` manage the source
+  - Explicit/custom readers: bind with `open(reader)` / `open_file(path)` → returns an `MdfReader` with `values(name)` / `values_in()` / `values_f64()` / `signal(name)` / `signal_in()`; `reader_mut()` / `into_inner()` expose the underlying `ByteRangeReader`
   - Byte ranges (power-user / partial reads): `byte_ranges(name)`, `byte_ranges_in(group, name)`, `byte_ranges_for_records(name, start, count)`
   - Conversions are resolved during index creation, enabling reads with empty `file_data` (`&[]`)
+- `Signal` (`src/signal.rs`) is the Rust equivalent of a pandas `Series`: `{ name, unit, timestamps: Vec<f64>, values: Vec<Option<DecodedValue>> }`, with `values_f64()` / `has_timestamps()`. Produced by `MDF::signal()`, `ChannelGroup::signal()`, `MdfReader::signal()`, and `MdfIndex::read()`.
 
 ### 6. File Operations
 - `cut.rs` - `cut_mdf_by_time(input, output, start_time, end_time)`: Copies only records whose master channel value falls within `[start_time, end_time]`. Identifies master channels by `channel_type == 2 && sync_type == 1`.
@@ -206,11 +209,11 @@ The codebase is organized into distinct layers. The module structure is defined 
 - Built only when `pyo3` feature is enabled (configured in `pyproject.toml` via `[tool.maturin] features = ["pyo3"]`)
 - Uses PyO3 0.21 with extension-module feature
 - The Python-visible names drop the `Py` prefix (set via `#[pyclass(name = "…")]`); the Rust struct names keep the `Py` prefix internally. **All navigation is by name — there are no `(group_index, channel_index)` arguments in the Python API.**
+- **`read(name, group=None)` returns a `pandas.Series`** (channel values, conversions applied, indexed by the group master converted to a `DatetimeIndex`). **`values(name, group=None)` returns a plain numpy `float64` array** (no timestamps, pandas-free). `__getitem__` is `read`.
 - Main classes:
-  - `Mdf` (struct `PyMDF`) - Wraps `MDF`; `groups` property (each `GroupInfo` carries its `channels`), `group(name)`, `channel(name)`, `channel_names`; reads: `read(name, group=None)` → numpy f64, `read_raw(name, group=None)` → list with conversions, `series(name, group=None)` → pandas Series, `__getitem__` (= `read`), `file_layout()`
+  - `Mdf` (struct `PyMDF`) - Wraps `MDF`; `groups` property (each `GroupInfo` carries its `channels`), `group(name)`, `channel(name)`, `channel_names`; reads: `read()` → Series, `values()` → numpy, `__getitem__`, `file_layout()`
   - `MdfWriter` (struct `PyMdfWriter`) - Wraps `MdfWriter`; manages ID mapping between Python and Rust IDs; provides `add_time_channel()`, `add_float_channel()`, `add_int_channel()` convenience methods (writer API unchanged in the redesign)
-  - `MdfIndex` (struct `PyMdfIndex`) - Wraps `MdfIndex`; `from_file()` / `load()` / `from_url()` / `save()`; navigation (`groups`, `group`, `channel`, `channel_names`, `groups_with_channel`); `byte_ranges()` / `byte_ranges_for_records()`; `conversion_info(name)`; **`open(path)` / `open_url(url)` return an `MdfData`** (bind the source once)
-  - `MdfData` (struct `PyMdfData`) - A reader bound to an index + one source. `read(name, group=None)` → numpy f64, `read_raw(...)` → list + conversions, `series(...)`, `__getitem__`, `byte_ranges(...)`, plus navigation delegations
+  - `MdfIndex` (struct `PyMdfIndex`) - Wraps `MdfIndex`; `from_file()` / `load()` / `from_url()` / `save()`; navigation (`groups`, `group`, `channel`, `channel_names`, `groups_with_channel`); **carries its data `source`** (settable `source` property, autodetecting `http(s)://` URLs vs file paths, plus `set_source()`); **lazy** `read()` → Series and `values()` → numpy (range request happens on read, GIL released); `byte_ranges()` / `byte_ranges_for_records()`; `conversion_info(name)`. (There is no separate `MdfData` class — the index *is* the bound reader.)
   - `ChannelInfo`, `GroupInfo`, `DecodedValue`, `DataType`, `FileLayout`/`BlockInfo`/`LinkInfo`/`GapInfo` - Data transfer / inspection types
 - Helper functions: `create_float_value()`, `create_uint_value()`, `create_int_value()`, `create_string_value()`, `create_data_type_*()` factory functions
 - Custom `MdfException` Python exception type
@@ -446,9 +449,9 @@ This section documents tested interoperability and differences between `mf4-rs` 
 
 | Class | mf4-rs | asammdf |
 |-------|--------|---------|
-| Reader | `Mdf` - name-based (`groups`, `group`, `channel`, `read`, `read_raw`, `series`, `__getitem__`) | `MDF` - 58+ methods |
+| Reader | `Mdf` - name-based (`groups`, `group`, `channel`, `read`→Series, `values`→numpy, `__getitem__`) | `MDF` - 58+ methods |
 | Writer | `MdfWriter` - 11 methods | `MDF.append()` + `Signal` (numpy-based) |
-| Index | `MdfIndex` + `MdfData` - name-based (bind source once via `open`/`open_url`) | No equivalent |
+| Index | `MdfIndex` - name-based, source-aware (`from_url`/`source`), lazy `read`→Series / `values`→numpy | No equivalent |
 
 ### Performance (100K records, 4 x f64 channels)
 

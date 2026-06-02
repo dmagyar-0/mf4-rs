@@ -160,7 +160,7 @@ def test_mf4rs_reads_asammdf_basic():
         groups = mdf.groups
         assert len(groups) >= 1, f"expected >=1 groups, got {len(groups)}"
 
-        temp_vals = mdf.read("Temperature")
+        temp_vals = mdf.values("Temperature")
         assert temp_vals is not None, "Temperature channel not found"
         assert len(temp_vals) == 100, f"expected 100 values, got {len(temp_vals)}"
         assert abs(temp_vals[0] - 20.0) < 0.001, f"first temp should be 20.0, got {temp_vals[0]}"
@@ -175,8 +175,8 @@ def test_cross_read_values_match():
     try:
         # Read with mf4-rs (returns numpy arrays)
         rs_mdf = mf4_rs.Mdf(path)
-        rs_temp = rs_mdf.read("Temperature")
-        rs_count = rs_mdf.read("Counter")
+        rs_temp = rs_mdf.values("Temperature")
+        rs_count = rs_mdf.values("Counter")
 
         # Read with asammdf
         a_mdf = AsamMDF(path)
@@ -219,7 +219,7 @@ def test_all_integer_types_roundtrip():
             mdf.close()
 
             rs_mdf = mf4_rs.Mdf(path)
-            rs_vals = rs_mdf.read(name)
+            rs_vals = rs_mdf.values(name)
             assert len(rs_vals) == len(values), f"{name}: expected {len(values)}, got {len(rs_vals)}"
             for orig, read in zip(values, rs_vals):
                 # Values are returned as float64, which has 53 bits of precision.
@@ -251,7 +251,7 @@ def test_float_types_roundtrip():
             mdf.close()
 
             rs_mdf = mf4_rs.Mdf(path)
-            rs_vals = rs_mdf.read(name)
+            rs_vals = rs_mdf.values(name)
             assert len(rs_vals) == len(values), f"{name}: expected {len(values)}, got {len(rs_vals)}"
             for orig, read in zip(values, rs_vals):
                 tol = 1e-2 if name == "float32" else 1e-10
@@ -349,7 +349,7 @@ def test_compressed_file_fails_gracefully():
 
         try:
             rs_mdf = mf4_rs.Mdf(path)
-            _ = rs_mdf.read("data")
+            _ = rs_mdf.values("data")
             # If we get here without error, compression support was added
             print("    (NOTE: ##DZ reading now works - update comparison docs)")
         except Exception as e:
@@ -549,7 +549,7 @@ def test_cut_asammdf_vlsd_string():
         # Python binding's f64 fast path can't return strings — strings round
         # through native Rust APIs and through asammdf below.)
         cut_mdf = mf4_rs.Mdf(out)
-        ctrs = cut_mdf.read("Counter")
+        ctrs = cut_mdf.values("Counter")
         assert ctrs is not None, "Counter not found in cut file"
         assert [int(c) for c in ctrs] == [20, 30, 40, 50, 60], list(ctrs)
 
@@ -578,7 +578,7 @@ def test_performance_read():
         for _ in range(10):
             mdf = mf4_rs.Mdf(path)
             for name in ["Time", "Temperature", "Counter"]:
-                mdf.read(name)
+                mdf.values(name)
         elapsed = time.time() - start
         assert elapsed < 10, f"10x read took {elapsed:.1f}s - performance regression"
         print(f"    (10x read in {elapsed:.3f}s)")

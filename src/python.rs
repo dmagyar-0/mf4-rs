@@ -17,9 +17,7 @@ use std::collections::HashMap;
 
 use crate::api::mdf::MDF;
 use crate::writer::{MdfWriter, ColumnData};
-use crate::index::{
-    CachingRangeReader, FileRangeReader, HttpRangeReader, IndexedChannel, MdfIndex,
-};
+use crate::index::{IndexedChannel, MdfIndex};
 use crate::blocks::common::DataType;
 use crate::parsing::decoder::DecodedValue;
 use crate::error::MdfError;
@@ -416,110 +414,59 @@ fn check_pandas_available(py: Python) -> PyResult<PyObject> {
         ))
 }
 
-/// Helper function to find the master/time channel in a channel group
-/// Returns None if no master channel is found
-fn find_master_channel<'a>(channels: &Vec<crate::api::channel::Channel<'a>>) -> Option<usize> {
-    for (idx, channel) in channels.iter().enumerate() {
-        let block = channel.block();
-        // Master channels have channel_type == 2
-        if block.channel_type == 2 {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-/// Helper function to find the master/time channel in indexed channels
-/// Returns None if no master channel is found
-fn find_master_channel_indexed(channels: &Vec<IndexedChannel>) -> Option<usize> {
-    for (idx, channel) in channels.iter().enumerate() {
-        // Master channels have channel_type == 2
-        if channel.channel_type == 2 {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-/// Helper function to create a pandas DatetimeIndex from relative time values
+/// Build a ``pandas.Series`` from a decoded [`Signal`].
 ///
-/// # Arguments
-/// * `py` - Python GIL token
-/// * `pd` - pandas module PyObject
-/// * `relative_times` - Vector of relative time values (in seconds) as PyObjects
-/// * `start_ns` - Start time in nanoseconds since epoch
-///
-/// # Returns
-/// PyObject representing a pandas DatetimeIndex, or an error if conversion fails
-///
-/// # Error Handling
-/// This function handles multiple edge cases:
-/// - None values in master channel (converted to NaT - Not a Time)
-/// - Integer time values (i64, u64) in addition to float values
-/// - Negative time values that would create timestamps before epoch
-/// - Overflow/underflow when adding large time deltas
-fn create_datetime_index(
+/// `values` becomes the data; `timestamps` (master values in seconds) becomes
+/// the index. With a `start_time_ns` the index is a ``DatetimeIndex`` (relative
+/// seconds added to the file start); otherwise the raw seconds are used. When
+/// `timestamps` is empty (no master, or the channel *is* the master) a default
+/// integer index is used. The series ``name`` is set to the channel name.
+fn signal_to_series(
     py: Python,
     pd: &PyObject,
-    relative_times: &[PyObject],
-    start_ns: u64,
+    name: &str,
+    timestamps: &[f64],
+    values: Vec<Option<DecodedValue>>,
+    start_time_ns: Option<u64>,
 ) -> PyResult<PyObject> {
-    // Convert start time from nanoseconds to a pandas Timestamp
-    let to_datetime = pd.getattr(py, "to_datetime")?;
-    let start_timestamp = to_datetime.call(
-        py,
-        (start_ns,),
-        Some([("unit", "ns")].into_py_dict(py))
-    )?;
+    let py_values: Vec<PyObject> = values
+        .into_iter()
+        .map(|o| o.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None()))
+        .collect();
 
-    // Create a Timedelta for each relative time and add to start time
-    let timedelta_class = pd.getattr(py, "Timedelta")?;
-    let nat = pd.getattr(py, "NaT")?;  // Not-a-Time for None values
-    let mut absolute_times = Vec::with_capacity(relative_times.len());
-
-    for rel_time in relative_times {
-        // Handle None values (invalid samples) - convert to NaT
-        if rel_time.is_none(py) {
-            absolute_times.push(nat.clone());
-            continue;
-        }
-
-        // Try to extract the time value as f64, then i64, then u64
-        // Master channels can be float or integer type
-        let seconds: f64 = if let Ok(f) = rel_time.extract::<f64>(py) {
-            f
-        } else if let Ok(i) = rel_time.extract::<i64>(py) {
-            i as f64
-        } else if let Ok(u) = rel_time.extract::<u64>(py) {
-            u as f64
+    let index: PyObject = if timestamps.is_empty() {
+        py.None()
+    } else {
+        let py_ts = PyArray1::from_vec_bound(py, timestamps.to_vec());
+        if let Some(start_ns) = start_time_ns {
+            // Vectorized: start_timestamp + to_timedelta(seconds).
+            let to_datetime = pd.getattr(py, "to_datetime")?;
+            let to_timedelta = pd.getattr(py, "to_timedelta")?;
+            let start_ts = to_datetime.call(
+                py, (start_ns,),
+                Some([("unit", "ns")].into_py_dict(py)),
+            )?;
+            let deltas = to_timedelta.call(
+                py, (py_ts.clone(),),
+                Some([("unit", "s")].into_py_dict(py)),
+            )?;
+            match deltas.call_method1(py, "__add__", (start_ts,)) {
+                Ok(dt_index) => dt_index,
+                Err(_) => py_ts.into(),
+            }
         } else {
-            // If we can't extract as any numeric type, use NaT
-            absolute_times.push(nat.clone());
-            continue;
-        };
+            py_ts.into()
+        }
+    };
 
-        // Check for edge cases that might cause overflow or invalid timestamps
-        // pandas datetime64[ns] has range: 1678-2262 (approximately)
-        // If start_ns + seconds would overflow, pandas will raise an OutOfBoundsDatetime error
-        // We'll let pandas handle this and propagate the error up
-
-        // Create a Timedelta in seconds and add to start time
-        // This can fail if the resulting timestamp is out of pandas' valid range
-        let delta = timedelta_class.call(
-            py,
-            (seconds,),
-            Some([("unit", "s")].into_py_dict(py))
-        )?;
-
-        let absolute_time = start_timestamp.call_method1(py, "__add__", (delta,))?;
-        absolute_times.push(absolute_time);
-    }
-
-    // Create DatetimeIndex from the list of timestamps
-    let datetime_index_class = pd.getattr(py, "DatetimeIndex")?;
-    let datetime_index = datetime_index_class.call1(py, (absolute_times,))?;
-
-    Ok(datetime_index)
+    let series_class = pd.getattr(py, "Series")?;
+    let series = if index.is_none(py) {
+        series_class.call1(py, (py_values,))?
+    } else {
+        series_class.call(py, (py_values,), Some([("index", index)].into_py_dict(py)))?
+    };
+    series.setattr(py, "name", name)?;
+    Ok(series)
 }
 
 /// Read-only handle to an MDF 4 file, backed by a memory-mapped buffer.
@@ -642,12 +589,13 @@ impl PyMDF {
         Ok(names)
     }
 
-    /// Read a numeric channel by name as a numpy ``float64`` array.
+    /// Read a channel as a ``pandas.Series`` of values indexed by timestamps.
     ///
-    /// This is the fast path: values are decoded directly into a numpy buffer,
-    /// invalid / non-decodable samples become ``NaN``. It does **not** apply
-    /// non-linear conversions — use :py:meth:`read_raw` for text / table /
-    /// value-to-text channels.
+    /// This is the primary read: the channel's samples (with all conversions
+    /// applied) are the data, and the group's master/time channel is the index
+    /// — a ``DatetimeIndex`` when the file has a start time, otherwise the raw
+    /// master seconds. If there is no master, or the requested channel *is* the
+    /// master, a default integer index is used.
     ///
     /// Parameters
     /// ----------
@@ -660,101 +608,45 @@ impl PyMDF {
     /// Raises
     /// ------
     /// MdfException
-    ///     If no matching channel exists.
-    fn read<'py>(&self, py: Python<'py>, name: &str, group: Option<&str>) -> PyResult<PyObject> {
+    ///     If no matching channel exists or pandas is not installed.
+    fn read(&self, py: Python, name: &str, group: Option<&str>) -> PyResult<PyObject> {
+        let pd = check_pandas_available(py)?;
+        let start_time_ns = self.mdf.start_time_ns();
+        let signal = match group {
+            Some(gn) => self
+                .mdf
+                .group(gn)
+                .ok_or_else(|| MdfException::new_err(format!("Channel group '{}' not found", gn)))?
+                .signal(name)?,
+            None => self.mdf.signal(name)?,
+        };
+        let signal = signal.ok_or_else(|| {
+            MdfException::new_err(match group {
+                Some(gn) => format!("Channel '{}' not found in group '{}'", name, gn),
+                None => format!("Channel '{}' not found", name),
+            })
+        })?;
+        signal_to_series(py, &pd, &signal.name, &signal.timestamps, signal.values, start_time_ns)
+    }
+
+    /// Read a numeric channel by name as a plain numpy ``float64`` array.
+    ///
+    /// The fast, pandas-free path — just the values, no timestamp index.
+    /// Invalid / non-numeric samples are ``NaN``. Use :py:meth:`read` when you
+    /// want the timestamp-indexed Series and faithful (text / table) conversions.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    /// group : Optional[str]
+    fn values<'py>(&self, py: Python<'py>, name: &str, group: Option<&str>) -> PyResult<PyObject> {
         let (g, idx) = self.find_group_channel(group, name)?;
         let values = g.channels()[idx].values_as_f64()?;
         Ok(PyArray1::from_vec_bound(py, values).into())
     }
 
-    /// Read a channel by name, returning native Python values with conversions.
-    ///
-    /// Slower than :py:meth:`read` but faithful to every conversion type
-    /// (linear, rational, table, value-to-text, …). ``None`` entries mark
-    /// invalid samples; valid samples are ``float`` / ``int`` / ``str`` /
-    /// ``bytes`` matching the channel.
-    ///
-    /// Parameters
-    /// ----------
-    /// name : str
-    /// group : Optional[str]
-    fn read_raw(&self, py: Python, name: &str, group: Option<&str>) -> PyResult<Vec<Option<PyObject>>> {
-        let (g, idx) = self.find_group_channel(group, name)?;
-        let values = g.channels()[idx].values()?;
-        Ok(values
-            .into_iter()
-            .map(|opt| opt.map(|dv| decoded_value_to_pyobject(dv, py)))
-            .collect())
-    }
-
-    /// Read a channel as a ``pandas.Series`` indexed by absolute timestamps.
-    ///
-    /// The series is indexed by the channel's group master (channel-type 2)
-    /// converted to a ``DatetimeIndex`` (relative seconds added to the file's
-    /// ``HD.abs_time``). If there is no master, or the requested channel *is*
-    /// the master, a default integer index is used; if the file has no start
-    /// time, master values are kept as a numeric index.
-    ///
-    /// Parameters
-    /// ----------
-    /// name : str
-    /// group : Optional[str]
-    ///
-    /// Raises
-    /// ------
-    /// MdfException
-    ///     If the channel is not found or pandas is not installed.
-    fn series(&self, py: Python, name: &str, group: Option<&str>) -> PyResult<PyObject> {
-        let pd = check_pandas_available(py)?;
-        let start_time_ns = self.mdf.start_time_ns();
-        let (g, ch_idx) = self.find_group_channel(group, name)?;
-        let channels = g.channels();
-
-        let values = channels[ch_idx].values_as_f64()?;
-        let py_values = PyArray1::from_vec_bound(py, values);
-
-        let index: PyObject = if let Some(master_idx) = find_master_channel(&channels) {
-            if master_idx != ch_idx {
-                let master_values = channels[master_idx].values_as_f64()?;
-                let py_master = PyArray1::from_vec_bound(py, master_values);
-
-                if let Some(start_ns) = start_time_ns {
-                    let to_datetime = pd.getattr(py, "to_datetime")?;
-                    let to_timedelta = pd.getattr(py, "to_timedelta")?;
-                    let start_ts = to_datetime.call(
-                        py, (start_ns,),
-                        Some([("unit", "ns")].into_py_dict(py))
-                    )?;
-                    let deltas = to_timedelta.call(
-                        py, (py_master.clone(),),
-                        Some([("unit", "s")].into_py_dict(py))
-                    )?;
-                    match deltas.call_method1(py, "__add__", (start_ts,)) {
-                        Ok(datetime_index) => datetime_index,
-                        Err(_) => py_master.into(),
-                    }
-                } else {
-                    py_master.into()
-                }
-            } else {
-                py.None()
-            }
-        } else {
-            py.None()
-        };
-
-        let series_class = pd.getattr(py, "Series")?;
-        let series = if index.is_none(py) {
-            series_class.call1(py, (py_values,))?
-        } else {
-            series_class.call(py, (py_values,), Some([("index", index)].into_py_dict(py)))?
-        };
-        series.setattr(py, "name", name)?;
-        Ok(series)
-    }
-
-    /// ``mdf["Speed"]`` — shorthand for :py:meth:`read` (numpy float64).
-    fn __getitem__<'py>(&self, py: Python<'py>, name: &str) -> PyResult<PyObject> {
+    /// ``mdf["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).
+    fn __getitem__(&self, py: Python, name: &str) -> PyResult<PyObject> {
         self.read(py, name, None)
     }
 
@@ -1230,20 +1122,22 @@ impl PyMdfWriter {
 ///
 /// An index records the byte ranges of each channel, fully resolves every
 /// conversion block, and serialises to JSON. Navigate it by **name**
-/// (:py:attr:`groups`, :py:meth:`group`, :py:meth:`channel`); to read sample
-/// data, bind a source once with :py:meth:`open` / :py:meth:`open_url`, which
-/// return an :class:`MdfData` you index by channel name.
+/// (:py:attr:`groups`, :py:meth:`group`, :py:meth:`channel`). It also remembers
+/// its data :py:attr:`source` (file path or URL); reading is lazy — the
+/// byte-range request happens on :py:meth:`read` / :py:meth:`values`, never at
+/// build time.
 ///
 /// **Limitation:** compressed (``##DZ``) data blocks are not supported.
 ///
 /// Example
 /// -------
-/// >>> idx = mf4_rs.MdfIndex.from_file("recording.mf4")
+/// >>> idx = mf4_rs.MdfIndex.from_url("https://host/recording.mf4")  # only metadata fetched
+/// >>> speed = idx.read("Speed")            # pandas Series; range request happens now
+/// >>> rpm   = idx.values("RPM")            # numpy float64, no timestamp index
 /// >>> idx.save("recording.idx.json")
 /// >>> idx = mf4_rs.MdfIndex.load("recording.idx.json")
-/// >>> data = idx.open("recording.mf4")     # bind the data source once
-/// >>> speed = data["Speed"]                # numpy float64
-/// >>> rpm   = data.read("RPM", group="Engine")
+/// >>> idx.source = "recording.mf4"         # re-attach a source after load
+/// >>> t = idx.read("Speed")
 #[gen_stub_pyclass]
 #[pyclass(name = "MdfIndex")]
 pub struct PyMdfIndex {
@@ -1293,11 +1187,10 @@ impl PyMdfIndex {
     fn from_url(py: Python, url: &str, chunk_size: Option<u64>) -> PyResult<Self> {
         let url = url.to_string();
         let chunk = chunk_size.unwrap_or(1 << 20);
+        // The URL is remembered as the index's source; only metadata is fetched
+        // here — sample data is range-requested lazily on `read` / `values`.
         let index = py.allow_threads(move || -> Result<MdfIndex, MdfError> {
-            let mut http = HttpRangeReader::new(&url)?;
-            let file_size = http.probe_size()?;
-            let mut cached = CachingRangeReader::with_chunk_size(http, chunk);
-            MdfIndex::from_range_reader(&mut cached, file_size)
+            MdfIndex::from_url_with_chunk_size(&url, chunk)
         })?;
         Ok(PyMdfIndex { index })
     }
@@ -1336,7 +1229,7 @@ impl PyMdfIndex {
     /// Names of the groups that contain a channel called ``name``.
     ///
     /// Use this to disambiguate a channel name shared by several groups, then
-    /// pass the chosen group to :py:meth:`MdfData.read`.
+    /// pass the chosen group to :py:meth:`read` / :py:meth:`values`.
     fn groups_with_channel(&self, name: &str) -> Vec<String> {
         self.index
             .find_channels(name)
@@ -1414,234 +1307,107 @@ impl PyMdfIndex {
         self.index.file_size
     }
 
-    /// Bind this index to a local MDF file for reading sample data.
+    /// The data source attached to this index (file path or URL), or ``None``.
     ///
-    /// Returns an :class:`MdfData`; the file path is supplied once here and
-    /// reused for every subsequent read.
-    fn open(&self, path: &str) -> PyMdfData {
-        PyMdfData { index: self.index.clone(), source: DataSource::File(path.to_string()) }
+    /// Set automatically by :py:meth:`from_file` / :py:meth:`from_url`. After
+    /// :py:meth:`load` re-attach one by assigning this property (or calling
+    /// :py:meth:`set_source`). Building the index never reads sample data; the
+    /// source is only range-requested when you call :py:meth:`read` / :py:meth:`values`.
+    #[getter]
+    fn source(&self) -> Option<String> {
+        source_to_string(self.index.source())
     }
 
-    /// Bind this index to an HTTP / S3 URL for reading sample data via range
-    /// requests. Returns an :class:`MdfData`.
-    fn open_url(&self, url: &str) -> PyMdfData {
-        PyMdfData { index: self.index.clone(), source: DataSource::Url(url.to_string()) }
-    }
-}
-
-/// Where an :class:`MdfData` reads its bytes from.
-enum DataSource {
-    File(String),
-    Url(String),
-}
-
-/// A reader bound to an :class:`MdfIndex` and a single data source.
-///
-/// Obtained from :py:meth:`MdfIndex.open` / :py:meth:`MdfIndex.open_url`. The
-/// source (file path or URL) is given once; afterwards you read channels by
-/// **name**:
-///
-/// >>> data = idx.open("recording.mf4")
-/// >>> speed = data["Speed"]                  # numpy float64 (fast path)
-/// >>> status = data.read_raw("Status")       # native values + conversions
-/// >>> s = data.series("Speed")               # pandas Series, datetime index
-#[gen_stub_pyclass]
-#[pyclass(name = "MdfData")]
-pub struct PyMdfData {
-    index: MdfIndex,
-    source: DataSource,
-}
-
-impl PyMdfData {
-    /// Resolve an (optional group, name) pair to indices.
-    fn locate(&self, group: Option<&str>, name: &str) -> PyResult<(usize, usize)> {
-        match group {
-            Some(g) => self.index.locate_in(g, name).ok_or_else(|| {
-                MdfException::new_err(format!("Channel '{}' not found in group '{}'", name, g))
-            }),
-            None => self.index.locate(name).ok_or_else(|| {
-                MdfException::new_err(format!("Channel '{}' not found", name))
-            }),
-        }
+    #[setter(source)]
+    fn set_source_prop(&mut self, value: Option<&str>) {
+        self.apply_source(value);
     }
 
-    /// Read decoded values (with conversions) for a resolved channel index.
-    fn read_decoded(
-        &self,
-        py: Python,
-        g: usize,
-        c: usize,
-    ) -> PyResult<Vec<Option<DecodedValue>>> {
-        Ok(match &self.source {
-            DataSource::File(path) => {
-                let mut reader = FileRangeReader::new(path)?;
-                self.index.read_channel_values(g, c, &mut reader)?
-            }
-            DataSource::Url(url) => {
-                let url = url.clone();
-                py.allow_threads(move || -> Result<_, MdfError> {
-                    let http = HttpRangeReader::new(&url)?;
-                    let mut cached = CachingRangeReader::new(http);
-                    cached.set_bypass(true);
-                    self.index.read_channel_values(g, c, &mut cached)
-                })?
-            }
-        })
-    }
-}
-
-#[gen_stub_pymethods]
-#[pymethods]
-impl PyMdfData {
-    /// Read a numeric channel by name as a numpy ``float64`` array (fast path).
+    /// Attach (or clear) the data source used by :py:meth:`read` / :py:meth:`values`.
     ///
-    /// Invalid / non-decodable samples become ``NaN``. Linear conversions are
-    /// applied inline; for text / table conversions use :py:meth:`read_raw`.
+    /// A value starting with ``http://`` or ``https://`` is treated as a URL;
+    /// anything else as a local file path. Pass ``None`` to clear.
+    fn set_source(&mut self, value: Option<&str>) {
+        self.apply_source(value);
+    }
+
+    /// Read a channel as a ``pandas.Series`` of values indexed by timestamps.
+    ///
+    /// **Lazy:** the byte-range request to the attached source happens now, not
+    /// when the index was built. Values carry all conversions; the index is the
+    /// group master converted to a ``DatetimeIndex`` (or raw seconds / default
+    /// index when there is no start time / master).
     ///
     /// Parameters
     /// ----------
     /// name : str
     /// group : Optional[str]
     ///     Disambiguate by group when the channel name is not unique.
-    fn read<'py>(&self, py: Python<'py>, name: &str, group: Option<&str>) -> PyResult<PyObject> {
-        let (g, c) = self.locate(group, name)?;
-        let values = match &self.source {
-            DataSource::File(path) => {
-                let file = std::fs::File::open(path).map_err(MdfError::IOError)?;
-                let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(MdfError::IOError)?;
-                self.index.read_channel_values_from_slice_as_f64(g, c, &mmap)?
-            }
-            DataSource::Url(url) => {
-                let url = url.clone();
-                py.allow_threads(move || -> Result<Vec<f64>, MdfError> {
-                    let http = HttpRangeReader::new(&url)?;
-                    let mut cached = CachingRangeReader::new(http);
-                    cached.set_bypass(true);
-                    self.index.read_channel_values_as_f64(g, c, &mut cached)
-                })?
-            }
-        };
-        Ok(PyArray1::from_vec_bound(py, values).into())
-    }
-
-    /// Read a channel by name, returning native Python values + conversions.
-    ///
-    /// ``None`` marks invalid samples; valid samples are ``float`` / ``int`` /
-    /// ``str`` / ``bytes``. Faithful to every conversion type.
-    ///
-    /// Parameters
-    /// ----------
-    /// name : str
-    /// group : Optional[str]
-    fn read_raw(&self, py: Python, name: &str, group: Option<&str>) -> PyResult<Vec<Option<PyObject>>> {
-        let (g, c) = self.locate(group, name)?;
-        let values = self.read_decoded(py, g, c)?;
-        Ok(values
-            .into_iter()
-            .map(|opt| opt.map(|dv| decoded_value_to_pyobject(dv, py)))
-            .collect())
-    }
-
-    /// Read a channel as a ``pandas.Series`` indexed by absolute timestamps.
-    ///
-    /// Indexed by the channel's group master converted to a ``DatetimeIndex``
-    /// (relative seconds added to the index's stored start time). Falls back to
-    /// a numeric / default index when there is no master or no start time.
-    ///
-    /// Parameters
-    /// ----------
-    /// name : str
-    /// group : Optional[str]
     ///
     /// Raises
     /// ------
     /// MdfException
-    ///     If the channel is not found or pandas is not installed.
-    fn series(&self, py: Python, name: &str, group: Option<&str>) -> PyResult<PyObject> {
+    ///     If no source is attached, the channel is missing, or pandas is absent.
+    fn read(&self, py: Python, name: &str, group: Option<&str>) -> PyResult<PyObject> {
         let pd = check_pandas_available(py)?;
-        let start_time_ns = self.index.start_time_ns;
-        let (g, c) = self.locate(group, name)?;
-
-        let values = self.read_decoded(py, g, c)?;
-        let py_values: Vec<PyObject> = values
-            .into_iter()
-            .map(|o| o.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None()))
-            .collect();
-
-        let group_ref = &self.index.groups()[g];
-        let index_obj: PyObject = if let Some(master_idx) = find_master_channel_indexed(&group_ref.channels) {
-            if master_idx != c {
-                let master_vals = self.read_decoded(py, g, master_idx)?;
-                let py_master: Vec<PyObject> = master_vals
-                    .into_iter()
-                    .map(|o| o.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None()))
-                    .collect();
-
-                if py_master.len() != py_values.len() {
-                    return Err(MdfException::new_err(format!(
-                        "Master channel length ({}) does not match data channel length ({}) for channel '{}'",
-                        py_master.len(), py_values.len(), name
-                    )));
-                }
-
-                if let Some(start_ns) = start_time_ns {
-                    match create_datetime_index(py, &pd, &py_master, start_ns) {
-                        Ok(di) => di,
-                        Err(_) => py_master.to_object(py),
-                    }
-                } else {
-                    py_master.to_object(py)
-                }
-            } else {
-                py.None()
-            }
-        } else {
-            py.None()
-        };
-
-        let series_class = pd.getattr(py, "Series")?;
-        let series = if index_obj.is_none(py) {
-            series_class.call1(py, (py_values,))?
-        } else {
-            series_class.call(py, (py_values,), Some([("index", index_obj)].into_py_dict(py)))?
-        };
-        series.setattr(py, "name", name)?;
-        Ok(series)
+        // Release the GIL during the (potentially blocking, e.g. HTTP) read.
+        let signal = py.allow_threads(|| match group {
+            Some(g) => self.index.read_in(g, name),
+            None => self.index.read(name),
+        })?;
+        signal_to_series(
+            py, &pd, &signal.name, &signal.timestamps, signal.values, self.index.start_time_ns,
+        )
     }
 
-    /// ``data["Speed"]`` — shorthand for :py:meth:`read` (numpy float64).
-    fn __getitem__<'py>(&self, py: Python<'py>, name: &str) -> PyResult<PyObject> {
+    /// Read a numeric channel by name as a plain numpy ``float64`` array.
+    ///
+    /// Lazy fast path — just the values, no timestamp index, pandas-free.
+    /// Invalid / non-numeric samples are ``NaN``.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    /// group : Optional[str]
+    fn values<'py>(&self, py: Python<'py>, name: &str, group: Option<&str>) -> PyResult<PyObject> {
+        let (g, c) = match group {
+            Some(gn) => self.index.locate_in(gn, name).ok_or_else(|| {
+                MdfException::new_err(format!("Channel '{}' not found in group '{}'", name, gn))
+            })?,
+            None => self.index.locate(name).ok_or_else(|| {
+                MdfException::new_err(format!("Channel '{}' not found", name))
+            })?,
+        };
+        // Release the GIL during the (potentially blocking, e.g. HTTP) read.
+        let values = py.allow_threads(|| self.index.read_values_f64_via_source(g, c))?;
+        Ok(PyArray1::from_vec_bound(py, values).into())
+    }
+
+    /// ``index["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).
+    fn __getitem__(&self, py: Python, name: &str) -> PyResult<PyObject> {
         self.read(py, name, None)
     }
+}
 
-    /// Byte ranges ``[(offset, length), ...]`` for a channel (escape hatch).
-    fn byte_ranges(&self, name: &str, group: Option<&str>) -> PyResult<Vec<(u64, u64)>> {
-        Ok(match group {
-            Some(g) => self.index.byte_ranges_in(g, name)?,
-            None => self.index.byte_ranges(name)?,
-        })
+impl PyMdfIndex {
+    /// Apply a string source, auto-detecting URL vs file path.
+    fn apply_source(&mut self, value: Option<&str>) {
+        match value {
+            None => self.index.source = None,
+            Some(v) if v.starts_with("http://") || v.starts_with("https://") => {
+                self.index.set_url(v);
+            }
+            Some(v) => self.index.set_file(v),
+        }
     }
+}
 
-    /// Metadata for every channel group (delegates to the bound index).
-    #[getter]
-    fn groups(&self) -> Vec<PyChannelGroupInfo> {
-        self.index.groups().iter().map(PyChannelGroupInfo::from_indexed).collect()
-    }
-
-    /// Find a channel group by name (first match), or ``None``.
-    fn group(&self, name: &str) -> Option<PyChannelGroupInfo> {
-        self.index.group(name).map(PyChannelGroupInfo::from_indexed)
-    }
-
-    /// Find a channel by name across all groups (first match), or ``None``.
-    fn channel(&self, name: &str) -> Option<PyChannelInfo> {
-        self.index.channel(name).map(PyChannelInfo::from_indexed)
-    }
-
-    /// Names of every named channel across all groups (duplicates kept).
-    #[getter]
-    fn channel_names(&self) -> Vec<String> {
-        self.index.channel_names().into_iter().map(String::from).collect()
+/// Render an index [`Source`](crate::index::Source) as a display string.
+fn source_to_string(source: Option<&crate::index::Source>) -> Option<String> {
+    match source {
+        Some(crate::index::Source::File(p)) => Some(p.clone()),
+        Some(crate::index::Source::Url(u)) => Some(u.clone()),
+        None => None,
     }
 }
 
@@ -2136,7 +1902,6 @@ pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMDF>()?;
     m.add_class::<PyMdfWriter>()?;
     m.add_class::<PyMdfIndex>()?;
-    m.add_class::<PyMdfData>()?;
     m.add_class::<PyChannelGroupInfo>()?;
     m.add_class::<PyChannelInfo>()?;
     m.add_class::<PyDecodedValue>()?;

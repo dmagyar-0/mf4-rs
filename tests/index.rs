@@ -478,6 +478,73 @@ fn test_multiple_channels_same_name() -> Result<(), MdfError> {
 }
 
 #[test]
+fn test_signal_and_lazy_source() -> Result<(), MdfError> {
+    let mdf_path = std::env::temp_dir().join("signal_source_test.mf4");
+    let index_path = std::env::temp_dir().join("signal_source_test.json");
+    let _ = fs::remove_file(&mdf_path);
+    let _ = fs::remove_file(&index_path);
+
+    // Master (Time) + one data channel.
+    let mut writer = MdfWriter::new(mdf_path.to_str().unwrap())?;
+    writer.init_mdf_file()?;
+    let cg_id = writer.add_channel_group(None, |_| {})?;
+    let t_id = writer.add_channel(&cg_id, None, |ch| {
+        ch.data_type = DataType::FloatLE;
+        ch.name = Some("Time".to_string());
+        ch.bit_count = 64;
+    })?;
+    writer.set_time_channel(&t_id)?;
+    writer.add_channel(&cg_id, Some(&t_id), |ch| {
+        ch.data_type = DataType::FloatLE;
+        ch.name = Some("Speed".to_string());
+        ch.bit_count = 64;
+    })?;
+    writer.start_data_block_for_cg(&cg_id, 0)?;
+    for i in 0..10 {
+        writer.write_record(&cg_id, &[
+            DecodedValue::Float(i as f64 * 0.1),
+            DecodedValue::Float(i as f64 * 2.0),
+        ])?;
+    }
+    writer.finish_data_block(&cg_id)?;
+    writer.finalize()?;
+
+    // from_file remembers the source; read() is lazy and pairs values with the
+    // master/time axis.
+    let index = MdfIndex::from_file(mdf_path.to_str().unwrap())?;
+    assert!(index.source().is_some(), "from_file should attach a source");
+
+    let speed = index.read("Speed")?;
+    assert_eq!(speed.name, "Speed");
+    assert_eq!(speed.values.len(), 10);
+    assert_eq!(speed.timestamps.len(), 10, "Speed should carry the Time axis");
+    assert!((speed.timestamps[5] - 0.5).abs() < 1e-9);
+    if let Some(DecodedValue::Float(v)) = speed.values[5] {
+        assert!((v - 10.0).abs() < 1e-9);
+    } else {
+        panic!("expected Float value");
+    }
+
+    // The master channel indexes itself: no separate timestamps.
+    let time = index.read("Time")?;
+    assert_eq!(time.values.len(), 10);
+    assert!(!time.has_timestamps(), "master channel has no separate timestamps");
+
+    // Source is not persisted; re-attach after load, then read lazily.
+    index.save_to_file(index_path.to_str().unwrap())?;
+    let mut loaded = MdfIndex::load_from_file(index_path.to_str().unwrap())?;
+    assert!(loaded.source().is_none(), "source must not be serialized");
+    assert!(loaded.read("Speed").is_err(), "read without a source should error");
+    loaded.set_file(mdf_path.to_str().unwrap());
+    let speed2 = loaded.read("Speed")?;
+    assert_eq!(speed2.values_f64(), speed.values_f64());
+
+    let _ = fs::remove_file(mdf_path);
+    let _ = fs::remove_file(index_path);
+    Ok(())
+}
+
+#[test]
 fn test_channel_group_name_lookup() -> Result<(), MdfError> {
     let mdf_path = std::env::temp_dir().join("group_name_test.mf4");
 

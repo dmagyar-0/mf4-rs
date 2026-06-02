@@ -160,9 +160,11 @@ def main() -> int:
                 assert g.name == f"Group {i}", f"group {i} name = {g.name!r}"
                 assert g.channel_count == CHANNELS_PER_GROUP
 
-            # Bind sources once: a local file and the same file over HTTP.
-            local = idx.open(str(mf4_path))
-            remote = idx.open_url(url)
+            # The index built over HTTP remembers its URL source.
+            assert idx.source == url, f"index source = {idx.source!r}"
+
+            # A second index over the same file on disk, for cross-checking.
+            idx_local = mf4_rs.MdfIndex.from_file(str(mf4_path))
 
             t0 = time.perf_counter()
             targets = [
@@ -173,23 +175,25 @@ def main() -> int:
                 ("Group 4", "ch_4_3"),
             ]
             for gn, cn in targets:
-                vals = local.read_raw(cn, group=gn)
-                vals_url = remote.read_raw(cn)
+                vals = idx_local.values(cn, group=gn)   # local file, lazy
+                vals_url = idx.values(cn)               # URL range request, lazy
                 assert len(vals) == RECORDS, f"{gn}/{cn} local len {len(vals)}"
                 assert len(vals_url) == RECORDS, f"{gn}/{cn} url len {len(vals_url)}"
-                # Spot-check one decoded value matches between local and URL paths.
+                # Spot-check one value matches between local and URL paths.
                 assert vals[10] == vals_url[10], (
                     f"{gn}/{cn}[10] differs: local={vals[10]!r} url={vals_url[10]!r}"
                 )
             print(f"5 channel reads (local + url) in {(time.perf_counter() - t0)*1000:.1f} ms")
 
-            # Round-trip via JSON to confirm the index is self-contained after
-            # being built over HTTP.
+            # Round-trip via JSON: the source is environment-local, so it is not
+            # persisted — re-attach the URL after loading.
             json_path = tmp_path / "fixture.idx.json"
             idx.save(str(json_path))
             idx2 = mf4_rs.MdfIndex.load(str(json_path))
-            vals_a = remote.read_raw("ch_2_4")
-            vals_b = idx2.open_url(url).read_raw("ch_2_4")
+            assert idx2.source is None, "source should not be persisted in JSON"
+            idx2.source = url
+            vals_a = idx.values("ch_2_4").tolist()
+            vals_b = idx2.values("ch_2_4").tolist()
             assert vals_a == vals_b, "JSON round-trip changed decoded values"
             print(f"index json: {json_path.stat().st_size} bytes")
 

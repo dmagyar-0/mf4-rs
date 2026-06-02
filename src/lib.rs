@@ -14,6 +14,7 @@ pub mod cut;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod merge;
 pub mod index;
+pub mod signal;
 pub mod block_layout;
 
 pub mod parsing {
@@ -49,15 +50,16 @@ use pyo3::prelude::*;
 /// Quick tour
 /// ----------
 ///
-/// Read::
+/// Read — ``read`` returns a ``pandas.Series`` (values indexed by the master
+/// time axis); ``values`` returns a plain numpy array::
 ///
 ///     import mf4_rs
 ///     mdf = mf4_rs.Mdf("recording.mf4")
 ///     for g in mdf.groups:
 ///         print(g.name, g.record_count, g.channel_names)
-///     speed = mdf["Speed"]                 # numpy.ndarray[float64]
+///     speed = mdf["Speed"]                 # pandas Series, datetime index
 ///     rpm   = mdf.read("RPM", group="Engine")
-///     s     = mdf.series("Speed")          # pandas Series, datetime index
+///     raw   = mdf.values("Speed")          # numpy.ndarray[float64], no index
 ///
 /// Write::
 ///
@@ -74,14 +76,15 @@ use pyo3::prelude::*;
 ///     w.finish_data_block(cg)
 ///     w.finalize()
 ///
-/// Index (HTTP-friendly random access) — bind the data source once::
+/// Index (HTTP-friendly random access) — the index remembers its source and
+/// reads lazily (range requests happen on ``read``/``values``, not at build)::
 ///
-///     idx = mf4_rs.MdfIndex.from_file("recording.mf4")
+///     idx = mf4_rs.MdfIndex.from_url("https://host/recording.mf4")  # only metadata fetched
+///     speed = idx.read("Speed")            # pandas Series; range request happens now
 ///     idx.save("recording.idx.json")
 ///     idx = mf4_rs.MdfIndex.load("recording.idx.json")
-///     data = idx.open("recording.mf4")     # or idx.open_url("https://…")
-///     speed = data["Speed"]                # numpy.ndarray[float64]
-///     status = data.read_raw("Status")     # native values + conversions
+///     idx.source = "recording.mf4"         # re-attach a source after load
+///     raw = idx.values("Speed")            # numpy, lazy
 ///
 /// Other utilities: :func:`merge_files`, :func:`cut_mdf_by_time`,
 /// :func:`cut_mdf_by_utc`, and the :class:`FileLayout` block-layout

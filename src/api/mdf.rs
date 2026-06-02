@@ -74,6 +74,19 @@ impl MDF {
         None
     }
 
+    /// Read a channel by name as a [`Signal`] (values paired with the master
+    /// time axis of the channel's group). First match across all groups.
+    ///
+    /// Returns `Ok(None)` if no channel with that name exists.
+    pub fn signal(&self, name: &str) -> Result<Option<crate::signal::Signal>, MdfError> {
+        for group in self.channel_groups() {
+            if let Some(sig) = group.signal(name)? {
+                return Ok(Some(sig));
+            }
+        }
+        Ok(None)
+    }
+
     /// Get the start time of the measurement in nanoseconds since epoch.
     ///
     /// This is the absolute timestamp stored in the MDF file header.

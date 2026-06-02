@@ -66,7 +66,7 @@ def bench_read_mf4rs(path, channel_names, iterations=5):
         start = time.perf_counter()
         reader = mf4_rs.Mdf(path)
         for name in channel_names:
-            arr = reader.read(name)
+            arr = reader.values(name)
             if arr is not None:
                 total_values += len(arr)
         elapsed = time.perf_counter() - start

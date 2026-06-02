@@ -279,6 +279,7 @@ fn test_index_serialization_with_resolved_data() -> Result<(), MdfError> {
         file_size: 1024,
         start_time_ns: None,
         channel_groups: vec![indexed_group],
+        source: None,
     };
     
     // Test serialization
