@@ -4,6 +4,7 @@ use crate::parsing::raw_channel_group::RawChannelGroup;
 use crate::parsing::source_info::SourceInfo;
 use crate::api::channel::Channel;
 use crate::error::MdfError;
+use crate::signal::Signal;
 
 /// High level wrapper for a channel group.
 ///
@@ -68,6 +69,46 @@ impl<'a> ChannelGroup<'a> {
         }
 
         channels
+    }
+
+    /// Find a channel in this group by name (first match).
+    pub fn channel(&self, name: &str) -> Option<Channel<'a>> {
+        self.channels()
+            .into_iter()
+            .find(|c| c.name().ok().flatten().as_deref() == Some(name))
+    }
+
+    /// Read a channel by name as a [`Signal`] (values paired with the group's
+    /// master/time axis).
+    ///
+    /// Returns `Ok(None)` if no channel with that name exists in this group.
+    /// `timestamps` is empty when the group has no master channel or when the
+    /// requested channel *is* the master.
+    pub fn signal(&self, name: &str) -> Result<Option<Signal>, MdfError> {
+        let channels = self.channels();
+        let mut target: Option<usize> = None;
+        let mut master: Option<usize> = None;
+        for (i, ch) in channels.iter().enumerate() {
+            if ch.block().channel_type == 2 {
+                master = Some(i);
+            }
+            if target.is_none() && ch.name()?.as_deref() == Some(name) {
+                target = Some(i);
+            }
+        }
+        let Some(ci) = target else { return Ok(None) };
+
+        let values = channels[ci].values()?;
+        let timestamps = match master {
+            Some(mi) if mi != ci => channels[mi].values_as_f64()?,
+            _ => Vec::new(),
+        };
+        Ok(Some(Signal {
+            name: name.to_string(),
+            unit: channels[ci].unit()?,
+            timestamps,
+            values,
+        }))
     }
 
     /// Get the raw data group (for internal use)

@@ -40,7 +40,7 @@ def create_test_file_asammdf(path, n_records, n_float_channels=4):
 
 def create_test_file_mf4rs(path, n_records, n_float_channels=4):
     """Create a test MDF file using mf4-rs writer."""
-    w = mf4_rs.PyMdfWriter(path)
+    w = mf4_rs.MdfWriter(path)
     w.init_mdf_file()
     cg = w.add_channel_group()
     w.add_time_channel(cg, "Time")
@@ -64,9 +64,9 @@ def bench_read_mf4rs(path, channel_names, iterations=5):
     total_values = 0
     for _ in range(iterations):
         start = time.perf_counter()
-        reader = mf4_rs.PyMDF(path)
+        reader = mf4_rs.Mdf(path)
         for name in channel_names:
-            arr = reader.get_channel_values(name)
+            arr = reader.values(name)
             if arr is not None:
                 total_values += len(arr)
         elapsed = time.perf_counter() - start

@@ -34,7 +34,7 @@ def bench_mf4rs_record_at_a_time(path, n_records, n_channels=4, iterations=3):
     """Old API: write_record in a loop."""
     times = []
     for _ in range(iterations):
-        w = mf4_rs.PyMdfWriter(path)
+        w = mf4_rs.MdfWriter(path)
         w.init_mdf_file()
         cg = w.add_channel_group()
         w.add_time_channel(cg, "Time")
@@ -70,7 +70,7 @@ def bench_mf4rs_columns_f64(path, n_records, n_channels=4, iterations=3):
 
     times = []
     for _ in range(iterations):
-        w = mf4_rs.PyMdfWriter(path)
+        w = mf4_rs.MdfWriter(path)
         w.init_mdf_file()
         cg = w.add_channel_group()
         w.add_time_channel(cg, "Time")
@@ -149,7 +149,7 @@ def verify_columns_correctness():
     ch0 = timestamps * 2.0
     ch1 = timestamps * 3.0
 
-    w = mf4_rs.PyMdfWriter(path)
+    w = mf4_rs.MdfWriter(path)
     w.init_mdf_file()
     cg = w.add_channel_group()
     w.add_time_channel(cg, "Time")
@@ -161,13 +161,13 @@ def verify_columns_correctness():
     w.finalize()
 
     # Read back with mf4-rs
-    reader = mf4_rs.PyMDF(path)
-    vals = reader.get_channel_values("ch_0")
+    reader = mf4_rs.Mdf(path)
+    vals = reader.values("ch_0")
     assert vals is not None, "Channel ch_0 not found"
     assert len(vals) == n, f"Expected {n} values, got {len(vals)}"
     np.testing.assert_allclose(vals, ch0, rtol=1e-10)
 
-    vals1 = reader.get_channel_values("ch_1")
+    vals1 = reader.values("ch_1")
     np.testing.assert_allclose(vals1, ch1, rtol=1e-10)
 
     print("  -> Correctness verified!")

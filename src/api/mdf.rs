@@ -1,6 +1,7 @@
 use crate::error::MdfError;
 use crate::parsing::mdf_file::MdfFile;
 use crate::api::channel_group::ChannelGroup;
+use crate::api::channel::Channel;
 use crate::block_layout::FileLayout;
 
 #[derive(Debug)]
@@ -49,6 +50,41 @@ impl MDF {
         }
 
         groups
+    }
+
+    /// Find a channel group by name (first match).
+    ///
+    /// Convenience over [`MDF::channel_groups`] for the common case of
+    /// addressing a group by its acquisition name.
+    pub fn group(&self, name: &str) -> Option<ChannelGroup<'_>> {
+        self.channel_groups()
+            .into_iter()
+            .find(|g| g.name().ok().flatten().as_deref() == Some(name))
+    }
+
+    /// Find a channel by name across all groups (first match).
+    pub fn channel(&self, name: &str) -> Option<Channel<'_>> {
+        for group in self.channel_groups() {
+            for channel in group.channels() {
+                if channel.name().ok().flatten().as_deref() == Some(name) {
+                    return Some(channel);
+                }
+            }
+        }
+        None
+    }
+
+    /// Read a channel by name as a [`Signal`] (values paired with the master
+    /// time axis of the channel's group). First match across all groups.
+    ///
+    /// Returns `Ok(None)` if no channel with that name exists.
+    pub fn signal(&self, name: &str) -> Result<Option<crate::signal::Signal>, MdfError> {
+        for group in self.channel_groups() {
+            if let Some(sig) = group.signal(name)? {
+                return Ok(Some(sig));
+            }
+        }
+        Ok(None)
     }
 
     /// Get the start time of the measurement in nanoseconds since epoch.

@@ -91,7 +91,7 @@ def cleanup(*paths):
 def write_mf4rs_basic():
     """Write a basic file with mf4-rs: time + float + int, 100 records."""
     path = tmp("mf4rs_basic")
-    w = mf4_rs.PyMdfWriter(path)
+    w = mf4_rs.MdfWriter(path)
     w.init_mdf_file()
     cg = w.add_channel_group("Group1")
     t = w.add_time_channel(cg, "Time")
@@ -156,11 +156,11 @@ def test_mf4rs_reads_asammdf_basic():
     """mf4-rs can read a basic asammdf file and get correct values."""
     path = write_asammdf_basic()
     try:
-        mdf = mf4_rs.PyMDF(path)
-        groups = mdf.channel_groups()
+        mdf = mf4_rs.Mdf(path)
+        groups = mdf.groups
         assert len(groups) >= 1, f"expected >=1 groups, got {len(groups)}"
 
-        temp_vals = mdf.get_channel_values("Temperature")
+        temp_vals = mdf.values("Temperature")
         assert temp_vals is not None, "Temperature channel not found"
         assert len(temp_vals) == 100, f"expected 100 values, got {len(temp_vals)}"
         assert abs(temp_vals[0] - 20.0) < 0.001, f"first temp should be 20.0, got {temp_vals[0]}"
@@ -174,9 +174,9 @@ def test_cross_read_values_match():
     path = write_mf4rs_basic()
     try:
         # Read with mf4-rs (returns numpy arrays)
-        rs_mdf = mf4_rs.PyMDF(path)
-        rs_temp = rs_mdf.get_channel_values("Temperature")
-        rs_count = rs_mdf.get_channel_values("Counter")
+        rs_mdf = mf4_rs.Mdf(path)
+        rs_temp = rs_mdf.values("Temperature")
+        rs_count = rs_mdf.values("Counter")
 
         # Read with asammdf
         a_mdf = AsamMDF(path)
@@ -218,8 +218,8 @@ def test_all_integer_types_roundtrip():
             mdf.save(path, overwrite=True)
             mdf.close()
 
-            rs_mdf = mf4_rs.PyMDF(path)
-            rs_vals = rs_mdf.get_channel_values(name)
+            rs_mdf = mf4_rs.Mdf(path)
+            rs_vals = rs_mdf.values(name)
             assert len(rs_vals) == len(values), f"{name}: expected {len(values)}, got {len(rs_vals)}"
             for orig, read in zip(values, rs_vals):
                 # Values are returned as float64, which has 53 bits of precision.
@@ -250,8 +250,8 @@ def test_float_types_roundtrip():
             mdf.save(path, overwrite=True)
             mdf.close()
 
-            rs_mdf = mf4_rs.PyMDF(path)
-            rs_vals = rs_mdf.get_channel_values(name)
+            rs_mdf = mf4_rs.Mdf(path)
+            rs_vals = rs_mdf.values(name)
             assert len(rs_vals) == len(values), f"{name}: expected {len(values)}, got {len(rs_vals)}"
             for orig, read in zip(values, rs_vals):
                 tol = 1e-2 if name == "float32" else 1e-10
@@ -264,7 +264,7 @@ def test_multi_group_cross_read():
     """Multi-group mf4-rs files are correctly parsed by asammdf."""
     path = tmp("multi_group")
     try:
-        w = mf4_rs.PyMdfWriter(path)
+        w = mf4_rs.MdfWriter(path)
         w.init_mdf_file()
 
         cg1 = w.add_channel_group("G1")
@@ -348,8 +348,8 @@ def test_compressed_file_fails_gracefully():
         mdf.close()
 
         try:
-            rs_mdf = mf4_rs.PyMDF(path)
-            _ = rs_mdf.get_channel_values("data")
+            rs_mdf = mf4_rs.Mdf(path)
+            _ = rs_mdf.values("data")
             # If we get here without error, compression support was added
             print("    (NOTE: ##DZ reading now works - update comparison docs)")
         except Exception as e:
@@ -364,7 +364,7 @@ def test_data_block_splitting_cross_read():
     path = tmp("dl_split")
     try:
         # Write enough data to trigger 4MB split: 300K records x 16 bytes = 4.8MB
-        w = mf4_rs.PyMdfWriter(path)
+        w = mf4_rs.MdfWriter(path)
         w.init_mdf_file()
         cg = w.add_channel_group("big")
         w.add_float_channel(cg, "a")
@@ -458,8 +458,8 @@ def test_units_and_comments_readable():
         mdf.save(path, overwrite=True)
         mdf.close()
 
-        rs_mdf = mf4_rs.PyMDF(path)
-        channels = rs_mdf.get_all_channels()
+        rs_mdf = mf4_rs.Mdf(path)
+        channels = [ch for g in rs_mdf.groups for ch in g.channels]
         temp_ch = [ch for ch in channels if ch.name == "Temperature"]
         assert len(temp_ch) >= 1, "Temperature channel not found"
         assert temp_ch[0].unit == "degC", f"expected unit='degC', got '{temp_ch[0].unit}'"
@@ -475,7 +475,7 @@ def test_performance_write():
     path = tmp("perf_write")
     try:
         n = 100_000
-        w = mf4_rs.PyMdfWriter(path)
+        w = mf4_rs.MdfWriter(path)
         w.init_mdf_file()
         cg = w.add_channel_group("perf")
         w.add_time_channel(cg, "Time")
@@ -548,8 +548,8 @@ def test_cut_asammdf_vlsd_string():
         # mf4-rs reads numeric channels of the cut output correctly. (The
         # Python binding's f64 fast path can't return strings — strings round
         # through native Rust APIs and through asammdf below.)
-        cut_mdf = mf4_rs.PyMDF(out)
-        ctrs = cut_mdf.get_channel_values("Counter")
+        cut_mdf = mf4_rs.Mdf(out)
+        ctrs = cut_mdf.values("Counter")
         assert ctrs is not None, "Counter not found in cut file"
         assert [int(c) for c in ctrs] == [20, 30, 40, 50, 60], list(ctrs)
 
@@ -576,9 +576,9 @@ def test_performance_read():
     try:
         start = time.time()
         for _ in range(10):
-            mdf = mf4_rs.PyMDF(path)
+            mdf = mf4_rs.Mdf(path)
             for name in ["Time", "Temperature", "Counter"]:
-                mdf.get_channel_values(name)
+                mdf.values(name)
         elapsed = time.time() - start
         assert elapsed < 10, f"10x read took {elapsed:.1f}s - performance regression"
         print(f"    (10x read in {elapsed:.3f}s)")
