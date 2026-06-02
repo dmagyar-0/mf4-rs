@@ -1202,6 +1202,32 @@ impl MdfIndex {
         self.group(group)?.channel(name)
     }
 
+    /// The attached data source rendered as a string (file path or URL).
+    pub fn source_string(&self) -> Option<String> {
+        match &self.source {
+            Some(Source::File(p)) => Some(p.clone()),
+            #[cfg(feature = "http")]
+            Some(Source::Url(u)) => Some(u.clone()),
+            None => None,
+        }
+    }
+
+    /// A flat catalog of every channel as `(source, group name, channel name)`.
+    ///
+    /// `source` is this index's attached source (the same value for every row,
+    /// handy when concatenating catalogs from many files/URLs). Built purely
+    /// from metadata — no sample data is read.
+    pub fn signal_list(&self) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+        let src = self.source_string();
+        let mut out = Vec::new();
+        for group in &self.channel_groups {
+            for channel in &group.channels {
+                out.push((src.clone(), group.name.clone(), channel.name.clone()));
+            }
+        }
+        out
+    }
+
     /// Every channel name across all groups, in file order (duplicates kept).
     pub fn channel_names(&self) -> Vec<&str> {
         self.channel_groups

@@ -250,9 +250,23 @@ class Mdf:
     >>> rpm   = mdf.read("RPM", group="Engine")
     >>> s     = mdf.series("Speed")          # pandas Series, datetime index
     """
+    source: builtins.str
     groups: builtins.list[GroupInfo]
     channel_names: builtins.list[builtins.str]
     def __new__(cls,path:builtins.str): ...
+    def list_signals(self) -> builtins.list[tuple[builtins.str, typing.Optional[builtins.str], typing.Optional[builtins.str]]]:
+        r"""
+        A flat catalog of every channel as ``(source, group, channel)`` tuples.
+        
+        ``source`` is this file's path (same for every row). ``group`` /
+        ``channel`` are ``None`` if unnamed. Metadata only — no samples decoded.
+        
+        Returns
+        -------
+        list[tuple[str, Optional[str], Optional[str]]]
+        """
+        ...
+
     def group(self, name:builtins.str) -> typing.Optional[GroupInfo]:
         r"""
         Find a channel group by name (first match), or ``None``.
@@ -450,6 +464,21 @@ class MdfIndex:
         Returns ``None`` if the channel has no conversion, otherwise a dict
         describing it (``conversion_type``, ``values``, ``resolved_texts``,
         ``formula`` …).
+        """
+        ...
+
+    def list_signals(self) -> builtins.list[tuple[typing.Optional[builtins.str], typing.Optional[builtins.str], typing.Optional[builtins.str]]]:
+        r"""
+        A flat catalog of every channel as ``(source, group, channel)`` tuples.
+        
+        ``source`` is this index's attached source (file path or URL) — the same
+        for every row, so catalogs from several indexes concatenate cleanly.
+        Built from metadata only; no sample data is read (cheap even for a
+        URL-backed index). ``group`` / ``channel`` are ``None`` if unnamed.
+        
+        Returns
+        -------
+        list[tuple[Optional[str], Optional[str], Optional[str]]]
         """
         ...
 

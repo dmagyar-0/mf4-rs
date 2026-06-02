@@ -505,6 +505,7 @@ fn signal_to_series(
 #[pyclass(name = "Mdf")]
 pub struct PyMDF {
     mdf: Box<MDF>,
+    path: String,
 }
 
 impl PyMDF {
@@ -552,7 +553,32 @@ impl PyMDF {
     #[new]
     fn new(path: &str) -> PyResult<Self> {
         let mdf = Box::new(MDF::from_file(path)?);
-        Ok(PyMDF { mdf })
+        Ok(PyMDF { mdf, path: path.to_string() })
+    }
+
+    /// The file path this reader was opened from.
+    #[getter]
+    fn source(&self) -> String {
+        self.path.clone()
+    }
+
+    /// A flat catalog of every channel as ``(source, group, channel)`` tuples.
+    ///
+    /// ``source`` is this file's path (same for every row). ``group`` /
+    /// ``channel`` are ``None`` if unnamed. Metadata only — no samples decoded.
+    ///
+    /// Returns
+    /// -------
+    /// list[tuple[str, Optional[str], Optional[str]]]
+    fn list_signals(&self) -> PyResult<Vec<(String, Option<String>, Option<String>)>> {
+        let mut out = Vec::new();
+        for group in self.mdf.channel_groups() {
+            let gname = group.name()?;
+            for channel in group.channels() {
+                out.push((self.path.clone(), gname.clone(), channel.name()?));
+            }
+        }
+        Ok(out)
     }
 
     /// Metadata for every channel group in the file, in file order.
@@ -1335,7 +1361,21 @@ impl PyMdfIndex {
     /// source is only range-requested when you call :py:meth:`read` / :py:meth:`values`.
     #[getter]
     fn source(&self) -> Option<String> {
-        source_to_string(self.index.source())
+        self.index.source_string()
+    }
+
+    /// A flat catalog of every channel as ``(source, group, channel)`` tuples.
+    ///
+    /// ``source`` is this index's attached source (file path or URL) — the same
+    /// for every row, so catalogs from several indexes concatenate cleanly.
+    /// Built from metadata only; no sample data is read (cheap even for a
+    /// URL-backed index). ``group`` / ``channel`` are ``None`` if unnamed.
+    ///
+    /// Returns
+    /// -------
+    /// list[tuple[Optional[str], Optional[str], Optional[str]]]
+    fn list_signals(&self) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+        self.index.signal_list()
     }
 
     #[setter(source)]
@@ -1423,15 +1463,6 @@ impl PyMdfIndex {
             }
             Some(v) => self.index.set_file(v),
         }
-    }
-}
-
-/// Render an index [`Source`](crate::index::Source) as a display string.
-fn source_to_string(source: Option<&crate::index::Source>) -> Option<String> {
-    match source {
-        Some(crate::index::Source::File(p)) => Some(p.clone()),
-        Some(crate::index::Source::Url(u)) => Some(u.clone()),
-        None => None,
     }
 }
 
