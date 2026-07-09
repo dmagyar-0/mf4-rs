@@ -64,8 +64,10 @@ where
         let dg = DataGroupBlock::from_bytes(&dg_bytes)?;
         let next_dg_addr = dg.next_dg_addr;
         let mut cg_addr = dg.first_cg_addr;
+        let mut cg_count = 0usize;
 
         while cg_addr != 0 {
+            cg_count += 1;
             let cg_bytes = reader.read_range(cg_addr, CG_BLOCK_LEN)?;
             let cg = ChannelGroupBlock::from_bytes(&cg_bytes)?;
             let next_cg_addr = cg.next_cg_addr;
@@ -122,6 +124,18 @@ where
             });
 
             cg_addr = next_cg_addr;
+        }
+
+        // Unsorted data groups (a record-ID prefix with several channel
+        // groups sharing the same data blocks) cannot be represented by the
+        // index: every CG would be indexed against the same interleaved
+        // records. Reject them with a clear error instead.
+        if dg.record_id_len > 0 && cg_count > 1 {
+            return Err(MdfError::BlockSerializationError(
+                "unsorted data groups (record IDs with multiple channel groups) \
+                 are not supported by the index"
+                    .to_string(),
+            ));
         }
 
         dg_addr = next_dg_addr;
