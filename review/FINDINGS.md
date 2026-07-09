@@ -2,6 +2,46 @@
 
 **Date:** 2026-07-09 · **Version reviewed:** v2.0.0 (`ddbad6f`) · **Reference:** asammdf 8.8.22, Python 3.11, numpy/pandas current
 
+> **FIX STATUS (2026-07-09, this branch):** All confirmed bugs below have been fixed on this
+> branch except where noted. Summary of the fixes:
+>
+> - **A1/A2** fixed — `values_as_f64` / `Mdf.values()` / `signal()` now apply conversions and
+>   invalidation (NaN), matching `MdfIndex` and asammdf; both paths pick the *first* master.
+> - **A3** fixed — every index read/byte-range path now errors clearly on VLSD channels
+>   (offset-based SD reads remain unimplemented — error instead of garbage).
+> - **A4/A5/A6** mitigated by loud refusal — unsorted data groups and non-record-aligned DL
+>   fragments now return clear errors on all read paths (parser + index) instead of silently
+>   mis-decoding. Full record-ID demux / fragment-spanning support remains future work.
+> - **A7** fixed — the writer hard-errors on unencodable channels (fixed-length strings, BE,
+>   CanOpen, complex) and on value/encoder type mismatches; the Python API gained
+>   `add_sint_channel` and `add_string_channel` (VLSD), both verified readable by asammdf.
+> - **A8** fixed — merge compares **and preserves** conversions/units/comments/sources and
+>   `sync_type`; rejects invalidation-bit files; header start time taken from the first file.
+>   Time axes are still concatenated verbatim (documented).
+> - **A9** fixed — cut refuses multi-CG data groups, preserves `record_id`, uses scale-aware
+>   inclusive bounds, no longer aborts on non-monotonic masters, and cloned channels keep
+>   their exact byte offsets (`add_channel_preserving_offsets`).
+> - **A10–A12, D1, D3, D4, D6** fixed — bit_offset/f16 rejected with errors, invalidation
+>   bytes included in record framing, `dl_equal_length` is now the data-section length,
+>   `write_record_u64` splits at 4 MB, no empty first fragments, VLSD channels forced to
+>   bit_count 64 with no sentinel link on disk.
+> - **B1–B8** fixed (B5: `X1` alias supported; eval errors still fall back to raw). JSON
+>   indexes survive ±inf/NaN conversion values losslessly.
+> - **C1–C8** fixed — malformed/truncated files return `MdfError` (no panics), cycle detection
+>   in all block walks, hostile index JSON validated, `write_columns_f64` UB removed,
+>   HTTP range reads verify 206/length, caching reader handles EOF, errors use `Display`.
+> - **D2** fixed (`##DV` parses), **D5** partially fixed (header stamped with current time;
+>   `##FH` block still not written), **D7** fixed.
+> - **F** fixed — Python `read()` uses a numpy fast path + Rust-built `datetime64[ns]` index:
+>   ~0.15 s for 4×1M samples (was ~1.35 s); GIL released during decodes.
+> - New regression suites: `tests/fix_conversions.rs`, `tests/fix_parser.rs`,
+>   `tests/fix_index.rs`, `tests/fix_writer.rs`, `tests/fix_api.rs` (83 new tests).
+>   Cross-validation: 30/30 pass; asammdf interop: 15/15 pass.
+>
+> Still open (features, not bugs): ##DZ compression, ##FH block, unsorted-file decoding,
+> offset-based VLSD reads in the index, channel composition (##CA), virtual channels,
+> float16 decode, `hd_tz_offset` in the pandas DatetimeIndex.
+
 ## Methodology
 
 1. **Static deep review** of all ~5,000 lines of Rust across five subsystems (parser/decoder, writer, index, conversions, cut/merge/Python bindings), with link offsets re-derived byte-by-byte from the MDF 4.1 block layouts and semantics cross-checked against asammdf's `v4_blocks.py` source. Several writer findings were verified at runtime with probe programs.

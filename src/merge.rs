@@ -272,7 +272,9 @@ pub fn merge_files(output: &str, first: &str, second: &str) -> Result<(), MdfErr
         let cache = &mut caches[group.src_file];
         let mut last_cn: Option<String> = None;
         for ch in &group.meta.channels {
-            let id = writer.add_channel(&cg_id, last_cn.as_deref(), |cn| {
+            // Offsets are copied from the source layout; a channel at byte 0
+            // that is not first in the list must keep its offset.
+            let id = writer.add_channel_preserving_offsets(&cg_id, last_cn.as_deref(), |cn| {
                 cn.data_type = ch.data_type.clone();
                 if let Some(n) = &ch.name {
                     cn.name = Some(n.clone());

@@ -209,7 +209,7 @@ The codebase is organized into distinct layers. The module structure is defined 
 - Built only when `pyo3` feature is enabled (configured in `pyproject.toml` via `[tool.maturin] features = ["pyo3"]`)
 - Uses PyO3 0.21 with extension-module feature
 - The Python-visible names drop the `Py` prefix (set via `#[pyclass(name = "…")]`); the Rust struct names keep the `Py` prefix internally. **All navigation is by name — there are no `(group_index, channel_index)` arguments in the Python API.**
-- **`read(name, group=None)` returns a `pandas.Series`** (channel values, conversions applied, indexed by the group master converted to a `DatetimeIndex`). **`values(name, group=None)` returns a plain numpy `float64` array** (no timestamps, pandas-free). `__getitem__` is `read`.
+- **`read(name, group=None)` returns a `pandas.Series`** (channel values, conversions applied, indexed by the group master converted to a `DatetimeIndex`). **`values(name, group=None)` returns a plain numpy `float64` array** (no timestamps, pandas-free; conversions applied, invalid samples are NaN — identical semantics to `MdfIndex.values`). `__getitem__` is `read`.
 - Main classes:
   - `Mdf` (struct `PyMDF`) - Wraps `MDF`; `groups` property (each `GroupInfo` carries its `channels`), `group(name)`, `channel(name)`, `channel_names`; reads: `read()` → Series, `values()` → numpy, `__getitem__`, `file_layout()`
   - `MdfWriter` (struct `PyMdfWriter`) - Wraps `MdfWriter`; manages ID mapping between Python and Rust IDs; provides `add_time_channel()`, `add_float_channel()`, `add_int_channel()` convenience methods (writer API unchanged in the redesign)
@@ -420,7 +420,7 @@ This section documents tested interoperability and differences between `mf4-rs` 
 | **Default float precision** | 32-bit (`default_bits()` returns 32 for FloatLE) | 64-bit (uses numpy float64) |
 | **Master channel** | User-created channel marked as master via `set_time_channel()` | Auto-generates a separate lowercase `time` channel per group |
 | **Channel group name** | `PyMdfWriter.add_channel_group(name)` accepts a name parameter but **does not write it** to the file (the closure `\|_cg\| {}` ignores it) | Writes `comment` and `acq_name` to `##CG` metadata block |
-| **File header timestamp** | Defaults to epoch (1970-01-01) | Sets to current time at file creation |
+| **File header timestamp** | Set to current time by `init_mdf_file` (override with `set_start_time`) | Sets to current time at file creation |
 | **File history (`##FH`)** | Not written | Writes `##FH` block with tool info |
 | **Metadata blocks (`##MD`)** | Not written | Writes XML `##MD` blocks for group comments |
 | **File size** | ~2.5x smaller for equivalent data (fewer metadata blocks, 32-bit defaults) | Larger due to 64-bit types, extra channels, and metadata |
@@ -466,18 +466,25 @@ This section documents tested interoperability and differences between `mf4-rs` 
 
 **Python API comparison (same data):**
 
+Measured 2026-07 with 1M records × 4 f64 channels + time (see `review/bench.py`):
+
 | Operation | mf4-rs Python bindings | asammdf |
 |-----------|------------------------|---------|
-| Write | ~0.08s (record-at-a-time loop) | ~0.03s (numpy vectorized) |
-| Read | ~0.012s | ~0.011s |
-| File size | 1.6 MB (32-bit default) | 4.0 MB (64-bit default) |
+| Write bulk (`write_columns_f64` / `append+save`) | ~0.06s | ~0.3-0.5s |
+| Write record-at-a-time loop | ~1.2-1.4 µs/record | n/a |
+| Read 4 channels → numpy (`values` / `.samples`) | ~0.03-0.05s | ~0.1s |
+| Read 4 channels → pandas Series (`read`, DatetimeIndex) | ~0.15-0.19s | n/a (raw seconds only) |
+| Cold single-channel read (JSON index vs open+get) | ~0.007s | ~0.03s |
 
-The native Rust API is **4-10x faster than both Python libraries**. The mf4-rs Python bindings appear slower than asammdf for writes because the Python API forces record-at-a-time calls with `DecodedValue` object creation overhead per value. Read performance is essentially identical between the two Python APIs. asammdf's write speed comes from numpy vectorized bulk array writes.
+`read()` builds numeric Series through a numpy fast path and constructs the
+DatetimeIndex from a Rust-computed `datetime64[ns]` array; only channels with
+text/bytes values fall back to per-object conversion. `Mdf.read`/`Mdf.values`
+release the GIL during decoding.
 
 ### Recommended Improvements Based on Comparison
 
 1. **Compression support**: Add `##DZ` block reading (deflate decompression) - this is the most impactful missing feature for reading real-world MDF files
-2. **64-bit float default**: The Python `add_float_channel()` uses `default_bits()` which returns 32 for FloatLE. Consider defaulting to 64-bit in the Python API to match scientific computing conventions and avoid precision loss
+2. **64-bit float default**: The Python `add_float_channel()` writes 64-bit; the generic `add_channel` with `create_data_type_float_le()` still defaults to 32 bits via `default_bits()`
 3. **Channel group metadata**: The `add_channel_group(name)` parameter is silently ignored - either implement it or remove the parameter
-4. **File header timestamp**: Write the current time to the header block instead of epoch
-5. **File history block**: Write a `##FH` block for tool identification and traceability
+4. **File history block**: Write a `##FH` block for tool identification and traceability (the header timestamp is now written; `##FH` is still absent)
+5. **Unsorted files / VLSD via index**: unsorted data groups and index-based VLSD reads are refused with clear errors; implementing them would unlock CANedge-style bus logs

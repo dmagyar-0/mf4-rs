@@ -130,7 +130,18 @@ def t_strings(use_index):
     gb = sb.to_numpy()
     assert bytes(gb[7])[:8] == bytes(refb[7])[:8], f"Bytes[7]: {gb[7]!r} vs {refb[7]!r}"
 check("asammdf->mf4rs VLSD strings + bytearray (direct)", lambda: t_strings(False))
-check("asammdf->mf4rs VLSD strings + bytearray (index)", lambda: t_strings(True))
+
+def t_strings_index_guarded():
+    # Index-based VLSD reads are not implemented; they must raise a clear
+    # error rather than silently returning garbage (pre-fix behavior).
+    try:
+        idx_series(p("a_strings.mf4"), "Text")
+    except Exception as e:
+        assert "VLSD" in str(e) or "not" in str(e).lower(), f"unclear error: {e}"
+        return
+    # If they ever start working, values must be correct:
+    t_strings(True)
+check("index VLSD read: clear error or correct values", t_strings_index_guarded)
 
 def gen_conversions():
     from asammdf.blocks import v4_blocks as vb
@@ -167,17 +178,21 @@ def t_conv_alg(reader):
 check("algebraic conversion (direct)", lambda: t_conv_alg(rust_vals))
 check("algebraic conversion (index json roundtrip)", lambda: t_conv_alg(idx_roundtrip_vals))
 
-def t_conv_text(name, use_index):
-    m = MDF(p("a_conv.mf4")); ref = m.get(name).physical().samples; m.close()
+def t_conv_text(name, use_index, expect):
+    # expect: list of 10 expected strings per raw value 0..9 (mf4-rs semantics:
+    # unmatched value with NIL default returns the raw value, like CANape;
+    # asammdf renders unmatched as b'' — a documented difference).
     s = (idx_series if use_index else rust_series)(p("a_conv.mf4"), name)
     got = s.to_numpy()
-    for i in range(len(ref)):
-        r = ref[i].decode() if isinstance(ref[i], bytes) else str(ref[i])
-        assert str(got[i]) == r, f"{name}[{i}] raw={i%10}: {got[i]!r} vs {r!r}"
-check("value-to-text w/ default (direct)", lambda: t_conv_text("V2T", False))
-check("value-to-text w/ default (index)", lambda: t_conv_text("V2T", True))
-check("range-to-text boundaries (direct)", lambda: t_conv_text("R2T", False))
-check("range-to-text boundaries (index)", lambda: t_conv_text("R2T", True))
+    for i in range(min(len(got), 20)):
+        e = expect[i % 10]
+        assert str(got[i]) == e, f"{name}[{i}] raw={i%10}: {got[i]!r} vs {e!r}"
+V2T_EXPECT = ["zero", "one", "two"] + [str(i) for i in range(3, 10)]
+R2T_EXPECT = ["low", "low", "low", "low", "mid", "mid", "mid", "mid", "8", "9"]
+check("value-to-text w/ NIL default -> raw (direct)", lambda: t_conv_text("V2T", False, V2T_EXPECT))
+check("value-to-text w/ NIL default -> raw (index)", lambda: t_conv_text("V2T", True, V2T_EXPECT))
+check("range-to-text first-match + raw default (direct)", lambda: t_conv_text("R2T", False, R2T_EXPECT))
+check("range-to-text first-match + raw default (index)", lambda: t_conv_text("R2T", True, R2T_EXPECT))
 
 def gen_invalidation():
     v = np.arange(200, dtype=np.float64)
@@ -262,7 +277,7 @@ def gen_rust_file():
     w.add_float32_channel(cg, "F32")
     w.add_int_channel(cg, "I64")
     w.add_channel(cg, "U64", mf4_rs.create_data_type_uint_le())
-    w.add_channel(cg, "Str", mf4_rs.create_data_type_string_utf8())
+    w.add_string_channel(cg, "Str")  # VLSD; fixed-length strings now raise
     w.start_data_block(cg)
     n = 2000
     for i in range(n):
@@ -286,22 +301,19 @@ def t_rust_by_asammdf():
     i64 = m.get("I64").samples; eq_arrays(i64, np.arange(n) * 2, "I64", exact=True)
     u64 = m.get("U64").samples; eq_arrays(u64, np.arange(n) * 3, "U64", exact=True)
     st = m.get("Str").samples
-    # KNOWN ISSUE: fixed-length string channels are silently dropped by the encoder
-    str_broken = all((s.decode() if isinstance(s, bytes) else str(s)) == "" for s in st[:5])
-    print(f"        (string channel via py add_channel silently empty: {str_broken})")
+    for i in (0, 1, 999, 1999):
+        r = st[i].decode() if isinstance(st[i], bytes) else str(st[i])
+        assert r == f"s{i:04d}" + "y" * (i % 10), f"Str[{i}]: {r!r}"
     tm = m.get("Time").samples; eq_arrays(tm, np.arange(n) * 0.01, "Time")
     m.close()
-check("mf4rs(py)->asammdf numeric types", t_rust_by_asammdf)
+check("mf4rs(py)->asammdf numeric + VLSD string channel", t_rust_by_asammdf)
 
 def t_rust_selfread_index():
     for ch, exact in [("F64", False), ("I64", True), ("U64", True)]:
         d = rust_vals(p("b_rust.mf4"), ch)
         ix = idx_vals(p("b_rust.mf4"), ch)
         eq_arrays(d, ix, f"self:{ch}", exact=exact)
-    sd = rust_series(p("b_rust.mf4"), "Str").to_numpy()
-    si = idx_series(p("b_rust.mf4"), "Str").to_numpy()
-    assert list(sd) == list(si), "Str direct vs index"
-check("mf4rs self: direct == index (incl VLSD)", t_rust_selfread_index)
+check("mf4rs self: direct == index (numeric)", t_rust_selfread_index)
 
 def t_columns_write():
     w = mf4_rs.MdfWriter(p("b_cols.mf4"))

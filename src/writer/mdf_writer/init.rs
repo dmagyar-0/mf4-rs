@@ -239,6 +239,36 @@ impl MdfWriter {
     where
         F: FnOnce(&mut ChannelBlock),
     {
+        self.add_channel_impl(cg_id, prev_cn_id, configure, true)
+    }
+
+    /// Like [`add_channel`], but never auto-assigns `byte_offset`: the value
+    /// set by `configure` — including a legitimate `0` on a channel that is
+    /// not first in the record — is written verbatim. Use when cloning
+    /// channels whose record layout is copied from another file and must be
+    /// preserved exactly (cut/merge).
+    pub fn add_channel_preserving_offsets<F>(
+        &mut self,
+        cg_id: &str,
+        prev_cn_id: Option<&str>,
+        configure: F,
+    ) -> Result<String, MdfError>
+    where
+        F: FnOnce(&mut ChannelBlock),
+    {
+        self.add_channel_impl(cg_id, prev_cn_id, configure, false)
+    }
+
+    fn add_channel_impl<F>(
+        &mut self,
+        cg_id: &str,
+        prev_cn_id: Option<&str>,
+        configure: F,
+        auto_offset: bool,
+    ) -> Result<String, MdfError>
+    where
+        F: FnOnce(&mut ChannelBlock),
+    {
         let cn_count = self.block_positions.keys().filter(|k| k.starts_with("cn_")).count();
         let cn_id = format!("cn_{}", cn_count);
 
@@ -249,9 +279,11 @@ impl MdfWriter {
         // stream, regardless of the payload data type.
         if ch.channel_type == 1 { ch.bit_count = 64; }
         if let Some(off) = self.cg_offsets.get_mut(cg_id) {
-            if ch.byte_offset == 0 { ch.byte_offset = *off as u32; }
+            if auto_offset && ch.byte_offset == 0 { ch.byte_offset = *off as u32; }
             let used = ((ch.bit_offset as usize + ch.bit_count as usize + 7) / 8) as usize;
-            *off = ch.byte_offset as usize + used;
+            // Keep the running offset monotonic so a later auto-placed
+            // channel can never overlap an explicitly placed one.
+            *off = (*off).max(ch.byte_offset as usize + used);
         }
 
         // Never serialize a placeholder `data` link for VLSD channels: the

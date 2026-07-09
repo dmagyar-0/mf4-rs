@@ -319,7 +319,10 @@ pub fn cut_mdf_by_time(
                 block.component_addr = 0;
                 block.data = 0;
 
-                let cn_id = writer.add_channel(&cg_id, prev_cn.as_deref(), |c| {
+                // Preserve the source record layout exactly — records are
+                // copied verbatim, so a cloned channel legitimately at byte
+                // offset 0 must not be re-positioned by the writer.
+                let cn_id = writer.add_channel_preserving_offsets(&cg_id, prev_cn.as_deref(), |c| {
                     *c = block.clone();
                 })?;
 
