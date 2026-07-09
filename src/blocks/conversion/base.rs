@@ -20,8 +20,11 @@ pub struct ConversionBlock {
     pub cc_flags: u16,
     pub cc_ref_count: u16,
     pub cc_val_count: u16,
+    #[serde(default, with = "f64_lossless::opt")]
     pub cc_phy_range_min: Option<f64>,
+    #[serde(default, with = "f64_lossless::opt")]
     pub cc_phy_range_max: Option<f64>,
+    #[serde(default, with = "f64_lossless::vec")]
     pub cc_val: Vec<f64>,
 
     pub formula: Option<String>,
@@ -121,6 +124,96 @@ impl BlockParse<'_> for ConversionBlock {
             resolved_conversions: None,
             default_conversion: None,
         })
+    }
+}
+
+/// Lossless (de)serialization helpers for `f64` fields that may hold
+/// non-finite values (±inf, or NaN bit patterns used as bitfield masks).
+///
+/// Plain serde would let `serde_json` write non-finite floats as `null`,
+/// which then fails to deserialize back into `f64` — making saved indexes
+/// unloadable. These helpers serialize finite values as plain JSON numbers
+/// (backward compatible with indexes written by older versions) and
+/// non-finite values as strings: `"inf"`, `"-inf"`, or a `"0x…"` u64 bit
+/// pattern (preserving NaN payload bits exactly). On input they accept
+/// numbers, those strings, and `null` (mapped to NaN for vector elements).
+pub(crate) mod f64_lossless {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub(crate) enum F64Repr {
+        Num(f64),
+        Str(String),
+        Null(Option<()>),
+    }
+
+    pub(crate) fn to_repr(v: f64) -> F64Repr {
+        if v.is_finite() {
+            F64Repr::Num(v)
+        } else if v == f64::INFINITY {
+            F64Repr::Str("inf".to_string())
+        } else if v == f64::NEG_INFINITY {
+            F64Repr::Str("-inf".to_string())
+        } else {
+            // NaN: keep the exact bit pattern (payload bits are meaningful,
+            // e.g. BitfieldText masks stored via f64::from_bits).
+            F64Repr::Str(format!("0x{:016X}", v.to_bits()))
+        }
+    }
+
+    pub(crate) fn from_repr(r: F64Repr) -> f64 {
+        match r {
+            F64Repr::Num(n) => n,
+            F64Repr::Str(s) => parse_f64_str(&s),
+            // Older versions serialized non-finite values as `null`
+            // (serde_json's default); map those to NaN.
+            F64Repr::Null(_) => f64::NAN,
+        }
+    }
+
+    fn parse_f64_str(s: &str) -> f64 {
+        let t = s.trim();
+        if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            if let Ok(bits) = u64::from_str_radix(hex, 16) {
+                return f64::from_bits(bits);
+            }
+        }
+        match t.to_ascii_lowercase().as_str() {
+            "inf" | "+inf" | "infinity" | "+infinity" => f64::INFINITY,
+            "-inf" | "-infinity" => f64::NEG_INFINITY,
+            "nan" => f64::NAN,
+            _ => t.parse::<f64>().unwrap_or(f64::NAN),
+        }
+    }
+
+    pub(crate) mod vec {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(v: &[f64], s: S) -> Result<S::Ok, S::Error> {
+            let reprs: Vec<F64Repr> = v.iter().map(|&x| to_repr(x)).collect();
+            reprs.serialize(s)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f64>, D::Error> {
+            let reprs = Vec::<F64Repr>::deserialize(d)?;
+            Ok(reprs.into_iter().map(from_repr).collect())
+        }
+    }
+
+    pub(crate) mod opt {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+            v.map(to_repr).serialize(s)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+            // `null` maps to `None` here (matching the old plain-Option
+            // encoding for absent range fields).
+            let repr = Option::<F64Repr>::deserialize(d)?;
+            Ok(repr.map(from_repr))
+        }
     }
 }
 
@@ -253,7 +346,22 @@ impl ConversionBlock {
                     // Nested conversion block - resolve recursively
                     let mut nested_conversion = ConversionBlock::from_bytes(&file_data[offset..])?;
                     nested_conversion.resolve_all_dependencies_recursive(file_data, depth + 1, visited, link_addr)?;
-                    
+
+                    // For BitfieldText, also resolve the nested conversion's
+                    // name (cc_tx_name) now, so applying the conversion later
+                    // with empty file data (index reads) can still emit the
+                    // "name = value" form without touching the file.
+                    if self.cc_type == ConversionType::BitfieldText {
+                        if let Some(name_addr) = nested_conversion.cc_tx_name {
+                            let name_off = name_addr as usize;
+                            if name_off.saturating_add(24) <= file_data.len() {
+                                if let Some(name_text) = read_string_block(file_data, name_addr)? {
+                                    resolved_texts.insert(i, name_text);
+                                }
+                            }
+                        }
+                    }
+
                     // Check if this should be stored as default conversion
                     if Some(i) == default_ref_index {
                         default_conversion = Some(Box::new(nested_conversion));
@@ -367,6 +475,19 @@ impl ConversionBlock {
                     let block_bytes = reader.read_range(link_addr, header.block_len)?;
                     let mut nested = ConversionBlock::from_bytes(&block_bytes)?;
                     nested.resolve_recursive_via_reader(reader, depth + 1, visited, link_addr)?;
+
+                    // For BitfieldText, also resolve the nested conversion's
+                    // name (cc_tx_name) so index reads can emit
+                    // "name = value" without file access.
+                    if self.cc_type == ConversionType::BitfieldText {
+                        if let Some(name_addr) = nested.cc_tx_name {
+                            if let Some(name_text) =
+                                read_string_block_via_reader(reader, name_addr)?
+                            {
+                                resolved_texts.insert(i, name_text);
+                            }
+                        }
+                    }
 
                     if Some(i) == default_ref_index {
                         default_conversion = Some(Box::new(nested));
