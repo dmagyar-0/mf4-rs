@@ -16,7 +16,7 @@ use crate::writer::MdfWriter;
 /// `0`, the offset is out of range, or the block type is not one of the
 /// handled kinds. Already-cloned source addresses are deduplicated through
 /// `cache`.
-fn clone_block_to_writer(
+pub(crate) fn clone_block_to_writer(
     writer: &mut MdfWriter,
     mmap: &[u8],
     src_addr: u64,
@@ -232,6 +232,18 @@ pub fn cut_mdf_by_time(
     for dg in &mdf.data_groups {
         let record_id_len = dg.block.record_id_len;
 
+        // A data group with several channel groups stores interleaved records
+        // distinguished by record IDs (unsorted layout). Copying such groups
+        // record-by-record with a single record size would corrupt the output,
+        // and the writer cannot express two channel groups sharing one data
+        // block — refuse loudly instead of writing a broken file.
+        if dg.channel_groups.len() > 1 {
+            return Err(MdfError::BlockSerializationError(
+                "cut: data groups with multiple channel groups (unsorted files) are not supported"
+                    .into(),
+            ));
+        }
+
         let mut prev_cg: Option<String> = None;
         for cg in &dg.channel_groups {
             let samples_byte_nr = cg.block.samples_byte_nr;
@@ -240,7 +252,12 @@ pub fn cut_mdf_by_time(
                 + samples_byte_nr as usize
                 + invalidation_bytes_nr as usize;
 
-            let cg_id = writer.add_channel_group(prev_cg.as_deref(), |_| {})?;
+            let src_record_id = cg.block.record_id;
+            let cg_id = writer.add_channel_group(prev_cg.as_deref(), |c| {
+                // Records are copied verbatim including any leading record-ID
+                // bytes, so the output CG must declare the same record ID.
+                c.record_id = src_record_id;
+            })?;
             prev_cg = Some(cg_id.clone());
 
             // Carry over the channel-group acq_name / acq_source / comment
@@ -407,7 +424,7 @@ pub fn cut_mdf_by_time(
 
             // Iterate raw parent records from the source DT/DL chain.
             let blocks = dg.data_blocks(&mdf.mmap)?;
-            'outer: for data_block in blocks {
+            for data_block in blocks {
                 let raw = data_block.data;
                 if record_size == 0 {
                     // Degenerate CG with no record bytes — nothing to do.
@@ -451,16 +468,15 @@ pub fn cut_mdf_by_time(
                             DecodedValue::SignedInteger(i) => i as f64,
                             _ => continue,
                         };
-                        if t < start_time {
-                            false
-                        } else if t - end_time > f64::EPSILON {
-                            // Match the legacy epsilon comparison so floats
-                            // produced by `i * 0.1` style timestamps remain
-                            // inclusive of the upper bound.
-                            break 'outer;
-                        } else {
-                            true
-                        }
+                        // Scale-aware tolerance keeps timestamps produced by
+                        // `i * 0.1`-style accumulation inclusive at both
+                        // bounds (an absolute f64::EPSILON is meaningless
+                        // once t >> 2). Records outside the window are
+                        // skipped rather than aborting the scan, so files
+                        // with a non-monotonic master remain correct.
+                        let tol_lo = start_time.abs().max(1.0) * 1e-12;
+                        let tol_hi = end_time.abs().max(1.0) * 1e-12;
+                        t >= start_time - tol_lo && t <= end_time + tol_hi
                     } else {
                         // No master channel — copy everything.
                         true

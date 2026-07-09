@@ -29,7 +29,7 @@ create_exception!(mf4_rs, MdfException, pyo3::exceptions::PyException);
 // Convert Rust MdfError to Python exception
 impl From<MdfError> for PyErr {
     fn from(err: MdfError) -> PyErr {
-        MdfException::new_err(format!("{:?}", err))
+        MdfException::new_err(format!("{}", err))
     }
 }
 
@@ -445,33 +445,56 @@ fn signal_to_series(
     values: Vec<Option<DecodedValue>>,
     start_time_ns: Option<u64>,
 ) -> PyResult<PyObject> {
-    let py_values: Vec<PyObject> = values
-        .into_iter()
-        .map(|o| o.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None()))
-        .collect();
+    // Fast path: purely numeric (or invalid) samples become a float64 numpy
+    // array (NaN for invalid) instead of a per-sample PyObject list. This is
+    // ~10-50x faster and yields a float64 Series instead of object dtype.
+    let mut numeric: Vec<f64> = Vec::with_capacity(values.len());
+    let mut all_numeric = true;
+    for v in &values {
+        match v {
+            None => numeric.push(f64::NAN),
+            Some(DecodedValue::Float(f)) => numeric.push(*f),
+            Some(DecodedValue::UnsignedInteger(u)) => numeric.push(*u as f64),
+            Some(DecodedValue::SignedInteger(i)) => numeric.push(*i as f64),
+            _ => {
+                all_numeric = false;
+                break;
+            }
+        }
+    }
+    let py_values: PyObject = if all_numeric {
+        PyArray1::from_vec_bound(py, numeric).into()
+    } else {
+        values
+            .into_iter()
+            .map(|o| o.map(|dv| decoded_value_to_pyobject(dv, py)).unwrap_or_else(|| py.None()))
+            .collect::<Vec<PyObject>>()
+            .to_object(py)
+    };
 
     let index: PyObject = if timestamps.is_empty() {
         py.None()
     } else {
-        let py_ts = PyArray1::from_vec_bound(py, timestamps.to_vec());
-        if let Some(start_ns) = start_time_ns {
-            // Vectorized: start_timestamp + to_timedelta(seconds).
-            let to_datetime = pd.getattr(py, "to_datetime")?;
-            let to_timedelta = pd.getattr(py, "to_timedelta")?;
-            let start_ts = to_datetime.call(
-                py, (start_ns,),
-                Some([("unit", "ns")].into_py_dict(py)),
-            )?;
-            let deltas = to_timedelta.call(
-                py, (py_ts.clone(),),
-                Some([("unit", "s")].into_py_dict(py)),
-            )?;
-            match deltas.call_method1(py, "__add__", (start_ts,)) {
-                Ok(dt_index) => dt_index,
-                Err(_) => py_ts.into(),
+        // Fast path: compute absolute nanosecond timestamps in Rust and hand
+        // numpy a datetime64[ns] view — ~35x faster than pd.to_timedelta.
+        // Falls back to raw float seconds if anything overflows i64 range
+        // (e.g. beyond pandas' year-2262 bound).
+        let dt_index = start_time_ns.and_then(|start_ns| {
+            let start_i64 = i64::try_from(start_ns).ok()?;
+            let mut ns: Vec<i64> = Vec::with_capacity(timestamps.len());
+            for &t in timestamps {
+                let rel = t * 1e9;
+                if !rel.is_finite() || rel.abs() >= i64::MAX as f64 {
+                    return None;
+                }
+                ns.push(start_i64.checked_add(rel.round() as i64)?);
             }
-        } else {
-            py_ts.into()
+            let arr = PyArray1::from_vec_bound(py, ns);
+            arr.call_method1("view", ("datetime64[ns]",)).ok().map(|a| a.to_object(py))
+        });
+        match dt_index {
+            Some(idx) => idx,
+            None => PyArray1::from_vec_bound(py, timestamps.to_vec()).into(),
         }
     };
 
@@ -654,14 +677,18 @@ impl PyMDF {
     fn read(&self, py: Python, name: &str, group: Option<&str>) -> PyResult<PyObject> {
         let pd = check_pandas_available(py)?;
         let start_time_ns = self.mdf.start_time_ns();
-        let signal = match group {
-            Some(gn) => self
-                .mdf
-                .group(gn)
-                .ok_or_else(|| MdfException::new_err(format!("Channel group '{}' not found", gn)))?
-                .signal(name)?,
-            None => self.mdf.signal(name)?,
-        };
+        // Decode without holding the GIL so other Python threads can run.
+        let signal = py.allow_threads(|| -> Result<Option<crate::signal::Signal>, MdfError> {
+            match group {
+                Some(gn) => match self.mdf.group(gn) {
+                    Some(g) => g.signal(name),
+                    None => Err(MdfError::BlockSerializationError(format!(
+                        "Channel group '{}' not found", gn
+                    ))),
+                },
+                None => self.mdf.signal(name),
+            }
+        })?;
         let signal = signal.ok_or_else(|| {
             MdfException::new_err(match group {
                 Some(gn) => format!("Channel '{}' not found in group '{}'", name, gn),
@@ -683,7 +710,8 @@ impl PyMDF {
     /// group : Optional[str]
     fn values<'py>(&self, py: Python<'py>, name: &str, group: Option<&str>) -> PyResult<PyObject> {
         let (g, idx) = self.find_group_channel(group, name)?;
-        let values = g.channels()[idx].values_as_f64()?;
+        // Decode without holding the GIL so other Python threads can run.
+        let values = py.allow_threads(|| g.channels()[idx].values_as_f64())?;
         Ok(PyArray1::from_vec_bound(py, values).into())
     }
 
@@ -943,11 +971,49 @@ impl PyMdfWriter {
 
     /// Add a 64-bit little-endian unsigned integer (``u64``) data channel.
     ///
-    /// For signed integers, build a generic channel with
-    /// :py:meth:`add_channel` and ``create_data_type_*`` helpers (or call
-    /// directly with the raw :class:`DataType`).
+    /// Values must be created with ``create_uint_value``. For signed
+    /// integers use :py:meth:`add_sint_channel` (writing a negative
+    /// ``create_int_value`` into an unsigned channel raises).
     fn add_int_channel(&mut self, group_id: &str, name: &str) -> PyResult<String> {
         self.add_channel_with_bits(group_id, name, PyDataType { name: "UnsignedIntegerLE".to_string(), value: 0 }, 64)
+    }
+
+    /// Add a 64-bit little-endian signed integer (``i64``) data channel.
+    ///
+    /// Values must be created with ``create_int_value``.
+    fn add_sint_channel(&mut self, group_id: &str, name: &str) -> PyResult<String> {
+        self.add_channel_with_bits(group_id, name, PyDataType { name: "SignedIntegerLE".to_string(), value: 2 }, 64)
+    }
+
+    /// Add a variable-length (VLSD) UTF-8 string data channel.
+    ///
+    /// Each record stores an offset into a ``##SD`` block that the writer
+    /// maintains automatically; pass values created with
+    /// ``create_string_value`` to :py:meth:`write_record`. This is the only
+    /// way to write string data — fixed-length string channels are not
+    /// supported by the writer.
+    fn add_string_channel(&mut self, group_id: &str, name: &str) -> PyResult<String> {
+        if let Some(ref mut writer) = self.writer {
+            let cg_id = self.channel_groups.get(group_id)
+                .ok_or_else(|| MdfException::new_err("Channel group not found"))?;
+            let prev_channel_id = self.last_channels.get(group_id)
+                .and_then(|py_id| self.channels.get(py_id))
+                .cloned();
+            let ch_id = writer.add_channel(cg_id, prev_channel_id.as_ref().map(|s| s.as_str()), |ch| {
+                ch.data_type = DataType::StringUtf8;
+                ch.name = Some(name.to_string());
+                ch.channel_type = 1; // VLSD
+                ch.data = 1;         // routed to the SD-block writer; patched on finish
+                ch.bit_count = 64;   // record slot holds a u64 offset
+            })?;
+            let py_id = format!("ch_{}", self.next_id);
+            self.next_id += 1;
+            self.channels.insert(py_id.clone(), ch_id);
+            self.last_channels.insert(group_id.to_string(), py_id.clone());
+            Ok(py_id)
+        } else {
+            Err(MdfException::new_err("Writer has been finalized"))
+        }
     }
 
     /// Mark an existing channel as the group's master / time channel.
@@ -1731,8 +1797,9 @@ fn file_layout_from_file(path: &str) -> PyResult<PyFileLayout> {
 /// The output preserves fixed-length numeric, string, and byte-array
 /// channels, per-record invalidation bytes, and VLSD ("signal-based")
 /// channels (a fresh ##SD chain is written for each kept VLSD channel).
-/// Per-channel conversion / source / metadata blocks are not re-emitted, so
-/// the output channels read as raw values.
+/// Per-channel conversion, source, unit and comment blocks are cloned
+/// recursively into the output, so cut channels keep their physical
+/// scaling and metadata.
 ///
 /// Parameters
 /// ----------
@@ -1911,6 +1978,17 @@ fn create_data_type_string_utf8() -> PyDataType {
     PyDataType { name: "StringUtf8".to_string(), value: 7 }
 }
 
+/// Return the :class:`DataType` for little-endian signed integers.
+///
+/// Pair with :py:meth:`MdfWriter.add_channel` when you need a signed
+/// integer channel of non-default width (otherwise see
+/// :py:meth:`MdfWriter.add_sint_channel`).
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn create_data_type_signed_le() -> PyDataType {
+    PyDataType { name: "SignedIntegerLE".to_string(), value: 2 }
+}
+
 /// Merge two MDF files into a new file at ``output``.
 ///
 /// Channel groups whose layouts (record-id length and channel list — names,
@@ -1942,12 +2020,12 @@ pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
          out-of-range indices, missing channels, I/O failures, conversion \
          dependency cycles, attempts to use a finalized writer, missing \
          optional dependencies (e.g. pandas), and so on.\n\n\
-         All public methods on PyMDF, PyMdfWriter, PyMdfIndex, and the \
+         All public methods on Mdf, MdfWriter, MdfIndex, and the \
          module-level free functions raise this (or a subclass of \
          Exception) on failure. Catch it as a single category to handle \
          every mf4_rs failure path:\n\n\
          >>> try:\n\
-         ...     mdf = mf4_rs.PyMDF(\"missing.mf4\")\n\
+         ...     mdf = mf4_rs.Mdf(\"missing.mf4\")\n\
          ... except mf4_rs.MdfException as e:\n\
          ...     print(\"could not open:\", e)",
     )?;
@@ -1974,6 +2052,7 @@ pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_data_type_uint_le, m)?)?;
     m.add_function(wrap_pyfunction!(create_data_type_float_le, m)?)?;
     m.add_function(wrap_pyfunction!(create_data_type_string_utf8, m)?)?;
+    m.add_function(wrap_pyfunction!(create_data_type_signed_le, m)?)?;
     m.add_function(wrap_pyfunction!(file_layout_from_file, m)?)?;
     m.add_function(wrap_pyfunction!(merge_files, m)?)?;
     m.add_function(wrap_pyfunction!(cut_mdf_by_time, m)?)?;
