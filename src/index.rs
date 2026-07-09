@@ -251,6 +251,22 @@ impl ByteRangeReader for FileRangeReader {
     fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, Self::Error> {
         use std::io::{Read, Seek, SeekFrom};
 
+        // Validate against the real file length *before* allocating: a forged
+        // or stale index could otherwise request an absurd length and abort
+        // the process on allocation failure.
+        let file_len = self.file.metadata().map_err(MdfError::IOError)?.len();
+        match offset.checked_add(length) {
+            Some(end) if end <= file_len => {}
+            _ => {
+                return Err(MdfError::TooShortBuffer {
+                    actual: file_len as usize,
+                    expected: offset.saturating_add(length) as usize,
+                    file: file!(),
+                    line: line!(),
+                });
+            }
+        }
+
         self.file.seek(SeekFrom::Start(offset))
             .map_err(|e| MdfError::IOError(e))?;
 
@@ -284,17 +300,22 @@ impl ByteRangeReader for MmapRangeReader {
     type Error = MdfError;
 
     fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, Self::Error> {
-        let start = offset as usize;
-        let end = start + length as usize;
-        if end > self.mmap.len() {
-            return Err(MdfError::TooShortBuffer {
-                actual: self.mmap.len(),
-                expected: end,
-                file: file!(),
-                line: line!(),
-            });
-        }
-        Ok(self.mmap[start..end].to_vec())
+        // Checked arithmetic: a forged offset/length must error, not wrap.
+        let end = match offset
+            .checked_add(length)
+            .and_then(|e| usize::try_from(e).ok())
+        {
+            Some(end) if end <= self.mmap.len() => end,
+            _ => {
+                return Err(MdfError::TooShortBuffer {
+                    actual: self.mmap.len(),
+                    expected: offset.saturating_add(length).min(usize::MAX as u64) as usize,
+                    file: file!(),
+                    line: line!(),
+                });
+            }
+        };
+        Ok(self.mmap[offset as usize..end].to_vec())
     }
 }
 
@@ -317,17 +338,22 @@ impl ByteRangeReader for SliceRangeReader {
     type Error = MdfError;
 
     fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, Self::Error> {
-        let start = offset as usize;
-        let end = start + length as usize;
-        if end > self.data.len() {
-            return Err(MdfError::TooShortBuffer {
-                actual: self.data.len(),
-                expected: end,
-                file: file!(),
-                line: line!(),
-            });
-        }
-        Ok(self.data[start..end].to_vec())
+        // Checked arithmetic: a forged offset/length must error, not wrap.
+        let end = match offset
+            .checked_add(length)
+            .and_then(|e| usize::try_from(e).ok())
+        {
+            Some(end) if end <= self.data.len() => end,
+            _ => {
+                return Err(MdfError::TooShortBuffer {
+                    actual: self.data.len(),
+                    expected: offset.saturating_add(length).min(usize::MAX as u64) as usize,
+                    file: file!(),
+                    line: line!(),
+                });
+            }
+        };
+        Ok(self.data[offset as usize..end].to_vec())
     }
 }
 
@@ -350,6 +376,11 @@ pub struct CachingRangeReader<R: ByteRangeReader<Error = MdfError>> {
     bypass: bool,
     underlying_requests: u64,
     cache_hits: u64,
+    /// Total size of the underlying resource, once learned. Whole-chunk
+    /// fetches are clamped against it so strict inner readers (which error on
+    /// reads past EOF) still work when the resource size is not a multiple of
+    /// `chunk_size`.
+    known_size: Option<u64>,
 }
 
 impl<R: ByteRangeReader<Error = MdfError>> CachingRangeReader<R> {
@@ -368,6 +399,7 @@ impl<R: ByteRangeReader<Error = MdfError>> CachingRangeReader<R> {
             bypass: false,
             underlying_requests: 0,
             cache_hits: 0,
+            known_size: None,
         }
     }
 
@@ -396,7 +428,7 @@ impl<R: ByteRangeReader<Error = MdfError>> CachingRangeReader<R> {
         self.read_range(offset, length).map(|_| ())
     }
 
-    fn ensure_chunks(&mut self, first: u64, last: u64) -> Result<(), MdfError> {
+    fn ensure_chunks(&mut self, first: u64, last: u64, requested_end: u64) -> Result<(), MdfError> {
         // Walk [first..=last], find each contiguous run of missing chunks,
         // issue one read per run.
         let mut idx = first;
@@ -411,9 +443,53 @@ impl<R: ByteRangeReader<Error = MdfError>> CachingRangeReader<R> {
             }
             let run_end = idx - 1;
             let read_offset = run_start * self.chunk_size;
-            let read_len = (run_end - run_start + 1) * self.chunk_size;
-            let bytes = self.inner.read_range(read_offset, read_len)?;
-            self.underlying_requests += 1;
+            let mut read_len = (run_end - run_start + 1) * self.chunk_size;
+
+            // Clamp against the known end of the resource: strict inner
+            // readers reject reads past EOF, and the final chunk is allowed
+            // to be short.
+            if let Some(size) = self.known_size {
+                if read_offset >= size {
+                    for slot in run_start..=run_end {
+                        self.chunks.insert(slot, Vec::new());
+                    }
+                    continue;
+                }
+                read_len = read_len.min(size - read_offset);
+            }
+
+            let bytes = match self.inner.read_range(read_offset, read_len) {
+                Ok(b) => {
+                    self.underlying_requests += 1;
+                    b
+                }
+                Err(e) => {
+                    self.underlying_requests += 1;
+                    // The whole-chunk read may extend past EOF (the resource
+                    // size need not be a multiple of chunk_size). Learn the
+                    // true end from the error when it reports one, otherwise
+                    // fall back to the span the caller actually asked for,
+                    // and retry clamped.
+                    let clamp_to = match &e {
+                        MdfError::TooShortBuffer { actual, .. }
+                            if (*actual as u64) > read_offset
+                                && (*actual as u64) < read_offset + read_len =>
+                        {
+                            self.known_size = Some(*actual as u64);
+                            *actual as u64
+                        }
+                        _ if requested_end > read_offset
+                            && requested_end < read_offset + read_len =>
+                        {
+                            requested_end
+                        }
+                        _ => return Err(e),
+                    };
+                    let b = self.inner.read_range(read_offset, clamp_to - read_offset)?;
+                    self.underlying_requests += 1;
+                    b
+                }
+            };
 
             // Split the response into chunk-sized pieces. The last chunk
             // may be short if the file ends partway through it.
@@ -446,15 +522,34 @@ impl<R: ByteRangeReader<Error = MdfError>> ByteRangeReader for CachingRangeReade
 
         let first = offset / self.chunk_size;
         let last = (offset + length - 1) / self.chunk_size;
+        let read_end = offset + length;
+
+        // A chunk cached from an earlier EOF-clamped read may be shorter than
+        // the span this read needs from it. Drop such chunks so ensure_chunks
+        // refetches them (clamped to this read's span or the known size).
+        for i in first..=last {
+            if let Some(chunk) = self.chunks.get(&i) {
+                let chunk_start = i * self.chunk_size;
+                let cached_end = chunk_start + chunk.len() as u64;
+                let mut needed_end = read_end.min(chunk_start + self.chunk_size);
+                if let Some(size) = self.known_size {
+                    needed_end = needed_end.min(size);
+                }
+                if cached_end < needed_end {
+                    self.chunks.remove(&i);
+                }
+            }
+        }
 
         // Track cache-hit metric only when no underlying read is required.
         let need_fetch = (first..=last).any(|i| !self.chunks.contains_key(&i));
-        self.ensure_chunks(first, last)?;
+        self.ensure_chunks(first, last, read_end)?;
         if !need_fetch {
             self.cache_hits += 1;
         }
 
-        let mut out = Vec::with_capacity(length as usize);
+        // Capacity capped so a forged huge length cannot abort on allocation.
+        let mut out = Vec::with_capacity(length.min(1 << 24) as usize);
         let mut remaining = length as usize;
         let mut cursor = offset;
         while remaining > 0 {
@@ -600,22 +695,50 @@ impl ByteRangeReader for HttpRangeReader {
             .map_err(|e| MdfError::BlockSerializationError(format!("HTTP GET error: {e}")))?;
         self.request_count += 1;
 
-        // Trust the server's Content-Length over our requested length: when
-        // the requested range extends past EOF the server caps the response,
-        // and in that case `take(length)` would block waiting for bytes the
-        // server is never going to send if keep-alive semantics confuse the
-        // underlying reader.
-        let content_length = resp
-            .header("Content-Length")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(length);
-        let to_read = content_length.min(length);
+        // 206 Partial Content is the accepted path. A 200 means the server
+        // ignored the Range header and sent the whole resource: that is only
+        // usable when the requested range starts at offset 0 (the body can be
+        // truncated to `length`); for any other offset the first `length`
+        // bytes would silently come from the wrong position, so error out.
+        let status = resp.status();
+        match status {
+            206 => {}
+            200 => {
+                if offset != 0 {
+                    return Err(MdfError::BlockSerializationError(format!(
+                        "HTTP server ignored Range request (status 200) for offset {}; \
+                         refusing to return bytes from the wrong position",
+                        offset
+                    )));
+                }
+            }
+            other => {
+                return Err(MdfError::BlockSerializationError(format!(
+                    "HTTP range request returned unexpected status {other}"
+                )));
+            }
+        }
 
-        let mut buf = Vec::with_capacity(to_read as usize);
+        // Read at most `length` bytes (a 200 response carries the whole
+        // resource and must be truncated), then insist we actually received
+        // all of them: a short body must be an error, not silently fewer
+        // records. Capacity is capped so a forged huge length cannot abort
+        // on allocation.
+        let mut buf = Vec::with_capacity(length.min(1 << 20) as usize);
         resp.into_reader()
-            .take(to_read)
+            .take(length)
             .read_to_end(&mut buf)
             .map_err(MdfError::IOError)?;
+        if (buf.len() as u64) < length {
+            // Report absolute positions so wrappers (e.g. CachingRangeReader)
+            // can learn the resource's true end from `actual`.
+            return Err(MdfError::TooShortBuffer {
+                actual: (offset + buf.len() as u64) as usize,
+                expected: (offset + length) as usize,
+                file: file!(),
+                line: line!(),
+            });
+        }
         Ok(buf)
     }
 }
@@ -662,6 +785,18 @@ impl MdfIndex {
         let mut indexed_groups = Vec::new();
 
         for group in mdf.channel_groups() {
+            // Unsorted data groups (a record-ID prefix with several channel
+            // groups sharing the same data blocks) would make every CG index
+            // the same interleaved records as if they were all its own.
+            let raw_dg = group.raw_data_group();
+            if raw_dg.block.record_id_len > 0 && raw_dg.channel_groups.len() > 1 {
+                return Err(MdfError::BlockSerializationError(
+                    "unsorted data groups (record IDs with multiple channel groups) \
+                     are not supported by the index"
+                        .to_string(),
+                ));
+            }
+
             let mut indexed_channels = Vec::new();
             let mmap = group.mmap();
 
@@ -964,9 +1099,104 @@ impl MdfIndex {
     }
 
     /// Deserialize an index from a JSON string (available on all targets).
+    ///
+    /// The deserialized index is [validated](Self::validate) so hostile or
+    /// stale index data errors here instead of panicking later during reads.
     pub fn from_json(json: &str) -> Result<Self, MdfError> {
-        serde_json::from_str(json)
-            .map_err(|e| MdfError::BlockSerializationError(format!("JSON deserialization failed: {}", e)))
+        let index: Self = serde_json::from_str(json)
+            .map_err(|e| MdfError::BlockSerializationError(format!("JSON deserialization failed: {}", e)))?;
+        index.validate()?;
+        Ok(index)
+    }
+
+    /// Validate structural invariants of the index.
+    ///
+    /// Called from [`Self::from_json`] / [`Self::load_from_file`] so that
+    /// malformed (hostile or stale) index data returns an error instead of
+    /// causing panics, integer underflow, or huge allocations during reads.
+    pub fn validate(&self) -> Result<(), MdfError> {
+        for group in &self.channel_groups {
+            let group_name = group.name.as_deref().unwrap_or("<unnamed>");
+            for db in &group.data_blocks {
+                if db.size < 24 {
+                    return Err(MdfError::BlockSerializationError(format!(
+                        "invalid index: group '{}' data block at offset {} has size {} \
+                         (smaller than the 24-byte block header)",
+                        group_name, db.file_offset, db.size
+                    )));
+                }
+                if db.file_offset.checked_add(db.size).is_none() {
+                    return Err(MdfError::BlockSerializationError(format!(
+                        "invalid index: group '{}' data block at offset {} with size {} \
+                         overflows the file address space",
+                        group_name, db.file_offset, db.size
+                    )));
+                }
+            }
+            if !group.data_blocks.is_empty() {
+                Self::checked_record_size(group)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Total on-disk record size (record id + data + invalidation bytes) for
+    /// a group, validated non-zero so callers can safely divide by it.
+    fn checked_record_size(group: &IndexedChannelGroup) -> Result<usize, MdfError> {
+        let size = group.record_id_len as usize
+            + group.record_size as usize
+            + group.invalidation_bytes as usize;
+        if size == 0 {
+            return Err(MdfError::BlockSerializationError(format!(
+                "invalid index: channel group '{}' has record size 0",
+                group.name.as_deref().unwrap_or("<unnamed>")
+            )));
+        }
+        Ok(size)
+    }
+
+    /// Size of a data block's data section (block size minus the 24-byte
+    /// header), validated so a corrupt/forged block size cannot underflow.
+    fn data_section_size(data_block: &DataBlockInfo) -> Result<u64, MdfError> {
+        data_block.size.checked_sub(24).ok_or_else(|| {
+            MdfError::BlockSerializationError(format!(
+                "invalid index: data block at offset {} has size {} \
+                 (smaller than the 24-byte block header)",
+                data_block.file_offset, data_block.size
+            ))
+        })
+    }
+
+    /// Number of whole records in a data block's data section.
+    ///
+    /// Errors if the block size underflows the header or if the data section
+    /// is not a multiple of the record size — a record spanning data-block
+    /// fragments is unsupported and silently flooring would decode garbage
+    /// for every record after the split.
+    fn records_in_block(data_block: &DataBlockInfo, record_size: usize) -> Result<u64, MdfError> {
+        let data_len = Self::data_section_size(data_block)?;
+        if data_len % record_size as u64 != 0 {
+            return Err(MdfError::BlockSerializationError(format!(
+                "data block at offset {}: data section of {} bytes is not a multiple of \
+                 the {}-byte record — record spans data block fragments, which is unsupported",
+                data_block.file_offset, data_len, record_size
+            )));
+        }
+        Ok(data_len / record_size as u64)
+    }
+
+    /// Error for VLSD channels on read paths that only handle fixed-size
+    /// records. Triggers on `channel_type == 1` regardless of whether the SD
+    /// address was captured: a VLSD channel without one is equally unreadable,
+    /// and decoding the inline 8-byte SD offsets would return garbage.
+    fn ensure_not_vlsd(channel: &IndexedChannel) -> Result<(), MdfError> {
+        if channel.channel_type == 1 {
+            return Err(MdfError::BlockSerializationError(format!(
+                "VLSD channel '{}' not yet supported in index reader",
+                channel.name.as_deref().unwrap_or("<unnamed>")
+            )));
+        }
+        Ok(())
     }
 
     /// Read channel values using the index and a byte range reader.
@@ -990,10 +1220,9 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
-        // Handle VLSD channels differently
-        if channel.channel_type == 1 && channel.vlsd_data_address.is_some() {
-            return self.read_vlsd_channel_values(group, channel, reader);
-        }
+        // VLSD channels are not supported: decoding their inline SD offsets
+        // as payload would return garbage.
+        Self::ensure_not_vlsd(channel)?;
 
         // For regular channels, read from data blocks
         self.read_regular_channel_values(group, channel, reader)
@@ -1017,21 +1246,25 @@ impl MdfIndex {
         channel: &IndexedChannel,
         reader: &mut R,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
-        let record_size = group.record_id_len as usize + group.record_size as usize + group.invalidation_bytes as usize;
-        let total_records: usize = group.data_blocks.iter()
-            .map(|db| ((db.size - 24) / record_size as u64) as usize)
-            .sum();
-        let mut values = Vec::with_capacity(total_records);
-        let temp_cb = channel.to_channel_block();
-
+        let record_size = Self::checked_record_size(group)?;
+        let mut total_records: usize = 0;
         for data_block in &group.data_blocks {
             if data_block.is_compressed {
                 return Err(MdfError::BlockSerializationError(
                     "Compressed blocks not yet supported in index reader".to_string()
                 ));
             }
+            total_records += Self::records_in_block(data_block, record_size)? as usize;
+        }
+        // Cap the pre-allocation: `total_records` derives from index-supplied
+        // block sizes, and a forged value must not abort on allocation. The
+        // vector still grows as needed; real reads fail earlier at the reader.
+        let mut values = Vec::with_capacity(total_records.min(1 << 24));
+        let temp_cb = channel.to_channel_block();
 
-            let block_data = reader.read_range(data_block.file_offset + 24, data_block.size - 24)?;
+        for data_block in &group.data_blocks {
+            let block_data = reader
+                .read_range(data_block.file_offset + 24, Self::data_section_size(data_block)?)?;
             Self::decode_records_to_values(&block_data, record_size, group, channel, &temp_cb, &mut values)?;
         }
 
@@ -1048,6 +1281,19 @@ impl MdfIndex {
         temp_cb: &crate::blocks::channel_block::ChannelBlock,
         values: &mut Vec<Option<DecodedValue>>,
     ) -> Result<(), MdfError> {
+        if record_size == 0 {
+            return Err(MdfError::BlockSerializationError(
+                "invalid index: record size is 0".to_string(),
+            ));
+        }
+        if block_data.len() % record_size != 0 {
+            return Err(MdfError::BlockSerializationError(format!(
+                "data block length {} is not a multiple of the {}-byte record — \
+                 record spans data block fragments, which is unsupported",
+                block_data.len(),
+                record_size
+            )));
+        }
         let record_count = block_data.len() / record_size;
         let record_id_len = group.record_id_len as usize;
         let cg_data_bytes = group.record_size;
@@ -1087,10 +1333,31 @@ impl MdfIndex {
         has_conversion: bool,
         values: &mut Vec<f64>,
     ) -> Result<(), MdfError> {
+        if record_size == 0 {
+            return Err(MdfError::BlockSerializationError(
+                "invalid index: record size is 0".to_string(),
+            ));
+        }
+        if block_data.len() % record_size != 0 {
+            return Err(MdfError::BlockSerializationError(format!(
+                "data block length {} is not a multiple of the {}-byte record — \
+                 record spans data block fragments, which is unsupported",
+                block_data.len(),
+                record_size
+            )));
+        }
         let record_count = block_data.len() / record_size;
         let record_id_len = group.record_id_len as usize;
         let cg_data_bytes = group.record_size;
         let has_invalidation = group.invalidation_bytes > 0;
+
+        // MDF 4.1: cn_flags bit 0 ("all values invalid") applies regardless
+        // of whether the group carries invalidation bytes. Short-circuit to
+        // NaN for every sample, matching decode_records_to_values.
+        if channel.flags & 0x1 != 0 {
+            values.extend(std::iter::repeat(f64::NAN).take(record_count));
+            return Ok(());
+        }
 
         if !has_invalidation && !has_conversion {
             // Fastest path: no invalidation, no conversion - just decode f64 directly
@@ -1162,19 +1429,6 @@ impl MdfIndex {
             }
         }
         Ok(())
-    }
-
-    /// Read values for a VLSD channel
-    fn read_vlsd_channel_values<R: ByteRangeReader<Error = MdfError>>(
-        &self,
-        _group: &IndexedChannelGroup,
-        _channel: &IndexedChannel,
-        _reader: &mut R,
-    ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
-        // TODO: Implement VLSD channel reading
-        Err(MdfError::BlockSerializationError(
-            "VLSD channels not yet supported in index reader".to_string()
-        ))
     }
 
     /// All channel groups in the file, in file order.
@@ -1450,12 +1704,8 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
-        // Handle VLSD channels differently
-        if channel.channel_type == 1 && channel.vlsd_data_address.is_some() {
-            return Err(MdfError::BlockSerializationError(
-                "VLSD channels not yet supported for byte range calculation".to_string()
-            ));
-        }
+        // VLSD channels not supported for byte range calculation
+        Self::ensure_not_vlsd(channel)?;
 
         // For regular channels, calculate byte ranges from data blocks
         self.calculate_regular_channel_byte_ranges(group, channel)
@@ -1487,20 +1737,23 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
-        // Validate record range
-        if start_record + record_count > group.record_count {
+        // Validate record range with checked arithmetic (forged inputs must
+        // error, not wrap), and without underflowing when record_count == 0.
+        let end_record = start_record.checked_add(record_count).ok_or_else(|| {
+            MdfError::BlockSerializationError(format!(
+                "Record range overflow: start {} + count {}",
+                start_record, record_count
+            ))
+        })?;
+        if end_record > group.record_count {
             return Err(MdfError::BlockSerializationError(
-                format!("Record range {}-{} exceeds total records {}", 
-                    start_record, start_record + record_count - 1, group.record_count)
+                format!("Record range starting at {} for {} records exceeds total records {}",
+                    start_record, record_count, group.record_count)
             ));
         }
 
-        // Handle VLSD channels differently
-        if channel.channel_type == 1 && channel.vlsd_data_address.is_some() {
-            return Err(MdfError::BlockSerializationError(
-                "VLSD channels not yet supported for byte range calculation".to_string()
-            ));
-        }
+        // VLSD channels not supported for byte range calculation
+        Self::ensure_not_vlsd(channel)?;
 
         self.calculate_channel_byte_ranges_for_records(group, channel, start_record, record_count)
     }
@@ -1523,7 +1776,7 @@ impl MdfIndex {
         record_count: u64,
     ) -> Result<Vec<(u64, u64)>, MdfError> {
         // Record structure: record_id + data_bytes + invalidation_bytes
-        let record_size = group.record_id_len as usize + group.record_size as usize + group.invalidation_bytes as usize;
+        let record_size = Self::checked_record_size(group)?;
         let channel_offset_in_record = group.record_id_len as usize + channel.byte_offset as usize;
         
         // Calculate how many bytes this channel needs per record
@@ -1547,8 +1800,7 @@ impl MdfIndex {
             }
 
             let block_data_start = data_block.file_offset + 24; // Skip block header
-            let block_data_size = data_block.size - 24;
-            let records_in_block = block_data_size / record_size as u64;
+            let records_in_block = Self::records_in_block(data_block, record_size)?;
             
             // Determine which records from this block we need
             let block_start_record = records_processed;
@@ -1593,6 +1845,12 @@ impl MdfIndex {
     /// in the record layout and any data-block splitting. Resolves the first
     /// channel matching `name`. Power-user entry point for issuing HTTP-range
     /// or S3 partial reads yourself.
+    ///
+    /// Note: each returned range is one *coalesced* span per data-block
+    /// fragment, running from the first byte of the channel in the fragment's
+    /// first record to its last byte in the fragment's last record. Because
+    /// records interleave all channels of the group, the span **includes the
+    /// bytes of the other channels** lying between this channel's samples.
     pub fn byte_ranges(&self, name: &str) -> Result<Vec<(u64, u64)>, MdfError> {
         let (g, c) = self.locate(name).ok_or_else(|| {
             MdfError::BlockSerializationError(format!("Channel '{}' not found", name))
@@ -1613,8 +1871,10 @@ impl MdfIndex {
 
     /// Byte ranges for a record window of a channel, by name.
     ///
-    /// `start_record` is 0-based; `record_count` is clamped to the records
-    /// available. Useful for paging through a large channel.
+    /// `start_record` is 0-based. Errors if `start_record + record_count`
+    /// exceeds the records available. Useful for paging through a large
+    /// channel. See [`MdfIndex::byte_ranges`] for what each returned span
+    /// covers.
     pub fn byte_ranges_for_records(
         &self,
         name: &str,
@@ -1643,26 +1903,33 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
-        let record_size = group.record_id_len as usize
-            + group.record_size as usize
-            + group.invalidation_bytes as usize;
+        // VLSD channels are not supported: decoding their inline SD offsets
+        // as payload would return garbage.
+        Self::ensure_not_vlsd(channel)?;
 
-        let total_records: usize = group.data_blocks.iter()
-            .map(|db| ((db.size - 24) / record_size as u64) as usize)
-            .sum();
-        let mut values = Vec::with_capacity(total_records);
+        let record_size = Self::checked_record_size(group)?;
 
-        let temp_cb = channel.to_decode_only_channel_block();
-        let linear_coeffs = Self::get_linear_coeffs(channel);
-        let has_conversion = channel.conversion.is_some();
-
+        let mut total_records: usize = 0;
         for data_block in &group.data_blocks {
             if data_block.is_compressed {
                 return Err(MdfError::BlockSerializationError(
                     "Compressed blocks not yet supported in index reader".to_string()
                 ));
             }
-            let block_data = reader.read_range(data_block.file_offset + 24, data_block.size - 24)?;
+            total_records += Self::records_in_block(data_block, record_size)? as usize;
+        }
+        // Cap the pre-allocation: `total_records` derives from index-supplied
+        // block sizes, and a forged value must not abort on allocation. The
+        // vector still grows as needed; real reads fail earlier at the reader.
+        let mut values = Vec::with_capacity(total_records.min(1 << 24));
+
+        let temp_cb = channel.to_decode_only_channel_block();
+        let linear_coeffs = Self::get_linear_coeffs(channel);
+        let has_conversion = channel.conversion.is_some();
+
+        for data_block in &group.data_blocks {
+            let block_data = reader
+                .read_range(data_block.file_offset + 24, Self::data_section_size(data_block)?)?;
             Self::decode_records_to_f64(&block_data, record_size, group, channel, &temp_cb, linear_coeffs, has_conversion, &mut values)?;
         }
 
@@ -1686,21 +1953,27 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
-        let record_size = group.record_id_len as usize
-            + group.record_size as usize
-            + group.invalidation_bytes as usize;
-        let total_records: usize = group.data_blocks.iter()
-            .map(|db| ((db.size - 24) / record_size as u64) as usize)
-            .sum();
-        let mut values = Vec::with_capacity(total_records);
-        let temp_cb = channel.to_channel_block();
+        // VLSD channels are not supported: decoding their inline SD offsets
+        // as payload would return garbage.
+        Self::ensure_not_vlsd(channel)?;
 
+        let record_size = Self::checked_record_size(group)?;
+        let mut total_records: usize = 0;
         for data_block in &group.data_blocks {
             if data_block.is_compressed {
                 return Err(MdfError::BlockSerializationError(
                     "Compressed blocks not yet supported in index reader".to_string()
                 ));
             }
+            total_records += Self::records_in_block(data_block, record_size)? as usize;
+        }
+        // Cap the pre-allocation: `total_records` derives from index-supplied
+        // block sizes, and a forged value must not abort on allocation. The
+        // vector still grows as needed; real reads fail earlier at the reader.
+        let mut values = Vec::with_capacity(total_records.min(1 << 24));
+        let temp_cb = channel.to_channel_block();
+
+        for data_block in &group.data_blocks {
             let block_data = Self::slice_data_block(file_data, data_block)?;
             Self::decode_records_to_values(block_data, record_size, group, channel, &temp_cb, &mut values)?;
         }
@@ -1725,23 +1998,29 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
-        let record_size = group.record_id_len as usize
-            + group.record_size as usize
-            + group.invalidation_bytes as usize;
-        let total_records: usize = group.data_blocks.iter()
-            .map(|db| ((db.size - 24) / record_size as u64) as usize)
-            .sum();
-        let mut values = Vec::with_capacity(total_records);
-        let temp_cb = channel.to_decode_only_channel_block();
-        let linear_coeffs = Self::get_linear_coeffs(channel);
-        let has_conversion = channel.conversion.is_some();
+        // VLSD channels are not supported: decoding their inline SD offsets
+        // as payload would return garbage.
+        Self::ensure_not_vlsd(channel)?;
 
+        let record_size = Self::checked_record_size(group)?;
+        let mut total_records: usize = 0;
         for data_block in &group.data_blocks {
             if data_block.is_compressed {
                 return Err(MdfError::BlockSerializationError(
                     "Compressed blocks not yet supported in index reader".to_string()
                 ));
             }
+            total_records += Self::records_in_block(data_block, record_size)? as usize;
+        }
+        // Cap the pre-allocation: `total_records` derives from index-supplied
+        // block sizes, and a forged value must not abort on allocation. The
+        // vector still grows as needed; real reads fail earlier at the reader.
+        let mut values = Vec::with_capacity(total_records.min(1 << 24));
+        let temp_cb = channel.to_decode_only_channel_block();
+        let linear_coeffs = Self::get_linear_coeffs(channel);
+        let has_conversion = channel.conversion.is_some();
+
+        for data_block in &group.data_blocks {
             let block_data = Self::slice_data_block(file_data, data_block)?;
             Self::decode_records_to_f64(block_data, record_size, group, channel, &temp_cb, linear_coeffs, has_conversion, &mut values)?;
         }
@@ -1750,10 +2029,29 @@ impl MdfIndex {
     }
 
     /// Slice a data block from file_data, skipping the 24-byte block header.
+    /// Uses checked arithmetic so a forged offset/size errors instead of
+    /// wrapping or panicking.
     #[allow(dead_code)] // used by the Python bindings (pyo3 feature)
     fn slice_data_block<'a>(file_data: &'a [u8], data_block: &DataBlockInfo) -> Result<&'a [u8], MdfError> {
-        let data_start = (data_block.file_offset + 24) as usize;
-        let data_end = data_start + (data_block.size - 24) as usize;
+        let data_len = Self::data_section_size(data_block)?;
+        let bounds = data_block
+            .file_offset
+            .checked_add(24)
+            .and_then(|start| start.checked_add(data_len).map(|end| (start, end)))
+            .and_then(|(start, end)| {
+                Some((usize::try_from(start).ok()?, usize::try_from(end).ok()?))
+            });
+        let (data_start, data_end) = match bounds {
+            Some(b) => b,
+            None => {
+                return Err(MdfError::TooShortBuffer {
+                    actual: file_data.len(),
+                    expected: usize::MAX,
+                    file: file!(),
+                    line: line!(),
+                });
+            }
+        };
         if data_end > file_data.len() {
             return Err(MdfError::TooShortBuffer {
                 actual: file_data.len(),

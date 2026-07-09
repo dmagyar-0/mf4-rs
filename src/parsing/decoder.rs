@@ -147,6 +147,13 @@ pub fn decode_f64_from_record(
         return f64::NAN;
     }
 
+    // bit_count == 0 has no value to decode (and would underflow the
+    // sign-bit computation below); bit_offset must be 0..=7 per the spec
+    // (larger values would overflow the shifts below).
+    if bit_count == 0 || bit_offset > 7 {
+        return f64::NAN;
+    }
+
     let num_bytes = ((bit_offset + bit_count + 7) / 8).max(1);
     if base_offset + num_bytes > record.len() {
         return f64::NAN;
@@ -162,7 +169,10 @@ pub fn decode_f64_from_record(
                     return LittleEndian::read_f32(slice) as f64;
                 }
             }
-            let raw = slice.iter().rev().fold(0u64, |acc, &b| (acc << 8) | b as u64);
+            // Fold into u128 so a 64-bit field spanning 9 bytes (bit_offset
+            // != 0) survives the shift, then drop the leading bit_offset bits.
+            let raw = slice.iter().rev().fold(0u128, |acc, &b| (acc << 8) | b as u128);
+            let raw = (raw >> bit_offset) as u64;
             if bit_count == 32 {
                 f32::from_bits(raw as u32) as f64
             } else if bit_count == 64 {
@@ -179,7 +189,8 @@ pub fn decode_f64_from_record(
                     return BigEndian::read_f32(slice) as f64;
                 }
             }
-            let raw = slice.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
+            let raw = slice.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128);
+            let raw = (raw >> bit_offset) as u64;
             if bit_count == 32 {
                 f32::from_bits(raw as u32) as f64
             } else if bit_count == 64 {
@@ -279,9 +290,36 @@ fn decode_value_internal(
     let bit_offset = channel.bit_offset as usize;
     let bit_count = channel.bit_count as usize;
 
+    let is_numeric = matches!(
+        channel.data_type,
+        DataType::UnsignedIntegerLE
+            | DataType::UnsignedIntegerBE
+            | DataType::SignedIntegerLE
+            | DataType::SignedIntegerBE
+            | DataType::FloatLE
+            | DataType::FloatBE
+    );
+
+    // bit_count == 0 has no value to decode (and would underflow the
+    // sign-bit computation for signed integers); bit_offset must be 0..=7
+    // per the spec (larger values would overflow the shifts below).
+    if is_numeric && (bit_count == 0 || bit_offset > 7) {
+        return None;
+    }
+
     let slice: &[u8] = if channel.channel_type == 1 && channel.data != 0 {
-        // VLSD: the entire record *is* the payload
-        record
+        // VLSD: the entire record *is* the payload. Numeric types are still
+        // read with a fixed width, so a short payload must yield None
+        // instead of panicking inside the fixed-width readers.
+        if is_numeric {
+            let needed = ((bit_offset + bit_count + 7) / 8).max(1);
+            if record.len() < needed {
+                return None;
+            }
+            &record[..needed]
+        } else {
+            record
+        }
     } else {
         // For non-numeric types, assume the field is stored in whole bytes.
         let num_bytes = if matches!(channel.data_type,
@@ -382,7 +420,10 @@ fn decode_value_internal(
                     return Some(DecodedValue::Float(LittleEndian::read_f64(slice)));
                 }
             }
-            let raw = slice.iter().rev().fold(0u64, |acc, &b| (acc << 8) | b as u64);
+            // Fold into u128 so a 64-bit field spanning 9 bytes (bit_offset
+            // != 0) survives the shift, then drop the leading bit_offset bits.
+            let raw = slice.iter().rev().fold(0u128, |acc, &b| (acc << 8) | b as u128);
+            let raw = (raw >> bit_offset) as u64;
             if bit_count == 32 {
                 Some(DecodedValue::Float(f32::from_bits(raw as u32) as f64))
             } else if bit_count == 64 {
@@ -399,7 +440,8 @@ fn decode_value_internal(
                     return Some(DecodedValue::Float(BigEndian::read_f64(slice)));
                 }
             }
-            let raw = slice.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
+            let raw = slice.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128);
+            let raw = (raw >> bit_offset) as u64;
             if bit_count == 32 {
                 Some(DecodedValue::Float(f32::from_bits(raw as u32) as f64))
             } else if bit_count == 64 {
@@ -409,33 +451,41 @@ fn decode_value_internal(
             }
         },
         DataType::StringLatin1 => {
-            // Latin1: each byte maps directly to a character.
-            let s: String = slice.iter().map(|&b| b as char).collect();
-            Some(DecodedValue::String(s.trim_end_matches('\0').to_string()))
+            // Latin1: each byte maps directly to a character. The value is a
+            // NUL-terminated string: stop at the first NUL byte (matches
+            // asammdf) instead of only trimming trailing NULs.
+            let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+            let s: String = slice[..end].iter().map(|&b| b as char).collect();
+            Some(DecodedValue::String(s))
         },
         DataType::StringUtf8 => {
-            match std::str::from_utf8(slice) {
-                Ok(s) => Some(DecodedValue::String(s.trim_end_matches('\0').to_string())),
+            let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+            match std::str::from_utf8(&slice[..end]) {
+                Ok(s) => Some(DecodedValue::String(s.to_string())),
                 Err(_) => Some(DecodedValue::String(String::from("<Invalid UTF8>")))
             }
         },
         DataType::StringUtf16LE => {
-            if slice.len() % 2 != 0 { return None; }
-            let u16_data: Vec<u16> = slice.chunks_exact(2)
+            // An odd byte count cannot form a code unit: drop the trailing
+            // byte instead of refusing to decode the value.
+            let even = &slice[..slice.len() & !1];
+            let u16_data: Vec<u16> = even.chunks_exact(2)
                 .map(|chunk| LittleEndian::read_u16(chunk))
                 .collect();
-            match String::from_utf16(&u16_data) {
-                Ok(s) => Some(DecodedValue::String(s.trim_end_matches('\0').to_string())),
+            let end = u16_data.iter().position(|&u| u == 0).unwrap_or(u16_data.len());
+            match String::from_utf16(&u16_data[..end]) {
+                Ok(s) => Some(DecodedValue::String(s)),
                 Err(_) => Some(DecodedValue::String(String::from("<Invalid UTF16LE>")))
             }
         },
         DataType::StringUtf16BE => {
-            if slice.len() % 2 != 0 { return None; }
-            let u16_data: Vec<u16> = slice.chunks_exact(2)
+            let even = &slice[..slice.len() & !1];
+            let u16_data: Vec<u16> = even.chunks_exact(2)
                 .map(|chunk| BigEndian::read_u16(chunk))
                 .collect();
-            match String::from_utf16(&u16_data) {
-                Ok(s) => Some(DecodedValue::String(s.trim_end_matches('\0').to_string())),
+            let end = u16_data.iter().position(|&u| u == 0).unwrap_or(u16_data.len());
+            match String::from_utf16(&u16_data[..end]) {
+                Ok(s) => Some(DecodedValue::String(s)),
                 Err(_) => Some(DecodedValue::String(String::from("<Invalid UTF16BE>")))
             }
         },

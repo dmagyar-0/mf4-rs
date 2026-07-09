@@ -688,9 +688,29 @@ class MdfWriter:
         r"""
         Add a 64-bit little-endian unsigned integer (``u64``) data channel.
         
-        For signed integers, build a generic channel with
-        :py:meth:`add_channel` and ``create_data_type_*`` helpers (or call
-        directly with the raw :class:`DataType`).
+        Values must be created with ``create_uint_value``. For signed
+        integers use :py:meth:`add_sint_channel` (writing a negative
+        ``create_int_value`` into an unsigned channel raises).
+        """
+        ...
+
+    def add_sint_channel(self, group_id:builtins.str, name:builtins.str) -> builtins.str:
+        r"""
+        Add a 64-bit little-endian signed integer (``i64``) data channel.
+        
+        Values must be created with ``create_int_value``.
+        """
+        ...
+
+    def add_string_channel(self, group_id:builtins.str, name:builtins.str) -> builtins.str:
+        r"""
+        Add a variable-length (VLSD) UTF-8 string data channel.
+        
+        Each record stores an offset into a ``##SD`` block that the writer
+        maintains automatically; pass values created with
+        ``create_string_value`` to :py:meth:`write_record`. This is the only
+        way to write string data — fixed-length string channels are not
+        supported by the writer.
         """
         ...
 
@@ -845,6 +865,16 @@ def create_data_type_float_le() -> DataType:
     """
     ...
 
+def create_data_type_signed_le() -> DataType:
+    r"""
+    Return the :class:`DataType` for little-endian signed integers.
+    
+    Pair with :py:meth:`MdfWriter.add_channel` when you need a signed
+    integer channel of non-default width (otherwise see
+    :py:meth:`MdfWriter.add_sint_channel`).
+    """
+    ...
+
 def create_data_type_string_utf8() -> DataType:
     r"""
     Return the :class:`DataType` for UTF-8 encoded string channels.
@@ -903,8 +933,9 @@ def cut_mdf_by_time(input_path:builtins.str, output_path:builtins.str, start_tim
     The output preserves fixed-length numeric, string, and byte-array
     channels, per-record invalidation bytes, and VLSD ("signal-based")
     channels (a fresh ##SD chain is written for each kept VLSD channel).
-    Per-channel conversion / source / metadata blocks are not re-emitted, so
-    the output channels read as raw values.
+    Per-channel conversion, source, unit and comment blocks are cloned
+    recursively into the output, so cut channels keep their physical
+    scaling and metadata.
     
     Parameters
     ----------

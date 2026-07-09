@@ -36,12 +36,27 @@ impl BlockParse<'_> for SourceBlock {
     fn from_bytes(bytes: &[u8]) -> Result<Self, MdfError> {
 
         let header = Self::parse_header(bytes)?;
-        
+
+        // Validate the buffer is long enough for the link section AND the
+        // three data bytes that follow it, before reading anything.
+        // (u64 arithmetic avoids overflow for absurd links_nr values.)
+        let required = 24u64
+            .saturating_add(header.links_nr.saturating_mul(8))
+            .saturating_add(3);
+        if (bytes.len() as u64) < required {
+            return Err(MdfError::TooShortBuffer {
+                actual:   bytes.len(),
+                expected: usize::try_from(required).unwrap_or(usize::MAX),
+                file:     file!(),
+                line:     line!(),
+            });
+        }
+        let link_count = header.links_nr as usize;
+
         // Link section: one LINK (u64 LE) per link_count (max 3 meaningful)
         let mut name_addr    = 0;
         let mut path_addr    = 0;
         let mut comment_addr = 0;
-        let link_count = header.links_nr as usize;
         for i in 0..link_count.min(3) {
             let off = 24 + i * 8;
             let link = LittleEndian::read_u64(&bytes[off..off + 8]);
@@ -54,18 +69,7 @@ impl BlockParse<'_> for SourceBlock {
         }
 
         // Data section immediately after all links:
-        
         let data_start = 24 + link_count * 8;
-
-        let expected_bytes = data_start + 2;
-        if bytes.len() < expected_bytes {
-            return Err(MdfError::TooShortBuffer {
-                actual:   bytes.len(),
-                expected: expected_bytes,
-                file:     file!(),
-                line:     line!(),
-            });
-        }
         let source_type = bytes[data_start];
         let bus_type    = bytes[data_start + 1];
         let flags       = bytes[data_start + 2];
@@ -94,9 +98,31 @@ impl BlockParse<'_> for SourceBlock {
 pub fn read_source_block(mmap: &[u8], address: u64) -> Result<SourceBlock, MdfError> {
 
     let start = address as usize;
-    let header = BlockHeader::from_bytes(&mmap[start..start+24])?;
+    if start.checked_add(24).map_or(true, |end| end > mmap.len()) {
+        return Err(MdfError::TooShortBuffer {
+            actual:   mmap.len(),
+            expected: start.saturating_add(24),
+            file:     file!(),
+            line:     line!(),
+        });
+    }
+    let header = BlockHeader::from_bytes(&mmap[start..start + 24])?;
     // We know the total length from the header:
     let total_len = header.block_len as usize;
-    let slice = &mmap[start..start + total_len];
+    let end = start.checked_add(total_len).ok_or(MdfError::TooShortBuffer {
+        actual:   mmap.len(),
+        expected: usize::MAX,
+        file:     file!(),
+        line:     line!(),
+    })?;
+    if end > mmap.len() {
+        return Err(MdfError::TooShortBuffer {
+            actual:   mmap.len(),
+            expected: end,
+            file:     file!(),
+            line:     line!(),
+        });
+    }
+    let slice = &mmap[start..end];
     Ok(SourceBlock::from_bytes(slice)?)
 }

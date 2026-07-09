@@ -158,7 +158,7 @@ impl Default for HeaderBlock {
             first_attachment_addr: 0,
             first_event_addr: 0,
             comment_addr: 0,
-            abs_time: 2 * 3600 * 1000000000,
+            abs_time: 0,
             tz_offset: 0,
             daylight_save_time: 0,
             time_flags: 0,

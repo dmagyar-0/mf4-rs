@@ -41,11 +41,10 @@ pub fn apply_rational(block: &ConversionBlock, value: DecodedValue) -> Result<De
 
             let num = p1 * raw * raw + p2 * raw + p3;
             let den = p4 * raw * raw + p5 * raw + p6;
-            if den.abs() > std::f64::EPSILON {
-                Ok(DecodedValue::Float(num / den))
-            } else {
-                Ok(DecodedValue::Float(raw))
-            }
+            // Always divide: a true zero denominator yields IEEE 754 ±inf/NaN,
+            // matching asammdf. Guarding with an epsilon falsified results for
+            // legitimate tiny denominators (e.g. 1/x at x = 1e-20).
+            Ok(DecodedValue::Float(num / den))
         } else {
             Ok(DecodedValue::Float(raw))
         }
@@ -57,9 +56,13 @@ pub fn apply_rational(block: &ConversionBlock, value: DecodedValue) -> Result<De
 /// Apply an algebraic conversion using a stored formula.
 pub fn apply_algebraic(block: &ConversionBlock, value: DecodedValue) -> Result<DecodedValue, MdfError> {
     if let (Some(raw), Some(expr_str)) = (extract_numeric(&value), block.formula.as_ref()) {
+        // asammdf compatibility: files converted from MDF3 commonly use `X1`
+        // as the variable name; normalize it to `X` before evaluating.
+        let expr = expr_str.replace("X1", "X");
         let mut ctx = Context::new();
         ctx.var("X", raw);
-        match eval_str_with_context(expr_str, ctx) {
+        ctx.var("X1", raw); // bind both spellings so either form evaluates
+        match eval_str_with_context(&expr, ctx) {
             Ok(res) => Ok(DecodedValue::Float(res)),
             Err(_) => Ok(DecodedValue::Float(raw)),
         }

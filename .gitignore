@@ -123,3 +123,4 @@ Icon
 *.bak
 *.backup
 *.old
+.claude/

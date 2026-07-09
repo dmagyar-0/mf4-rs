@@ -10,14 +10,24 @@ pub struct DataBlock<'a> {
 
 impl<'a> BlockParse<'a> for DataBlock<'a> {
     const ID: &'static str = "##DT";
-    /// Parse a DTBLOCK from the given byte slice.
+    /// Parse a DTBLOCK or DVBLOCK from the given byte slice.
+    ///
+    /// Both `##DT` (record data) and `##DV` (sample data of a column-oriented
+    /// group) blocks share the same layout: a 24-byte header followed by raw
+    /// data. Any other block id is rejected.
     ///
     /// The slice must contain at least the number of bytes specified by the
     /// block length in the header. Only a reference to the data portion is
     /// stored to avoid unnecessary allocations.
     fn from_bytes(bytes: &'a [u8]) -> Result<Self, MdfError> {
 
-        let header = Self::parse_header(bytes)?;
+        let header = BlockHeader::from_bytes(bytes)?;
+        if header.id != "##DT" && header.id != "##DV" {
+            return Err(MdfError::BlockIDError {
+                actual: header.id.clone(),
+                expected: "##DT / ##DV".to_string(),
+            });
+        }
 
         let data_len = (header.block_len as usize).saturating_sub(24);
         let expected_bytes = 24 + data_len;

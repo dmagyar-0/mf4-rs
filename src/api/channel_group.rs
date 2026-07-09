@@ -89,7 +89,8 @@ impl<'a> ChannelGroup<'a> {
         let mut target: Option<usize> = None;
         let mut master: Option<usize> = None;
         for (i, ch) in channels.iter().enumerate() {
-            if ch.block().channel_type == 2 {
+            // First master wins (matches MdfIndex's master selection)
+            if master.is_none() && ch.block().channel_type == 2 {
                 master = Some(i);
             }
             if target.is_none() && ch.name()?.as_deref() == Some(name) {

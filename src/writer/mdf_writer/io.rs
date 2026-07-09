@@ -80,6 +80,7 @@ impl MdfWriter {
             cg_channels: HashMap::new(),
             cg_channel_ids: HashMap::new(),
             channel_map: HashMap::new(),
+            cg_inval_bytes: HashMap::new(),
         }
     }
 
@@ -112,6 +113,7 @@ impl MdfWriter {
             cg_channels: HashMap::new(),
             cg_channel_ids: HashMap::new(),
             channel_map: HashMap::new(),
+            cg_inval_bytes: HashMap::new(),
         })
     }
 
@@ -134,6 +136,7 @@ impl MdfWriter {
             cg_channels: HashMap::new(),
             cg_channel_ids: HashMap::new(),
             channel_map: HashMap::new(),
+            cg_inval_bytes: HashMap::new(),
         })
     }
 
