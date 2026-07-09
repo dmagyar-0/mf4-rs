@@ -1,3 +1,11 @@
+## v3.0.0 — 2026-07-09
+
+### BREAKING CHANGES
+- correctness, robustness and performance fixes from asammdf cross-validation review (#81)
+
+### Fixes
+- correctness, robustness and performance fixes from asammdf cross-validation review (#81)
+
 ## v2.0.0 — 2026-06-02
 
 ### BREAKING CHANGES
