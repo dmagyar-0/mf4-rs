@@ -35,7 +35,7 @@ struct OpenDataBlock {
     /// Precomputed per-channel encoders
     encoders: Vec<ChannelEncoder>,
     /// Per-channel VLSD payload accumulator. `Some(buf)` for VLSD channels
-    /// (channel_type == 1 && data != 0), `None` otherwise. The buffer holds
+    /// (channel_type == 1), `None` otherwise. The buffer holds
     /// the running [u32 length][bytes] stream that will be emitted as a ##SD
     /// block in `finish_data_block`.
     vlsd_payloads: Vec<Option<Vec<u8>>>,
@@ -67,4 +67,9 @@ pub struct MdfWriter {
     /// open DT block emits its SD block.
     cg_channel_ids: HashMap<String, Vec<String>>,
     channel_map: HashMap<String, (String, usize)>,
+    /// invalidation_bytes_nr configured for each channel group (captured from
+    /// the `add_channel_group` closure). `start_data_block` includes these
+    /// bytes (zero-filled) in the record layout so the declared record stride
+    /// matches the written stride.
+    cg_inval_bytes: HashMap<String, u32>,
 }

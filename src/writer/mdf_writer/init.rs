@@ -11,12 +11,21 @@ use crate::blocks::common::BlockHeader;
 
 impl MdfWriter {
     /// Initializes a new MDF 4.1 file with identification and header blocks.
+    ///
+    /// The header's absolute start time (`HD.abs_time`) is set to the current
+    /// system time in nanoseconds since the Unix epoch. Use
+    /// [`MdfWriter::set_start_time`] afterwards to overwrite it with a
+    /// specific timestamp.
     pub fn init_mdf_file(&mut self) -> Result<(u64, u64), MdfError> {
         let id_block = IdentificationBlock::default();
         let id_bytes = id_block.to_bytes()?;
         let id_pos = self.write_block_with_id(&id_bytes, "id_block")?;
 
-        let hd_block = HeaderBlock::default();
+        let mut hd_block = HeaderBlock::default();
+        hd_block.abs_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         let hd_bytes = hd_block.to_bytes()?;
         let hd_pos = self.write_block_with_id(&hd_bytes, "hd_block")?;
         Ok((id_pos, hd_pos))
@@ -87,6 +96,11 @@ impl MdfWriter {
 
         let mut cg_block = ChannelGroupBlock::default();
         configure(&mut cg_block);
+
+        // Remember the configured invalidation byte count so
+        // `start_data_block` can include it in the record layout.
+        self.cg_inval_bytes
+            .insert(cg_id.clone(), cg_block.invalidation_bytes_nr);
 
         let cg_bytes = cg_block.to_bytes()?;
         let _pos = self.write_block_with_id(&cg_bytes, &cg_id)?;
@@ -231,13 +245,28 @@ impl MdfWriter {
         let mut ch = ChannelBlock::default();
         configure(&mut ch);
         if ch.bit_count == 0 { ch.bit_count = ch.data_type.default_bits(); }
+        // A VLSD channel's record slot is always a u64 offset into the ##SD
+        // stream, regardless of the payload data type.
+        if ch.channel_type == 1 { ch.bit_count = 64; }
         if let Some(off) = self.cg_offsets.get_mut(cg_id) {
             if ch.byte_offset == 0 { ch.byte_offset = *off as u32; }
             let used = ((ch.bit_offset as usize + ch.bit_count as usize + 7) / 8) as usize;
             *off = ch.byte_offset as usize + used;
         }
 
-        let cn_bytes = ch.to_bytes()?;
+        // Never serialize a placeholder `data` link for VLSD channels: the
+        // in-memory sentinel (e.g. `ch.data = 1`) is not a valid block
+        // address, and if the writer is finalized before `finish_data_block`
+        // patches the link, readers would follow a bogus pointer.
+        // `finish_data_block` / `finish_signal_data_block` write the real
+        // ##SD address later.
+        let cn_bytes = if ch.channel_type == 1 && ch.data != 0 {
+            let mut on_disk = ch.clone();
+            on_disk.data = 0;
+            on_disk.to_bytes()?
+        } else {
+            ch.to_bytes()?
+        };
         let cn_pos = self.write_block_with_id(&cn_bytes, &cn_id)?;
         if let Some(channel_name) = &ch.name {
             let tx_id = format!("tx_name_{}", cn_id);
