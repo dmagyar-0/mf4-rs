@@ -135,7 +135,16 @@ impl IdentificationBlock {
             });
         }
 
-        let file_identifier = str::from_utf8(&bytes[0..8]).unwrap().to_string();
+        // Non-UTF8 bytes in the identifier mean this is not an MDF file at
+        // all — report that as an identifier error instead of panicking.
+        let file_identifier = match str::from_utf8(&bytes[0..8]) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                return Err(MdfError::FileIdentifierError(
+                    String::from_utf8_lossy(&bytes[0..8]).to_string(),
+                ));
+            }
+        };
         if file_identifier != "MDF     " {
             return Err(MdfError::FileIdentifierError(file_identifier));
         }
@@ -149,8 +158,8 @@ impl IdentificationBlock {
 
         Ok(Self {
             file_identifier: file_identifier,
-            version_identifier: String::from(str::from_utf8(&bytes[8..16]).unwrap()),
-            program_identifier: String::from(str::from_utf8(&bytes[16..24]).unwrap()),
+            version_identifier: String::from_utf8_lossy(&bytes[8..16]).to_string(),
+            program_identifier: String::from_utf8_lossy(&bytes[16..24]).to_string(),
             // Reserved bytes between 24 and 28 are skipped
             // The version number immediately follows at bytes 28..30
             version_number: LittleEndian::read_u16(&bytes[28..30]),

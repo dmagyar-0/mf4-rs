@@ -25,10 +25,15 @@ impl BlockParse<'_> for TextBlock {
             });
         }
         let data = &bytes[24..24 + data_len];
-        
-        let text = String::from_utf8_lossy(data)
-            .trim_matches('\0')  // Trim all leading and trailing null characters.
-            .to_string();
+
+        // The stored text is a NUL-terminated C string: everything from the
+        // first NUL byte onwards (terminator + alignment padding) is ignored.
+        // Do NOT strip leading NULs — that would alter the decoded name.
+        let terminated = match data.iter().position(|&b| b == 0) {
+            Some(pos) => &data[..pos],
+            None => data,
+        };
+        let text = String::from_utf8_lossy(terminated).to_string();
 
         Ok(Self { header, text })
     }

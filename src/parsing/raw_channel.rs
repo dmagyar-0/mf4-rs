@@ -42,6 +42,7 @@ impl<'a> RawChannel {
             let mut link_idx = 0;
             let mut current_sdb: Option<SignalDataBlock> = None;
             let mut sdb_pos = 0;
+            let mut visited_dl: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
             // Build a from_fn iterator carrying that mutable state
             let vlsd_iter = std::iter::from_fn(move || -> Option<Result<&'a [u8], MdfError>> {
@@ -75,7 +76,18 @@ impl<'a> RawChannel {
                     if link_idx < data_links.len() {
                         let frag_addr = data_links[link_idx];
                         link_idx += 1;
+                        if frag_addr == 0 {
+                            continue; // null link
+                        }
                         let off = frag_addr as usize;
+                        if off >= bytes.len() {
+                            return Some(Err(MdfError::TooShortBuffer {
+                                actual:   bytes.len(),
+                                expected: off.saturating_add(24),
+                                file:     file!(),
+                                line:     line!(),
+                            }));
+                        }
                         match SignalDataBlock::from_bytes(&bytes[off..]) {
                             Ok(sdb) => {
                                 // Prepare to yield from it on the next loop
@@ -89,9 +101,27 @@ impl<'a> RawChannel {
 
                     // 3) If we have a next_addr, peek its ID to decide what it is
                     if next_addr != 0 {
+                        // Cycle detection: a chain that revisits an address
+                        // would otherwise loop forever.
+                        if !visited_dl.insert(next_addr) {
+                            return Some(Err(MdfError::BlockLinkError(format!(
+                                "cycle detected in VLSD data chain at address {:#x}",
+                                next_addr
+                            ))));
+                        }
                         let off = next_addr as usize;
-                        // read the 4-byte ID
-                        let id = &bytes[off..off+4];
+                        // read the 4-byte ID (bounds-checked)
+                        let id = match bytes.get(off..off.saturating_add(4)) {
+                            Some(id) => id,
+                            None => {
+                                return Some(Err(MdfError::TooShortBuffer {
+                                    actual:   bytes.len(),
+                                    expected: off.saturating_add(4),
+                                    file:     file!(),
+                                    line:     line!(),
+                                }));
+                            }
+                        };
                         match id {
                             b"##DL" => {
                                 // Data List Block
@@ -141,6 +171,12 @@ impl<'a> RawChannel {
         let sample_byte_len     = channel_group.block.samples_byte_nr as usize;
         let invalidation_bytes  = channel_group.block.invalidation_bytes_nr as usize;
         let record_size         = record_id_len + sample_byte_len + invalidation_bytes;
+
+        // A record size of zero (malformed channel group) would make the
+        // chunking below divide by zero / panic — there are no records.
+        if record_size == 0 {
+            return Ok(Box::new(std::iter::empty()));
+        }
 
         // Gather all DataBlock fragments (DT, DV or DZ):
         let blocks = data_group.data_blocks(mmap)?;

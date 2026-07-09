@@ -22,7 +22,7 @@ pub enum MdfError {
         expected: String,
     },
 
-    #[error("Invalid file handling")]
+    #[error("I/O error: {0}")]
     IOError(#[from] std::io::Error),
 
     #[error("Invalid version string: {0}")]

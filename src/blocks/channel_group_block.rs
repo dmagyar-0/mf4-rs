@@ -145,10 +145,23 @@ impl ChannelGroupBlock {
     pub fn read_channels(&mut self, mmap: &[u8]) -> Result<Vec<ChannelBlock>, MdfError> {
         let mut channels = Vec::new();
         let mut current_ch_addr = self.first_ch_addr;
+        let mut visited = std::collections::HashSet::new();
 
         while current_ch_addr != 0 {
+            if !visited.insert(current_ch_addr) {
+                return Err(MdfError::BlockLinkError(format!(
+                    "cycle detected in channel linked list at address {:#x}",
+                    current_ch_addr
+                )));
+            }
             let ch_offset = current_ch_addr as usize;
-            let mut channel = ChannelBlock::from_bytes(&mmap[ch_offset..])?;
+            let bytes = mmap.get(ch_offset..).ok_or(MdfError::TooShortBuffer {
+                actual:   mmap.len(),
+                expected: ch_offset.saturating_add(160),
+                file:     file!(),
+                line:     line!(),
+            })?;
+            let mut channel = ChannelBlock::from_bytes(bytes)?;
             channel.resolve_conversion(mmap)?;
             current_ch_addr = channel.next_ch_addr;
             channels.push(channel);
