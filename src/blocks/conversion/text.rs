@@ -25,43 +25,52 @@ pub fn find_range_to_text_index(cc_val: &[f64], raw: f64, inclusive_upper: bool)
 
 pub fn apply_value_to_text(block: &ConversionBlock, value: DecodedValue, file_data: &[u8]) -> Result<DecodedValue, MdfError> {
     let raw = match extract_numeric(&value) { Some(x) => x, None => return Ok(value) };
-    let idx = block.cc_val.iter().position(|&k| k == raw).unwrap_or(block.cc_val.len());
-    
+    let matched = block.cc_val.iter().position(|&k| k == raw);
+    let is_match = matched.is_some();
+    // On no match, fall through to the default entry (index cc_val.len()).
+    let idx = matched.unwrap_or(block.cc_val.len());
+
     // First try to use resolved data if available
     if let Some(resolved_text) = block.get_resolved_text(idx) {
         return Ok(DecodedValue::String(resolved_text.clone()));
     }
-    
+
     if let Some(resolved_conversion) = block.get_resolved_conversion(idx) {
         return resolved_conversion.apply_decoded(value, &[]); // Use empty file_data for resolved conversions
     }
-    
+
     // If no match found and we have a default conversion, use it
-    if idx >= block.cc_val.len() {
+    if !is_match {
         if let Some(default_conversion) = block.get_default_conversion() {
             return default_conversion.apply_decoded(value, &[]);
         }
     }
-    
+
     // Fallback to legacy behavior if no resolved data (for backward compatibility)
     let link = *block.cc_ref.get(idx).unwrap_or(&0);
     if link == 0 {
-        // Try default conversion as final fallback
-        if let Some(default_conversion) = block.get_default_conversion() {
-            return default_conversion.apply_decoded(value, &[]);
-        }
-        return Ok(DecodedValue::Unknown);
+        return if is_match {
+            // A matched key whose text link is NIL yields an empty string
+            // (asammdf yields empty bytes).
+            Ok(DecodedValue::String(String::new()))
+        } else if let Some(default_conversion) = block.get_default_conversion() {
+            default_conversion.apply_decoded(value, &[])
+        } else {
+            // No match and NIL/missing default: pass the raw value through
+            // unchanged (matches asammdf and CANape).
+            Ok(value)
+        };
     }
-    
+
     let off = link as usize;
-    if off + 24 > file_data.len() { 
+    if off + 24 > file_data.len() {
         // Try default conversion if link is invalid
         if let Some(default_conversion) = block.get_default_conversion() {
             return default_conversion.apply_decoded(value, &[]);
         }
-        return Ok(DecodedValue::Unknown); 
+        return Ok(value);
     }
-    
+
     let hdr = BlockHeader::from_bytes(&file_data[off..off+24])?;
     if hdr.id == "##TX" {
         if let Some(txt) = read_string_block(file_data, link)? {
@@ -71,20 +80,20 @@ pub fn apply_value_to_text(block: &ConversionBlock, value: DecodedValue, file_da
         if let Some(default_conversion) = block.get_default_conversion() {
             return default_conversion.apply_decoded(value, &[]);
         }
-        return Ok(DecodedValue::Unknown);
+        return Ok(value);
     }
     if hdr.id == "##CC" {
         let mut nested = ConversionBlock::from_bytes(&file_data[off..])?;
         let _ = nested.resolve_formula(file_data);
         return nested.apply_decoded(value, file_data);
     }
-    
+
     // Try default conversion for unrecognized block types
     if let Some(default_conversion) = block.get_default_conversion() {
         return default_conversion.apply_decoded(value, &[]);
     }
-    
-    Ok(DecodedValue::Unknown)
+
+    Ok(value)
 }
 
 pub fn apply_range_to_text(block: &ConversionBlock, value: DecodedValue, file_data: &[u8]) -> Result<DecodedValue, MdfError> {
@@ -92,42 +101,49 @@ pub fn apply_range_to_text(block: &ConversionBlock, value: DecodedValue, file_da
     let inclusive_upper = matches!(value, DecodedValue::UnsignedInteger(_) | DecodedValue::SignedInteger(_));
     let idx = find_range_to_text_index(&block.cc_val, raw, inclusive_upper);
     let n_ranges = block.cc_val.len() / 2;
-    
+    let is_match = idx < n_ranges;
+
     // First try to use resolved data if available
     if let Some(resolved_text) = block.get_resolved_text(idx) {
         return Ok(DecodedValue::String(resolved_text.clone()));
     }
-    
+
     if let Some(resolved_conversion) = block.get_resolved_conversion(idx) {
         return resolved_conversion.apply_decoded(value, &[]); // Use empty file_data for resolved conversions
     }
-    
+
     // If no range matched (idx == n_ranges) and we have a default conversion, use it
-    if idx >= n_ranges {
+    if !is_match {
         if let Some(default_conversion) = block.get_default_conversion() {
             return default_conversion.apply_decoded(value, &[]);
         }
     }
-    
+
     // Fallback to legacy behavior if no resolved data (for backward compatibility)
     let link = *block.cc_ref.get(idx).unwrap_or(&0);
     if link == 0 {
-        // Try default conversion as final fallback
-        if let Some(default_conversion) = block.get_default_conversion() {
-            return default_conversion.apply_decoded(value, &[]);
-        }
-        return Ok(DecodedValue::Unknown);
+        return if is_match {
+            // A matched range whose text link is NIL yields an empty string
+            // (asammdf yields empty bytes).
+            Ok(DecodedValue::String(String::new()))
+        } else if let Some(default_conversion) = block.get_default_conversion() {
+            default_conversion.apply_decoded(value, &[])
+        } else {
+            // No match and NIL/missing default: pass the raw value through
+            // unchanged (matches asammdf and CANape).
+            Ok(value)
+        };
     }
-    
+
     let off = link as usize;
     if off + 24 > file_data.len() {
         // Try default conversion if link is invalid
         if let Some(default_conversion) = block.get_default_conversion() {
             return default_conversion.apply_decoded(value, &[]);
         }
-        return Ok(DecodedValue::Unknown);
+        return Ok(value);
     }
-    
+
     let hdr = BlockHeader::from_bytes(&file_data[off..off+24])?;
     if hdr.id == "##TX" {
         return match read_string_block(file_data, link)? {
@@ -137,7 +153,7 @@ pub fn apply_range_to_text(block: &ConversionBlock, value: DecodedValue, file_da
                 if let Some(default_conversion) = block.get_default_conversion() {
                     default_conversion.apply_decoded(value, &[])
                 } else {
-                    Ok(DecodedValue::Unknown)
+                    Ok(value)
                 }
             },
         };
@@ -147,27 +163,31 @@ pub fn apply_range_to_text(block: &ConversionBlock, value: DecodedValue, file_da
         let _ = nested.resolve_formula(file_data);
         return nested.apply_decoded(value, file_data);
     }
-    
+
     // Try default conversion for unrecognized block types
     if let Some(default_conversion) = block.get_default_conversion() {
         return default_conversion.apply_decoded(value, &[]);
     }
-    
-    Ok(DecodedValue::Unknown)
+
+    Ok(value)
 }
 
 pub fn apply_text_to_value(block: &ConversionBlock, value: DecodedValue, file_data: &[u8]) -> Result<DecodedValue, MdfError> {
     let input = match value { DecodedValue::String(s) => s, other => return Ok(other) };
     let n = block.cc_ref.len();
     
-    // First try to use resolved data if available
+    // First try to use resolved data if available.
+    // Iterate in cc_ref index order (0..n) so the FIRST matching reference
+    // wins deterministically (the HashMap has arbitrary iteration order).
     if let Some(resolved_texts) = &block.resolved_texts {
-        for (i, resolved_text) in resolved_texts.iter() {
-            if *i < n && input == *resolved_text {
-                if *i < block.cc_val.len() {
-                    return Ok(DecodedValue::Float(block.cc_val[*i]));
-                } else {
-                    return Ok(DecodedValue::Unknown);
+        for i in 0..n {
+            if let Some(resolved_text) = resolved_texts.get(&i) {
+                if input == *resolved_text {
+                    if i < block.cc_val.len() {
+                        return Ok(DecodedValue::Float(block.cc_val[i]));
+                    } else {
+                        return Ok(DecodedValue::Unknown);
+                    }
                 }
             }
         }

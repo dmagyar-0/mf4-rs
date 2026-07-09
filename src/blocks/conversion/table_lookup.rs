@@ -7,7 +7,8 @@ use super::linear::extract_numeric;
 /// `cc_val` must be `[key0, val0, key1, val1, …]`.
 pub fn lookup_table(cc_val: &[f64], raw: f64, interp: bool) -> Option<f64> {
     let len = cc_val.len();
-    if len < 4 || len % 2 != 0 { return None; }
+    // A single key/value pair is spec-valid: every input clamps to that value.
+    if len < 2 || len % 2 != 0 { return None; }
     let n = len / 2;
     let mut table = Vec::with_capacity(n);
     for i in 0..n { table.push((cc_val[2*i], cc_val[2*i + 1])); }
