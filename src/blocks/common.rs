@@ -103,7 +103,9 @@ pub trait BlockParse<'a>: Sized {
     const ID: &'static str;
 
     fn parse_header(bytes: &[u8]) -> Result<BlockHeader, MdfError> {
-        let header = BlockHeader::from_bytes(&bytes[0..24])?;
+        // `BlockHeader::from_bytes` performs its own length check, so pass the
+        // slice through unsliced to avoid panicking on buffers < 24 bytes.
+        let header = BlockHeader::from_bytes(bytes)?;
         if header.id != Self::ID {
             return Err(MdfError::BlockIDError {
                 actual: header.id.clone(),
@@ -234,6 +236,14 @@ pub fn read_string_block(mmap: &[u8], address: u64) -> Result<Option<String>, Md
     }
 
     let offset = address as usize;
+    if offset.checked_add(24).map_or(true, |end| end > mmap.len()) {
+        return Err(MdfError::TooShortBuffer {
+            actual:   mmap.len(),
+            expected: offset.saturating_add(24),
+            file:     file!(),
+            line:     line!(),
+        });
+    }
     let header = BlockHeader::from_bytes(&mmap[offset..offset + 24])?;
 
     match header.id.as_str() {

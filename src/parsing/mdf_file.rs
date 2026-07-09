@@ -77,21 +77,57 @@ impl MdfFile {
     fn parse_from_slice(
         data: &[u8],
     ) -> Result<(IdentificationBlock, HeaderBlock, Vec<RawDataGroup>), MdfError> {
+        // The identification block (64 bytes) is immediately followed by the
+        // header block (104 bytes); anything shorter cannot be an MDF file.
+        if data.len() < 168 {
+            return Err(MdfError::TooShortBuffer {
+                actual:   data.len(),
+                expected: 168,
+                file:     file!(),
+                line:     line!(),
+            });
+        }
         let identification = IdentificationBlock::from_bytes(&data[0..64])?;
         let header = HeaderBlock::from_bytes(&data[64..64 + 104])?;
 
         let mut data_groups = Vec::new();
         let mut dg_addr = header.first_dg_addr;
+        let mut visited_dg = std::collections::HashSet::new();
         while dg_addr != 0 {
+            if !visited_dg.insert(dg_addr) {
+                return Err(MdfError::BlockLinkError(format!(
+                    "cycle detected in data group linked list at address {:#x}",
+                    dg_addr
+                )));
+            }
             let dg_offset = dg_addr as usize;
-            let data_group_block = DataGroupBlock::from_bytes(&data[dg_offset..])?;
+            let dg_bytes = data.get(dg_offset..).ok_or(MdfError::TooShortBuffer {
+                actual:   data.len(),
+                expected: dg_offset.saturating_add(64),
+                file:     file!(),
+                line:     line!(),
+            })?;
+            let data_group_block = DataGroupBlock::from_bytes(dg_bytes)?;
             let next_dg_addr = data_group_block.next_dg_addr;
 
             let mut next_cg_addr = data_group_block.first_cg_addr;
             let mut raw_channel_groups = Vec::new();
+            let mut visited_cg = std::collections::HashSet::new();
             while next_cg_addr != 0 {
+                if !visited_cg.insert(next_cg_addr) {
+                    return Err(MdfError::BlockLinkError(format!(
+                        "cycle detected in channel group linked list at address {:#x}",
+                        next_cg_addr
+                    )));
+                }
                 let offset = next_cg_addr as usize;
-                let mut channel_group_block = ChannelGroupBlock::from_bytes(&data[offset..])?;
+                let cg_bytes = data.get(offset..).ok_or(MdfError::TooShortBuffer {
+                    actual:   data.len(),
+                    expected: offset.saturating_add(104),
+                    file:     file!(),
+                    line:     line!(),
+                })?;
+                let mut channel_group_block = ChannelGroupBlock::from_bytes(cg_bytes)?;
                 next_cg_addr = channel_group_block.next_cg_addr;
                 let channels = channel_group_block.read_channels(data)?;
 

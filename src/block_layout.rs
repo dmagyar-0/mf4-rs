@@ -336,9 +336,27 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// Return the file bytes starting at `offset`, verifying that at least
+    /// `needed` bytes are available. Prevents slice panics on truncated or
+    /// malformed files with out-of-range link addresses.
+    fn bytes_at(&self, offset: usize, needed: usize) -> Result<&'a [u8], MdfError> {
+        if offset
+            .checked_add(needed)
+            .map_or(true, |end| end > self.data.len())
+        {
+            return Err(MdfError::TooShortBuffer {
+                actual: self.data.len(),
+                expected: offset.saturating_add(needed),
+                file: file!(),
+                line: line!(),
+            });
+        }
+        Ok(&self.data[offset..])
+    }
+
     fn walk(&mut self) -> Result<(), MdfError> {
         // ##ID (not a standard block header - exactly 64 bytes at offset 0).
-        let id = IdentificationBlock::from_bytes(&self.data[0..64])?;
+        let id = IdentificationBlock::from_bytes(self.bytes_at(0, 64)?)?;
         self.blocks.push(BlockInfo {
             offset: 0,
             end_offset: 64,
@@ -377,7 +395,7 @@ impl<'a> Walker<'a> {
             return Ok(());
         }
         let o = offset as usize;
-        let hd = HeaderBlock::from_bytes(&self.data[o..o + 104])?;
+        let hd = HeaderBlock::from_bytes(self.bytes_at(o, 104)?)?;
 
         let links = vec![
             self.make_link("first_dg_addr", hd.first_dg_addr),
@@ -416,7 +434,7 @@ impl<'a> Walker<'a> {
             return Ok(0);
         }
         let o = offset as usize;
-        let dg = DataGroupBlock::from_bytes(&self.data[o..])?;
+        let dg = DataGroupBlock::from_bytes(self.bytes_at(o, 64)?)?;
         let size = dg.header.block_len;
 
         let links = vec![
@@ -478,7 +496,7 @@ impl<'a> Walker<'a> {
             return Ok((0, 0, 0));
         }
         let o = offset as usize;
-        let cg = ChannelGroupBlock::from_bytes(&self.data[o..])?;
+        let cg = ChannelGroupBlock::from_bytes(self.bytes_at(o, 104)?)?;
         let size = cg.header.block_len;
         let record_size = record_id_len as usize
             + cg.samples_byte_nr as usize
@@ -531,7 +549,7 @@ impl<'a> Walker<'a> {
             return Ok(0);
         }
         let o = offset as usize;
-        let cn = ChannelBlock::from_bytes(&self.data[o..])?;
+        let cn = ChannelBlock::from_bytes(self.bytes_at(o, 160)?)?;
         let size = cn.header.block_len;
 
         let name = read_text_at(self.data, cn.name_addr).unwrap_or_default();
@@ -594,7 +612,7 @@ impl<'a> Walker<'a> {
             return Ok(());
         }
         let o = offset as usize;
-        let cc = ConversionBlock::from_bytes(&self.data[o..])?;
+        let cc = ConversionBlock::from_bytes(self.bytes_at(o, 24)?)?;
         let size = cc.header.block_len;
 
         let mut links = vec![
@@ -645,7 +663,7 @@ impl<'a> Walker<'a> {
             return Ok(());
         }
         let o = offset as usize;
-        let si = SourceBlock::from_bytes(&self.data[o..])?;
+        let si = SourceBlock::from_bytes(self.bytes_at(o, 24)?)?;
         let size = si.header.block_len;
 
         let links = vec![
@@ -784,7 +802,7 @@ impl<'a> Walker<'a> {
             return Ok(());
         }
         let o = offset as usize;
-        let header = BlockHeader::from_bytes(&self.data[o..o + 24])?;
+        let header = BlockHeader::from_bytes(self.bytes_at(o, 24)?)?;
         let size = header.block_len;
         let payload = size.saturating_sub(24);
 
@@ -826,7 +844,7 @@ impl<'a> Walker<'a> {
             return Ok(());
         }
         let o = offset as usize;
-        let header = BlockHeader::from_bytes(&self.data[o..o + 24])?;
+        let header = BlockHeader::from_bytes(self.bytes_at(o, 24)?)?;
         let size = header.block_len;
         self.blocks.push(BlockInfo {
             offset,
@@ -851,7 +869,7 @@ impl<'a> Walker<'a> {
             return Ok(());
         }
         let o = offset as usize;
-        let dl = DataListBlock::from_bytes(&self.data[o..])?;
+        let dl = DataListBlock::from_bytes(self.bytes_at(o, 24)?)?;
         let size = dl.header.block_len;
 
         let mut links = vec![self.make_link("next", dl.next)];

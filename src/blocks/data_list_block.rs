@@ -24,12 +24,23 @@ impl BlockParse<'_> for DataListBlock {
     fn from_bytes(bytes: &[u8]) -> Result<Self, MdfError> {
 
         let header = Self::parse_header(bytes)?;
-        
-        let min_len = 24 + (header.links_nr as usize * 8) + 1 + 3 + 4;
-        if bytes.len() < min_len {
+
+        // A DLBLOCK always carries at least the 'next' link. links_nr == 0
+        // would underflow the data-link count below.
+        if header.links_nr == 0 {
+            return Err(MdfError::BlockSerializationError(
+                "DataListBlock must have links_nr >= 1 (the 'next' link)".to_string(),
+            ));
+        }
+
+        // u64 arithmetic avoids overflow for absurd links_nr values.
+        let min_len_u64 = 24u64
+            .saturating_add(header.links_nr.saturating_mul(8))
+            .saturating_add(1 + 3 + 4);
+        if (bytes.len() as u64) < min_len_u64 {
             return Err(MdfError::TooShortBuffer {
                 actual: bytes.len(),
-                expected: min_len,
+                expected: usize::try_from(min_len_u64).unwrap_or(usize::MAX),
                 file: file!(), line: line!(),
             });
         }
@@ -64,14 +75,17 @@ impl BlockParse<'_> for DataListBlock {
             let len = u64::from_le_bytes(bytes[off..off+8].try_into().unwrap());
             (Some(len), None)
         } else {
-            let mut offs = Vec::with_capacity(data_block_nr as usize);
-            if bytes.len() < off + (data_block_nr as usize * 8) {
+            // Check the length BEFORE allocating, so a bogus data_block_nr
+            // cannot trigger a huge allocation.
+            let needed = (off as u64).saturating_add(data_block_nr as u64 * 8);
+            if (bytes.len() as u64) < needed {
                 return Err(MdfError::TooShortBuffer {
                     actual: bytes.len(),
-                    expected: off + data_block_nr as usize * 8,
+                    expected: usize::try_from(needed).unwrap_or(usize::MAX),
                     file: file!(), line: line!(),
                 });
             }
+            let mut offs = Vec::with_capacity(data_block_nr as usize);
             for _ in 0..data_block_nr {
                 let o = u64::from_le_bytes(bytes[off..off+8].try_into().unwrap());
                 offs.push(o);
