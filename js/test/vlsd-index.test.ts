@@ -9,10 +9,12 @@ import { BytesRangeSource } from "../src/range-source";
 /**
  * VLSD (variable-length string) contract for the lazy index path.
  *
- * Index-based reads of VLSD channels are not yet supported: they must fail
- * with a clear error — and that failure must not affect reads of the
- * fixed-width channels in the same group, which must keep working through
- * the index path (validated against the direct reader).
+ * Index-based reads of VLSD channels resolve each record's inline 8-byte
+ * offset into the channel's ##SD fragment chain: `read` returns the strings
+ * (aligned with the group master timestamps) and `values` returns NaN per
+ * sample (strings are not numeric). `signalByteRanges` includes the ##SD
+ * spans so the fragment path fetches everything the decoder needs — and the
+ * JSON round trip preserves the fragment list.
  */
 
 function buildVlsdFile(): { bytes: Uint8Array; strs: string[] } {
@@ -41,32 +43,52 @@ test("VLSD channel reads correctly via the direct reader", () => {
   mdf.dispose();
 });
 
-test("VLSD channel via the index path fails with a clear error", async () => {
-  const { bytes } = buildVlsdFile();
+test("VLSD channel reads via the lazy index path (JSON round trip)", async () => {
+  const { bytes, strs } = buildVlsdFile();
   const idx = MdfIndex.fromJson(MdfIndex.fromBytes(bytes).toJson());
   const source = new BytesRangeSource(bytes);
 
-  await assert.rejects(
-    () => idx.read("Label", source),
-    (e: Error) => /VLSD channel 'Label' not yet supported/.test(e.message),
-  );
-  await assert.rejects(
-    () => idx.values("Label", source),
-    (e: Error) => /VLSD channel 'Label' not yet supported/.test(e.message),
-  );
+  // read: strings, one per record, timestamps aligned with the master.
+  const sig = await idx.read("Label", source);
+  assert.deepEqual(sig.values, strs);
+  assert.equal(sig.timestamps.length, strs.length);
+
+  // values: the numeric fast path maps strings to NaN, one per record.
+  const vals = await idx.values("Label", source);
+  assert.equal(vals.length, strs.length);
+  assert.ok(Array.from(vals).every((v) => Number.isNaN(v)));
+
   idx.dispose();
 });
 
-test("a failed VLSD index read does not poison other channels in the group", async () => {
+test("signalByteRanges for a VLSD channel covers its ##SD stream", () => {
+  const { bytes } = buildVlsdFile();
+  const idx = MdfIndex.fromBytes(bytes);
+
+  // The VLSD channel needs more bytes than its group's fixed records alone:
+  // its ranges must strictly contain the fixed-width channel's ranges.
+  const fixed = idx.signalByteRanges("Value");
+  const vlsd = idx.signalByteRanges("Label");
+  const total = (rs: [number, number][]) => rs.reduce((n, [, len]) => n + len, 0);
+  assert.ok(
+    total(vlsd as [number, number][]) > total(fixed as [number, number][]),
+    "VLSD ranges must include the ##SD data on top of the record data",
+  );
+
+  // byteRanges (static per-channel spans) still refuses VLSD channels.
+  assert.throws(() => idx.byteRanges("Label"), /VLSD/);
+
+  idx.dispose();
+});
+
+test("VLSD and fixed-width channels coexist on the index path", async () => {
   const { bytes } = buildVlsdFile();
   const mdf = Mdf.fromBytes(bytes);
   const idx = MdfIndex.fromJson(MdfIndex.fromBytes(bytes).toJson());
   const source = new BytesRangeSource(bytes);
 
-  await assert.rejects(() => idx.read("Label", source));
-
-  // Fixed-width channel in the same (VLSD-containing) group still reads via
-  // the index path, and matches the direct reader.
+  // Fixed-width channel in the same (VLSD-containing) group reads via the
+  // index path and matches the direct reader.
   const lazy = await idx.read("Value", source);
   const direct = mdf.read("Value");
   assert.deepEqual(Array.from(lazy.values as number[]), Array.from(direct.values as number[]));
@@ -74,6 +96,10 @@ test("a failed VLSD index read does not poison other channels in the group", asy
 
   const lazyVals = await idx.values("Value", source);
   assert.deepEqual(Array.from(lazyVals), Array.from(mdf.values("Value")));
+
+  // And the VLSD channel matches the direct reader too.
+  const lazyLabel = await idx.read("Label", source);
+  assert.deepEqual(lazyLabel.values, mdf.read("Label").values);
 
   idx.dispose();
   mdf.dispose();
