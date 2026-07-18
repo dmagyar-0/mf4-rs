@@ -37,6 +37,10 @@ pub mod api {
 #[cfg(feature = "pyo3")]
 pub mod python;
 
+// WebAssembly (wasm-bindgen) bindings module
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
 // Re-export the Python module when building as an extension
 #[cfg(feature = "pyo3")]
 use pyo3::prelude::*;

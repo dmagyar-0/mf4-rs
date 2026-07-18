@@ -48,11 +48,24 @@ pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"], optiona
 numpy = { version = "0.21", optional = true }
 pyo3-stub-gen = { version = "0.7", optional = true }
 
+# WebAssembly bindings (optional). Enabled by the `wasm` feature; used by
+# src/wasm.rs to expose the reader/writer/index to JS/TS via wasm-bindgen.
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
 [dev-dependencies]
 tiny_http = "0.12"
 tempfile = "3"
+
+# wasm-pack post-processing: skip the wasm-opt download/step so the npm
+# package builds in restricted/offline environments. Re-enable if you want
+# binaryen size optimization during publishing.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
 
 [features]
 default = []
 http = ["dep:ureq", "dep:openssl", "dep:native-tls"]
 pyo3 = ["dep:pyo3", "dep:numpy", "dep:pyo3-stub-gen", "http"]
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde-wasm-bindgen"]
