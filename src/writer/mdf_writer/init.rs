@@ -22,10 +22,16 @@ impl MdfWriter {
         let id_pos = self.write_block_with_id(&id_bytes, "id_block")?;
 
         let mut hd_block = HeaderBlock::default();
-        hd_block.abs_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        // `SystemTime::now()` is unsupported (and panics) on
+        // `wasm32-unknown-unknown`; leave `abs_time` at 0 there and let the
+        // caller set it explicitly via [`MdfWriter::set_start_time`].
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            hd_block.abs_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+        }
         let hd_bytes = hd_block.to_bytes()?;
         let hd_pos = self.write_block_with_id(&hd_bytes, "hd_block")?;
         Ok((id_pos, hd_pos))
