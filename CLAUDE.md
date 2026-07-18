@@ -188,7 +188,7 @@ The codebase is organized into distinct layers. The module structure is defined 
   - Metadata navigation: `groups()`, `group(name)`, `channel(name)`, `channel_in(group, name)`, `channel_names()`, `find_channels(name)`; `IndexedChannelGroup::channel(name)` / `channel_names()` / `master_channel()`; `IndexedChannel::is_master()` / `is_vlsd()`
   - Lazy reads via the attached source: `read(name)` / `read_in(group, name)` return a [`Signal`](src/signal.rs) (values paired with the group master/time axis); `source()` / `set_file()` / `set_url()` / `set_source()` manage the source
   - Explicit/custom readers: bind with `open(reader)` / `open_file(path)` → returns an `MdfReader` with `values(name)` / `values_in()` / `values_f64()` / `signal(name)` / `signal_in()`; `reader_mut()` / `into_inner()` expose the underlying `ByteRangeReader`
-  - Byte ranges (power-user / partial reads): `byte_ranges(name)`, `byte_ranges_in(group, name)`, `byte_ranges_for_records(name, start, count)`
+  - Byte ranges (power-user / partial reads): `byte_ranges(name)`, `byte_ranges_in(group, name)`, `byte_ranges_for_records(name, start, count)` — refused for VLSD channels, whose offset indirection a static range cannot express (use `read()` / `values()` instead)
   - Conversions are resolved during index creation, enabling reads with empty `file_data` (`&[]`)
 - `Signal` (`src/signal.rs`) is the Rust equivalent of a pandas `Series`: `{ name, unit, timestamps: Vec<f64>, values: Vec<Option<DecodedValue>> }`, with `values_f64()` / `has_timestamps()`. Produced by `MDF::signal()`, `ChannelGroup::signal()`, `MdfReader::signal()`, and `MdfIndex::read()`.
 
@@ -307,6 +307,7 @@ Channels with `channel_type == 1` and a non-zero `data` field store variable-len
 - `IndexedChannel.conversion` stores a `ConversionBlock` with `resolved_texts`, `resolved_conversions`, and `default_conversion` populated
 - When reading via index, conversions are applied with empty file data (`&[]`) since all dependencies are resolved
 - `ByteRangeReader` trait allows plugging in HTTP, S3, or other data sources
+- VLSD channels (`channel_type == 1`) are readable through the index: each channel's `##SD` fragment chain is captured at build time in `IndexedChannel.vlsd_data_blocks`, and `read()` / `values()` resolve each record's inline 8-byte offset into that stream. `byte_ranges()` still refuses VLSD channels (a static range cannot express the offset indirection). Old JSON indexes without `vlsd_data_blocks` load fine but error on VLSD reads with a "rebuild the index" message.
 - Compressed blocks (`##DZ`) are not yet supported in the index reader
 
 ### When Modifying Conversions
@@ -487,4 +488,4 @@ release the GIL during decoding.
 2. **64-bit float default**: The Python `add_float_channel()` writes 64-bit; the generic `add_channel` with `create_data_type_float_le()` still defaults to 32 bits via `default_bits()`
 3. **Channel group metadata**: The `add_channel_group(name)` parameter is silently ignored - either implement it or remove the parameter
 4. **File history block**: Write a `##FH` block for tool identification and traceability (the header timestamp is now written; `##FH` is still absent)
-5. **Unsorted files / VLSD via index**: unsorted data groups and index-based VLSD reads are refused with clear errors; implementing them would unlock CANedge-style bus logs
+5. **Unsorted files via index**: index-based VLSD reads are now supported (string/byte-array VLSD channels resolve through `read()` / `values()`; `byte_ranges()` still refuses them). Unsorted data groups are still refused with a clear error; implementing them would unlock CANedge-style bus logs

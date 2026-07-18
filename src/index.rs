@@ -9,7 +9,7 @@ use crate::api::mdf::MDF;
 use crate::blocks::common::{DataType, BlockParse};
 use crate::blocks::conversion::{ConversionBlock, ConversionType};
 use crate::error::MdfError;
-use crate::parsing::decoder::{check_value_validity, decode_channel_value_with_validity, decode_f64_from_record, DecodedValue};
+use crate::parsing::decoder::{check_value_validity, decode_channel_value, decode_channel_value_with_validity, decode_f64_from_record, DecodedValue};
 use crate::signal::{decoded_opt_to_f64, Signal};
 
 /// Represents the location and metadata of data blocks in the file
@@ -48,6 +48,9 @@ pub struct IndexedChannel {
     pub conversion: Option<ConversionBlock>,
     /// For VLSD channels: address of signal data blocks
     pub vlsd_data_address: Option<u64>,
+    /// For VLSD channels: locations of the ##SD fragments in chain order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vlsd_data_blocks: Vec<DataBlockInfo>,
 }
 
 impl IndexedChannel {
@@ -335,6 +338,36 @@ impl SliceRangeReader {
 }
 
 impl ByteRangeReader for SliceRangeReader {
+    type Error = MdfError;
+
+    fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, Self::Error> {
+        // Checked arithmetic: a forged offset/length must error, not wrap.
+        let end = match offset
+            .checked_add(length)
+            .and_then(|e| usize::try_from(e).ok())
+        {
+            Some(end) if end <= self.data.len() => end,
+            _ => {
+                return Err(MdfError::TooShortBuffer {
+                    actual: self.data.len(),
+                    expected: offset.saturating_add(length).min(usize::MAX as u64) as usize,
+                    file: file!(),
+                    line: line!(),
+                });
+            }
+        };
+        Ok(self.data[offset as usize..end].to_vec())
+    }
+}
+
+/// Borrowing counterpart to [`SliceRangeReader`] — a [`ByteRangeReader`] over a
+/// borrowed `&[u8]` (e.g. a memory map), so the mmap-based index paths can
+/// reuse the generic reader logic without cloning the whole file into a `Vec`.
+struct BorrowedSliceReader<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> ByteRangeReader for BorrowedSliceReader<'a> {
     type Error = MdfError;
 
     fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, Self::Error> {
@@ -813,6 +846,13 @@ impl MdfIndex {
                     None
                 };
 
+                let vlsd_data_blocks = if block.channel_type == 1 && block.data != 0 {
+                    let mut slice_reader = BorrowedSliceReader { data: mmap };
+                    Self::extract_vlsd_data_blocks(&mut slice_reader, block.data)?
+                } else {
+                    Vec::new()
+                };
+
                 indexed_channels.push(IndexedChannel {
                     name: channel.name()?,
                     unit: channel.unit()?,
@@ -829,6 +869,7 @@ impl MdfIndex {
                     } else {
                         None
                     },
+                    vlsd_data_blocks,
                 });
             }
 
@@ -962,6 +1003,11 @@ impl MdfIndex {
             let mut indexed_channels = Vec::with_capacity(group.channels.len());
             for ch in group.channels {
                 let block = ch.block;
+                let vlsd_data_blocks = if block.channel_type == 1 && block.data != 0 {
+                    Self::extract_vlsd_data_blocks(reader, block.data)?
+                } else {
+                    Vec::new()
+                };
                 indexed_channels.push(IndexedChannel {
                     name: ch.name,
                     unit: ch.unit,
@@ -978,6 +1024,7 @@ impl MdfIndex {
                     } else {
                         None
                     },
+                    vlsd_data_blocks,
                 });
             }
 
@@ -1071,6 +1118,134 @@ impl MdfIndex {
         Ok(data_blocks)
     }
 
+    /// Walk a VLSD channel's `data` chain (a single `##SD`, or a `##DL` chain
+    /// of `##SD`/`##DZ` fragments) and record each fragment's location in chain
+    /// order.
+    ///
+    /// Generic over [`ByteRangeReader`] so the mmap path (via
+    /// [`BorrowedSliceReader`]) and the remote path share one implementation.
+    /// Cycle-detects the `##DL` `next` chain, rejects unexpected block IDs, and
+    /// validates that a variable-length `##DL`'s per-fragment virtual offsets
+    /// reproduce the running sum of prior fragments' data-section sizes — the
+    /// invariant the offset-based reader relies on.
+    fn extract_vlsd_data_blocks<R>(
+        reader: &mut R,
+        data_addr: u64,
+    ) -> Result<Vec<DataBlockInfo>, MdfError>
+    where
+        R: ByteRangeReader<Error = MdfError>,
+    {
+        let mut data_blocks: Vec<DataBlockInfo> = Vec::new();
+        let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // Running sum of fragment data-section sizes (size - 24), i.e. the
+        // virtual start offset of the next fragment in the concatenated stream.
+        let mut running_offset: u64 = 0;
+        let mut current = data_addr;
+
+        while current != 0 {
+            let header_bytes = reader.read_range(current, 24)?;
+            let header = crate::blocks::common::BlockHeader::from_bytes(&header_bytes)?;
+
+            match header.id.as_str() {
+                "##SD" => {
+                    data_blocks.push(DataBlockInfo {
+                        file_offset: current,
+                        size: header.block_len,
+                        is_compressed: false,
+                    });
+                    current = 0;
+                }
+                "##DZ" => {
+                    data_blocks.push(DataBlockInfo {
+                        file_offset: current,
+                        size: header.block_len,
+                        is_compressed: true,
+                    });
+                    current = 0;
+                }
+                "##DL" => {
+                    // Cycle detection on the DL chain: a chain revisiting an
+                    // address would otherwise loop forever.
+                    if !visited.insert(current) {
+                        return Err(MdfError::BlockLinkError(format!(
+                            "cycle detected in VLSD data list chain at address {:#x}",
+                            current
+                        )));
+                    }
+                    let dl_bytes = reader.read_range(current, header.block_len)?;
+                    let dl = crate::blocks::data_list_block::DataListBlock::from_bytes(&dl_bytes)?;
+
+                    for (i, &fragment_address) in dl.data_links.iter().enumerate() {
+                        if fragment_address == 0 {
+                            continue;
+                        }
+                        let frag_header_bytes = reader.read_range(fragment_address, 24)?;
+                        let frag_header =
+                            crate::blocks::common::BlockHeader::from_bytes(&frag_header_bytes)?;
+                        let is_compressed = match frag_header.id.as_str() {
+                            "##SD" => false,
+                            "##DZ" => true,
+                            other => {
+                                return Err(MdfError::BlockIDError {
+                                    actual: other.to_string(),
+                                    expected: "##SD / ##DZ".to_string(),
+                                });
+                            }
+                        };
+
+                        // A variable-length DL carries an explicit virtual
+                        // offset per fragment. The offset-based read path maps
+                        // an inline offset to a fragment via cumulative
+                        // data-section sizes, so a non-contiguous chain would
+                        // silently mislocate entries — reject it here.
+                        if let Some(offsets) = &dl.offsets {
+                            if let Some(&declared) = offsets.get(i) {
+                                if declared != running_offset {
+                                    return Err(MdfError::BlockSerializationError(format!(
+                                        "non-contiguous VLSD ##SD chain is unsupported: \
+                                         fragment at offset {} declares virtual start {} \
+                                         but the running data-section sum is {}",
+                                        fragment_address, declared, running_offset
+                                    )));
+                                }
+                            }
+                        }
+
+                        let data_section = frag_header.block_len.checked_sub(24).ok_or_else(|| {
+                            MdfError::BlockSerializationError(format!(
+                                "VLSD fragment at offset {} has size {} \
+                                 (smaller than the 24-byte block header)",
+                                fragment_address, frag_header.block_len
+                            ))
+                        })?;
+                        running_offset = running_offset.checked_add(data_section).ok_or_else(|| {
+                            MdfError::BlockSerializationError(
+                                "VLSD ##SD chain total size overflows the address space"
+                                    .to_string(),
+                            )
+                        })?;
+
+                        data_blocks.push(DataBlockInfo {
+                            file_offset: fragment_address,
+                            size: frag_header.block_len,
+                            is_compressed,
+                        });
+                    }
+
+                    current = dl.next;
+                }
+                other => {
+                    return Err(MdfError::BlockIDError {
+                        actual: other.to_string(),
+                        expected: "##SD / ##DL / ##DZ".to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(data_blocks)
+    }
+
     /// Save the index to a JSON file.
     ///
     /// Not available on `wasm32-unknown-unknown`; use [`to_json`] instead.
@@ -1136,6 +1311,24 @@ impl MdfIndex {
             if !group.data_blocks.is_empty() {
                 Self::checked_record_size(group)?;
             }
+            for channel in &group.channels {
+                for db in &channel.vlsd_data_blocks {
+                    if db.size < 24 {
+                        return Err(MdfError::BlockSerializationError(format!(
+                            "invalid index: group '{}' VLSD data block at offset {} has size {} \
+                             (smaller than the 24-byte block header)",
+                            group_name, db.file_offset, db.size
+                        )));
+                    }
+                    if db.file_offset.checked_add(db.size).is_none() {
+                        return Err(MdfError::BlockSerializationError(format!(
+                            "invalid index: group '{}' VLSD data block at offset {} with size {} \
+                             overflows the file address space",
+                            group_name, db.file_offset, db.size
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1185,14 +1378,18 @@ impl MdfIndex {
         Ok(data_len / record_size as u64)
     }
 
-    /// Error for VLSD channels on read paths that only handle fixed-size
-    /// records. Triggers on `channel_type == 1` regardless of whether the SD
-    /// address was captured: a VLSD channel without one is equally unreadable,
-    /// and decoding the inline 8-byte SD offsets would return garbage.
+    /// Error for VLSD channels on the byte-range calculation paths.
+    ///
+    /// A VLSD channel's fixed record field holds an 8-byte offset into a
+    /// separate `##SD` stream, not the value bytes, so a static
+    /// `(offset, length)` range cannot describe where a sample's payload
+    /// lives. Value reads (`read` / `values`) resolve the indirection and are
+    /// fully supported; only byte-range calculation refuses VLSD channels.
     fn ensure_not_vlsd(channel: &IndexedChannel) -> Result<(), MdfError> {
         if channel.channel_type == 1 {
             return Err(MdfError::BlockSerializationError(format!(
-                "VLSD channel '{}' not yet supported in index reader",
+                "byte ranges cannot represent offset-indirected VLSD channel '{}'; \
+                 use read()/values() instead",
                 channel.name.as_deref().unwrap_or("<unnamed>")
             )));
         }
@@ -1220,9 +1417,9 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
-        // VLSD channels are not supported: decoding their inline SD offsets
-        // as payload would return garbage.
-        Self::ensure_not_vlsd(channel)?;
+        if channel.channel_type == 1 {
+            return self.read_vlsd_channel_values(group, channel, reader);
+        }
 
         // For regular channels, read from data blocks
         self.read_regular_channel_values(group, channel, reader)
@@ -1269,6 +1466,196 @@ impl MdfIndex {
         }
 
         Ok(values)
+    }
+
+    /// Read values for a VLSD channel (channel type 1) via a byte-range reader.
+    ///
+    /// The channel's fixed record field holds an 8-byte little-endian virtual
+    /// offset into the concatenation of the `##SD` fragments' data sections;
+    /// at that offset lives one `[u32 length][payload]` entry. This resolves
+    /// each record's offset into the captured fragment chain and decodes the
+    /// payload, preserving one value per record so [`Signal`] timestamps stay
+    /// aligned and per-record invalidation can be honoured.
+    fn read_vlsd_channel_values<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        group: &IndexedChannelGroup,
+        channel: &IndexedChannel,
+        reader: &mut R,
+    ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
+        // Compressed fragments (either the fixed records or the SD stream) are
+        // not decodable yet.
+        if group.data_blocks.iter().any(|b| b.is_compressed)
+            || channel.vlsd_data_blocks.iter().any(|b| b.is_compressed)
+        {
+            return Err(MdfError::BlockSerializationError(
+                "Compressed blocks not yet supported in index reader".to_string(),
+            ));
+        }
+
+        // A VLSD channel without a data link has no signal data at all —
+        // rebuilding the index cannot help, so distinguish it from an index
+        // built before VLSD chains were captured.
+        if channel.vlsd_data_blocks.is_empty() {
+            if channel.vlsd_data_address.is_none() {
+                return Err(MdfError::BlockSerializationError(format!(
+                    "VLSD channel '{}' has no signal data (its ##SD data link is 0)",
+                    channel.name.as_deref().unwrap_or("<unnamed>")
+                )));
+            }
+            return Err(MdfError::BlockSerializationError(format!(
+                "VLSD channel '{}' has no signal-data fragments recorded in the index; \
+                 rebuild the index with this version to read it",
+                channel.name.as_deref().unwrap_or("<unnamed>")
+            )));
+        }
+
+        // The VLSD offset field is fixed at 64 bits by the spec and is
+        // byte-aligned; a nonzero bit offset would silently shift every
+        // resolved stream offset.
+        if channel.bit_count != 64 || channel.bit_offset != 0 {
+            return Err(MdfError::BlockSerializationError(format!(
+                "VLSD channel '{}' has a {}-bit record field at bit offset {}; the \
+                 inline VLSD offset must be a byte-aligned 64-bit field",
+                channel.name.as_deref().unwrap_or("<unnamed>"),
+                channel.bit_count,
+                channel.bit_offset
+            )));
+        }
+
+        // Fetch each SD fragment's data section, tracking each fragment's
+        // virtual start offset in the concatenated stream.
+        let mut fragments: Vec<Vec<u8>> = Vec::with_capacity(channel.vlsd_data_blocks.len());
+        let mut frag_starts: Vec<u64> = Vec::with_capacity(channel.vlsd_data_blocks.len());
+        let mut running: u64 = 0;
+        for db in &channel.vlsd_data_blocks {
+            let data_len = Self::data_section_size(db)?;
+            let bytes = reader.read_range(db.file_offset + 24, data_len)?;
+            frag_starts.push(running);
+            running = running.checked_add(bytes.len() as u64).ok_or_else(|| {
+                MdfError::BlockSerializationError(
+                    "VLSD ##SD chain total size overflows the address space".to_string(),
+                )
+            })?;
+            fragments.push(bytes);
+        }
+        let stream_len = running;
+
+        let record_size = Self::checked_record_size(group)?;
+        let record_id_len = group.record_id_len as usize;
+        let cg_data_bytes = group.record_size;
+        let has_invalidation = group.invalidation_bytes > 0;
+        let all_invalid = channel.flags & 0x1 != 0;
+        let offset_pos = record_id_len + channel.byte_offset as usize;
+
+        // A fixed-record channel block (data == 0) drives the validity check;
+        // a separate VLSD block (data != 0) drives payload decoding.
+        let validity_cb = channel.to_channel_block();
+        let mut payload_cb = channel.to_channel_block();
+        payload_cb.data = 1;
+
+        let mut total_records: usize = 0;
+        for data_block in &group.data_blocks {
+            total_records += Self::records_in_block(data_block, record_size)? as usize;
+        }
+        let mut values = Vec::with_capacity(total_records.min(1 << 24));
+
+        for data_block in &group.data_blocks {
+            let block_data = reader
+                .read_range(data_block.file_offset + 24, Self::data_section_size(data_block)?)?;
+            if block_data.len() % record_size != 0 {
+                return Err(MdfError::BlockSerializationError(format!(
+                    "data block length {} is not a multiple of the {}-byte record — \
+                     record spans data block fragments, which is unsupported",
+                    block_data.len(),
+                    record_size
+                )));
+            }
+            let record_count = block_data.len() / record_size;
+            for i in 0..record_count {
+                let record = &block_data[i * record_size..(i + 1) * record_size];
+
+                if all_invalid
+                    || (has_invalidation
+                        && !check_value_validity(record, record_id_len, cg_data_bytes, &validity_cb))
+                {
+                    values.push(None);
+                    continue;
+                }
+
+                // Read the inline 8-byte virtual offset.
+                if offset_pos + 8 > record.len() {
+                    return Err(MdfError::TooShortBuffer {
+                        actual: record.len(),
+                        expected: offset_pos + 8,
+                        file: file!(),
+                        line: line!(),
+                    });
+                }
+                let virtual_offset =
+                    u64::from_le_bytes(record[offset_pos..offset_pos + 8].try_into().unwrap());
+
+                if virtual_offset >= stream_len {
+                    return Err(MdfError::BlockSerializationError(format!(
+                        "VLSD inline offset {} is past the end of the {}-byte signal-data stream",
+                        virtual_offset, stream_len
+                    )));
+                }
+
+                // Locate the fragment whose virtual span contains the offset.
+                let frag_idx = frag_starts.partition_point(|&s| s <= virtual_offset) - 1;
+                let frag = &fragments[frag_idx];
+                let pos = (virtual_offset - frag_starts[frag_idx]) as usize;
+
+                if pos + 4 > frag.len() {
+                    return Err(MdfError::BlockSerializationError(format!(
+                        "VLSD entry at virtual offset {} is truncated: no room for its \
+                         length prefix in fragment {}",
+                        virtual_offset, frag_idx
+                    )));
+                }
+                let len = u32::from_le_bytes(frag[pos..pos + 4].try_into().unwrap()) as usize;
+                let start = pos + 4;
+                let end = match start.checked_add(len) {
+                    Some(e) if e <= frag.len() => e,
+                    _ => {
+                        return Err(MdfError::BlockSerializationError(format!(
+                            "VLSD entry at virtual offset {} declares length {} which \
+                             exceeds fragment {} (size {})",
+                            virtual_offset, len, frag_idx, frag.len()
+                        )));
+                    }
+                };
+                let payload = &frag[start..end];
+
+                if let Some(value) = decode_channel_value(payload, 0, &payload_cb) {
+                    let final_value = if let Some(conversion) = &channel.conversion {
+                        conversion.apply_decoded(value, &[])?
+                    } else {
+                        value
+                    };
+                    values.push(Some(final_value));
+                } else {
+                    values.push(None);
+                }
+            }
+        }
+
+        Ok(values)
+    }
+
+    /// Map VLSD decoded values to `f64`, matching `Channel::values_as_f64`:
+    /// numeric variants convert, everything else (strings, bytes, invalid) is
+    /// NaN.
+    fn vlsd_values_to_f64(values: Vec<Option<DecodedValue>>) -> Vec<f64> {
+        values
+            .into_iter()
+            .map(|v| match v {
+                Some(DecodedValue::Float(f)) => f,
+                Some(DecodedValue::UnsignedInteger(u)) => u as f64,
+                Some(DecodedValue::SignedInteger(i)) => i as f64,
+                _ => f64::NAN,
+            })
+            .collect()
     }
 
     /// Decode records from a data block slice into values vec.
@@ -1903,9 +2290,10 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
-        // VLSD channels are not supported: decoding their inline SD offsets
-        // as payload would return garbage.
-        Self::ensure_not_vlsd(channel)?;
+        if channel.channel_type == 1 {
+            let vals = self.read_vlsd_channel_values(group, channel, reader)?;
+            return Ok(Self::vlsd_values_to_f64(vals));
+        }
 
         let record_size = Self::checked_record_size(group)?;
 
@@ -1953,9 +2341,10 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
-        // VLSD channels are not supported: decoding their inline SD offsets
-        // as payload would return garbage.
-        Self::ensure_not_vlsd(channel)?;
+        if channel.channel_type == 1 {
+            let mut slice_reader = BorrowedSliceReader { data: file_data };
+            return self.read_vlsd_channel_values(group, channel, &mut slice_reader);
+        }
 
         let record_size = Self::checked_record_size(group)?;
         let mut total_records: usize = 0;
@@ -1998,9 +2387,11 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
-        // VLSD channels are not supported: decoding their inline SD offsets
-        // as payload would return garbage.
-        Self::ensure_not_vlsd(channel)?;
+        if channel.channel_type == 1 {
+            let mut slice_reader = BorrowedSliceReader { data: file_data };
+            let vals = self.read_vlsd_channel_values(group, channel, &mut slice_reader)?;
+            return Ok(Self::vlsd_values_to_f64(vals));
+        }
 
         let record_size = Self::checked_record_size(group)?;
         let mut total_records: usize = 0;

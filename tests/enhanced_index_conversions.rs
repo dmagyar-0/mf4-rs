@@ -262,6 +262,7 @@ fn test_index_serialization_with_resolved_data() -> Result<(), MdfError> {
         pos_invalidation_bit: 0,
         conversion: Some(conversion),
         vlsd_data_address: None,
+        vlsd_data_blocks: Vec::new(),
     };
     
     let indexed_group = IndexedChannelGroup {

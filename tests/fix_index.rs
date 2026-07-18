@@ -1,7 +1,9 @@
 //! Regression tests for the index-system fixes:
 //!
-//! - A3: VLSD channels must error on every index read path instead of
-//!   silently decoding the inline 8-byte SD offsets as payload.
+//! - A3: VLSD channels now read correctly through the index (values,
+//!   values_f64, and the lazy Signal path) by resolving each record's inline
+//!   8-byte SD offset into the captured ##SD fragment chain; only the static
+//!   byte-range calculation still refuses VLSD channels.
 //! - B7: cn_flags bit 0 ("all values invalid") must apply on the f64 fast
 //!   path even when the group has no invalidation bytes.
 //! - C6: hostile/stale index JSON (block size < 24, record_size == 0,
@@ -63,37 +65,51 @@ fn write_vlsd_file(path: &str) -> Result<usize, MdfError> {
     Ok(payloads.len())
 }
 
-/// A3: reading a VLSD channel through the index must error on every path,
-/// not return garbage decoded from the inline SD offsets.
+/// A3: reading a VLSD channel through the index must SUCCEED with the correct
+/// values on every value-read path (resolving the inline SD offsets), while
+/// the static byte-range calculation still refuses VLSD channels.
 #[test]
-fn vlsd_channel_reads_error_instead_of_garbage() -> Result<(), MdfError> {
+fn vlsd_channel_reads_resolve_correctly() -> Result<(), MdfError> {
     let path = tmp_path("fix_index_vlsd.mf4");
     let path_str = path.to_str().unwrap();
     let n = write_vlsd_file(path_str)?;
+    let expected = ["alpha", "bravo!", "charlie"];
 
     let index = MdfIndex::from_file(path_str)?;
 
-    // MdfReader::values (DecodedValue path)
+    // MdfReader::values (DecodedValue path) resolves the strings.
     let mut reader = index.open_file(path_str)?;
-    assert!(
-        reader.values("Msg").is_err(),
-        "values() on a VLSD channel must error"
-    );
-    // MdfReader::values_f64 (fast f64 path) — previously decoded garbage
-    assert!(
-        reader.values_f64("Msg").is_err(),
-        "values_f64() on a VLSD channel must error"
-    );
-    // Byte-range calculation
+    let msgs = reader.values("Msg")?;
+    assert_eq!(msgs.len(), n);
+    for (got, want) in msgs.iter().zip(expected.iter()) {
+        match got {
+            Some(DecodedValue::String(s)) => assert_eq!(s, want),
+            other => panic!("expected string {:?}, got {:?}", want, other),
+        }
+    }
+
+    // MdfReader::values_f64 (fast f64 path): strings map to NaN, one per record.
+    let f64s = reader.values_f64("Msg")?;
+    assert_eq!(f64s.len(), n);
+    assert!(f64s.iter().all(|v| v.is_nan()), "string VLSD values must be NaN");
+
+    // Byte-range calculation still refuses VLSD channels.
     assert!(
         index.byte_ranges("Msg").is_err(),
         "byte_ranges() on a VLSD channel must error"
     );
-    // Lazy source-based read (slice path via mmap)
-    assert!(
-        index.read("Msg").is_err(),
-        "read() on a VLSD channel must error"
-    );
+
+    // Lazy source-based read (slice path via mmap) yields a Signal whose
+    // timestamps align with the values (one per record).
+    let sig = index.read("Msg")?;
+    assert_eq!(sig.values.len(), n);
+    assert_eq!(sig.timestamps.len(), n);
+    for (got, want) in sig.values.iter().zip(expected.iter()) {
+        match got {
+            Some(DecodedValue::String(s)) => assert_eq!(s, want),
+            other => panic!("expected string {:?}, got {:?}", want, other),
+        }
+    }
 
     // The fixed-size channel in the same group still reads fine.
     let times = reader.values_f64("Time")?;
