@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commit & PR Title Format (MUST FOLLOW)
 
-This repository uses **automated releases driven by Conventional Commits**. Every push to `main` runs `.github/workflows/release.yml`, which inspects commit messages since the last `v*` tag, computes a SemVer bump, updates `Cargo.toml` / `pyproject.toml` / `Cargo.lock` / `CHANGELOG.md`, tags `vX.Y.Z`, and publishes to PyPI and crates.io.
+This repository uses **automated releases driven by Conventional Commits**. Every push to `main` runs `.github/workflows/release.yml`, which inspects commit messages since the last `v*` tag, computes a SemVer bump, updates `Cargo.toml` / `pyproject.toml` / `Cargo.lock` / `js/package.json` / `js/package-lock.json` / `CHANGELOG.md`, tags `vX.Y.Z`, and publishes to PyPI, crates.io, and npm (the `publish-npm` job builds the wasm bindings with `wasm-pack`, compiles the TypeScript wrapper, runs the js test suite via `prepublishOnly`, and publishes `js/` as the `mf4-rs` npm package using the `NPM_TOKEN` secret).
 
 The repo squash-merges PRs, so **the PR title becomes the commit message on `main`** — and that is what the release pipeline parses. PR titles are also linted by `.github/workflows/pr-title.yml` (uses `amannn/action-semantic-pull-request`).
 
@@ -45,14 +45,14 @@ The pipeline takes the **highest** bump implied by any commit since the last tag
    - `perf:` for performance improvements with no behavior change
    - `chore:` / `docs:` / `refactor:` / `test:` / `ci:` / `build:` / `style:` for non-shipping changes
 2. Use `!` or a `BREAKING CHANGE:` footer **only** when the public Rust crate API or the Python bindings change incompatibly.
-3. **Never hand-edit the `version` fields** in `Cargo.toml` or `pyproject.toml`, and never manually edit `CHANGELOG.md` to add release sections — the release workflow owns those. Editing them by hand will cause merge conflicts the next time the workflow runs.
+3. **Never hand-edit the `version` fields** in `Cargo.toml`, `pyproject.toml`, or `js/package.json` / `js/package-lock.json`, and never manually edit `CHANGELOG.md` to add release sections — the release workflow owns those. Editing them by hand will cause merge conflicts the next time the workflow runs.
 4. When committing within a PR branch, individual commit subjects don't need to be conventional (the squash uses the PR title), but matching the convention still helps reviewers.
 
 ## Project Overview
 
-`mf4-rs` is a Rust library for working with ASAM MDF 4 (Measurement Data Format) files. It implements a subset of the MDF 4.1 specification sufficient for data logging and inspection tasks. The library supports reading existing MDF files, writing new ones, creating lightweight JSON indexes for fast random access, time-based file cutting, and file merging. Optional Python bindings are available via PyO3.
+`mf4-rs` is a Rust library for working with ASAM MDF 4 (Measurement Data Format) files. It implements a subset of the MDF 4.1 specification sufficient for data logging and inspection tasks. The library supports reading existing MDF files, writing new ones, creating lightweight JSON indexes for fast random access, time-based file cutting, and file merging. Optional Python bindings are available via PyO3 (published to PyPI), and optional WebAssembly bindings via wasm-bindgen are wrapped by a TypeScript package in `js/` (published to npm as `mf4-rs`).
 
-**Key stats:** ~5,000 lines of Rust across ~47 source files. Rust edition 2024, version 1.0.0, MIT licensed.
+**Key stats:** ~15,000 lines of Rust across ~52 source files, plus a TypeScript wrapper package in `js/`. Rust edition 2024, MIT licensed. The version in `Cargo.toml` / `pyproject.toml` / `js/package.json` is managed by the release workflow — never edit it by hand.
 
 ## Build and Test Commands
 
@@ -103,6 +103,21 @@ cargo run --features pyo3 --bin stub_gen
 ```
 
 When adding a new `#[pyclass]`, `#[pymethods]`, or `#[pyfunction]`, place a matching `#[gen_stub_pyclass]` / `#[gen_stub_pymethods]` / `#[gen_stub_pyfunction]` (or `#[gen_stub_pyclass_enum]` for complex enums) **immediately above** the pyo3 attribute. `#[gen_stub_pymethods]` cannot be combined with `#[gen_stub_pyclass_enum]` in pyo3-stub-gen 0.7 — leave the `#[pymethods]` impl for a complex enum unannotated (its variants still appear in the stub).
+
+### TypeScript / WebAssembly Bindings Development
+```bash
+# Check the wasm bindings compile (they also build on native targets for IDE friendliness)
+cargo check --features wasm
+
+# Build the wasm module into js/pkg-node/ (requires wasm-pack and the
+# wasm32-unknown-unknown target; wasm-opt is disabled via Cargo.toml metadata)
+cd js && npm run build:wasm
+
+# Compile the TypeScript wrapper into js/dist/ and run the js test suite
+npm run build
+npm test
+```
+`js/pkg-node/`, `js/dist/`, and `js/node_modules/` are gitignored build artifacts. The npm package version in `js/package.json` / `js/package-lock.json` is managed by the release workflow — never bump it by hand.
 
 ## Architecture
 
@@ -219,6 +234,14 @@ The codebase is organized into distinct layers. The module structure is defined 
 - Custom `MdfException` Python exception type
 - Returns native Python types (float, int, str, bytes) via `decoded_value_to_pyobject()` for zero-copy efficiency
 - Pandas DatetimeIndex support: converts relative master channel times to absolute timestamps using the MDF file's start time
+
+### 9. WebAssembly / TypeScript Bindings (`src/wasm.rs` + `js/`)
+- `src/wasm.rs` is built only when the `wasm` feature is enabled (wasm-bindgen + js-sys + serde-wasm-bindgen); it also compiles on native targets for IDE friendliness
+- Mirrors the **name-based** API philosophy of the Python bindings: `Mdf` (in-memory reader from bytes), `MdfIndex` (self-contained index + fragment-based reads), `MdfWriter` (in-memory writer producing a `Uint8Array`)
+- The wasm module has no filesystem/network access — I/O lives on the JS side. `MdfIndex` exposes `signalByteRanges()` + `valuesFromFragments()`/`readFromFragments()` so callers fetch bytes themselves and pass fragments in
+- `js/` is the npm package (`mf4-rs`): a typed TypeScript wrapper (`js/src/`) over the generated `pkg-node/` wasm-bindgen module, adding Node convenience constructors (`Mdf.fromFile`, `fromUrl`) and the pluggable `RangeSource` abstraction (`FetchRangeSource`, `FileRangeSource`, `BytesRangeSource`) for lazy remote reads
+- Built with `wasm-pack build --target nodejs` (see `js/package.json` scripts); tests run with Node's built-in test runner (`npm test`, Node >= 18)
+- See `WASM_FEASIBILITY.md` for the original design notes and `examples/wasm-smoke/` for a browser smoke test
 
 ## Key Design Patterns and Concepts
 
@@ -363,6 +386,16 @@ maturin develop --release
 python tests/test_asammdf_interop.py
 ```
 The Python tests exit 0 if dependencies are missing (so CI won't fail without asammdf installed). When dependencies are available, all 14 tests must pass.
+
+**TypeScript/wasm tests (run when changing `src/wasm.rs` or `js/`):**
+```bash
+cd js
+npm ci
+npm run build:wasm   # requires wasm-pack + wasm32-unknown-unknown target
+npm run build
+npm test             # Node built-in test runner over js/test/*.test.ts (compiled)
+```
+These same steps run automatically (via `prepublishOnly`) in the release workflow's `publish-npm` job — a failing js test aborts the npm publish.
 
 ### Integration Tests (`tests/`)
 - `api.rs` - Writer/parser round-trip, data writing, bulk records, block positions, time-based cutting
