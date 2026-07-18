@@ -541,14 +541,19 @@ impl WasmMdfIndex {
     ///
     /// Returns one `(file_offset + 24, size - 24)` span per `##DT`/`##DV`
     /// fragment of the owning group (the 24 skips the block header), merged.
+    /// For a VLSD channel the spans of its `##SD` fragment chain are included
+    /// as well — the decoder resolves each record's inline offset into that
+    /// stream, so its bytes must be fetched alongside the fixed records.
     /// This is exactly what the fragment readers need: `valuesFromFragments` /
     /// `readFromFragments` decode whole data sections, not just the requested
     /// channel's columns, so the fragments must cover each full section.
     fn signal_ranges(&self, name: &str, group: Option<&str>) -> Result<Vec<(u64, u64)>, JsError> {
-        let (g, _c) = self.locate(name, group)?;
+        let (g, c) = self.locate(name, group)?;
         let grp = &self.index.channel_groups[g];
-        let mut ranges = Vec::with_capacity(grp.data_blocks.len());
-        for db in &grp.data_blocks {
+        let channel = &grp.channels[c];
+        let mut ranges =
+            Vec::with_capacity(grp.data_blocks.len() + channel.vlsd_data_blocks.len());
+        for db in grp.data_blocks.iter().chain(channel.vlsd_data_blocks.iter()) {
             if db.is_compressed {
                 return Err(JsError::new(
                     "compressed (##DZ) data blocks are not supported for fragment reads",
@@ -675,8 +680,9 @@ impl WasmMdfIndex {
     /// Full data-section byte ranges for the group owning `name`, merged.
     ///
     /// Returns one span per data-block fragment covering the entire data
-    /// section (block bytes minus the 24-byte header). These are exactly the
-    /// ranges the fragment readers need: `valuesFromFragments` /
+    /// section (block bytes minus the 24-byte header); for a VLSD channel the
+    /// spans of its `##SD` fragment chain are included too. These are exactly
+    /// the ranges the fragment readers need: `valuesFromFragments` /
     /// `readFromFragments` decode whole data sections (all channels are
     /// interleaved per record), so fetch these and pass the fetched fragments
     /// straight through — the requested channel and its master are both

@@ -108,12 +108,13 @@ export class MdfIndex {
    * Full data-section byte ranges for the group owning `name`, merged.
    *
    * Returns one span per data-block fragment covering the entire data section
-   * (block bytes minus the 24-byte header). This is exactly the range set the
-   * fragment readers need: `valuesFromFragments`/`readFromFragments` decode
-   * whole data sections (all channels interleave per record), so fetch these
-   * and pass the fetched fragments straight through — the requested channel
-   * and its master are both covered for any record layout. This is also what
-   * `values`/`read` fetch under the hood.
+   * (block bytes minus the 24-byte header); for a VLSD channel the spans of
+   * its `##SD` fragment chain are included too. This is exactly the range set
+   * the fragment readers need: `valuesFromFragments`/`readFromFragments`
+   * decode whole data sections (all channels interleave per record), so fetch
+   * these and pass the fetched fragments straight through — the requested
+   * channel and its master are both covered for any record layout. This is
+   * also what `values`/`read` fetch under the hood.
    */
   signalByteRanges(name: string, group?: string | null): ByteRange[] {
     return this.inner.signalByteRanges(name, group) as ByteRange[];
