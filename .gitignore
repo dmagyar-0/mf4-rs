@@ -70,6 +70,10 @@ benchmarks/results/reports/
 js/pkg/
 js/pkg-node/
 
+# TypeScript build output and npm dependencies for the js/ package
+js/dist/
+js/node_modules/
+
 # Test/Debug Scripts
 # Temporary Python scripts created during development
 debug_*.py
