@@ -89,6 +89,16 @@ export class FetchRangeSource implements RangeSource {
           return this.cachedSize;
         }
       }
+      // 206 with an unknown total: the body is a 1-byte partial and must not
+      // be cached as the full file. Fall back to a plain GET.
+      const full = await this.fetchImpl(this.url);
+      if (!full.ok) {
+        throw new Error(`FetchRangeSource: full GET for size failed with status ${full.status}`);
+      }
+      const body = new Uint8Array(await full.arrayBuffer());
+      this.cachedBody = body;
+      this.cachedSize = body.byteLength;
+      return this.cachedSize;
     }
     // Server ignored Range and sent the full body; cache it for later reads.
     const buf = new Uint8Array(await res.arrayBuffer());
