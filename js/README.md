@@ -124,24 +124,25 @@ const signal = await clientIndex.read("VehicleSpeed", source, "Group1");
 needs, fetch them from the `RangeSource` (concurrently), and decode
 client-side — the wasm module never needs the whole file.
 
-### Note on `signalByteRanges` vs. what the convenience methods fetch
+### `signalByteRanges` vs. `byteRanges`
 
-`signalByteRanges(name, group)` returns the merged byte ranges for a
-channel **and its group's master** — the ranges you'd want for a plain
-two-channel (master + data) group. In testing against groups with additional
-channels declared after the requested one, that merged range does not
-always cover the tail bytes of later records for those trailing channels,
-and `valuesFromFragments`/`readFromFragments` require the *entire* data
-section to be present in the supplied fragments (they decode whole blocks,
-not just the requested column). To stay correct for arbitrary group shapes,
-`MdfIndex.values`/`read` fetch the union of `byteRanges` for **every**
-channel in the owning group, not just `signalByteRanges`. For a plain
-two-channel group this union is identical to `signalByteRanges`, so there is
-no extra cost in the common case; for wider groups it means fetching that
-group's full data section. `byteRanges` and `signalByteRanges` are still
-exposed directly as power-user APIs if you want to build a different fetch
-strategy (e.g. you know your group is master+single-channel and want the
-smallest possible request).
+`signalByteRanges(name, group)` returns the **full data-section ranges** for
+the group that owns the channel — one span per data-block fragment covering
+the entire section (block bytes minus the 24-byte header). These are exactly
+the bytes the fragment decoders need: `valuesFromFragments` /
+`readFromFragments` decode whole data sections (every channel is interleaved
+per record), so fetch `signalByteRanges` and pass the fetched fragments
+straight through — the requested channel and its master are both covered for
+any record layout. This is what `MdfIndex.values`/`read` fetch under the
+hood.
+
+`byteRanges(name, group)` is a lower-level power-user API: it returns the
+spans that a *single* channel's bytes fall in. Because records interleave all
+channels, those spans still include neighbouring channels' bytes and do **not**
+on their own guarantee full-data-section coverage — so they are not suitable
+to feed directly to the fragment decoders. Use `byteRanges` only when you are
+building a custom fetch strategy and understand the record layout;
+otherwise prefer `signalByteRanges`.
 
 ### Custom range sources
 
@@ -194,9 +195,10 @@ before relying on it in production.
   `values()` (lazy, over a `RangeSource`), `read()` (lazy), `dispose()`.
 - `MdfWriter` — in-memory writer: `initMdfFile`, `setStartTime`,
   `addChannelGroup`, `addChannel`, `addTimeChannel`, `addFloatChannel`,
-  `addFloat32Channel`, `addIntChannel`, `addSintChannel`, `setTimeChannel`,
-  `startDataBlock`, `writeRecord`, `finishDataBlock`, `finalize()`,
-  `dispose()`.
+  `addFloat32Channel`, `addIntChannel`, `addSintChannel`, `addStringChannel`,
+  `setTimeChannel`, `startDataBlock`, `writeRecord`, `finishDataBlock`,
+  `finalize()`, `dispose()`. Numeric channels accept `number` or `bigint`
+  record values; string channels (`addStringChannel`) accept `string`.
 - `RangeSource` implementations: `FetchRangeSource`, `FileRangeSource`,
   `BytesRangeSource`.
 - Types: `Signal`, `GroupInfo`, `IndexGroupInfo`, `ChannelInfo`,

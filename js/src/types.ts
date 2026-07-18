@@ -9,7 +9,6 @@ export type ChannelValue = number | string | bigint | Uint8Array | null;
 export interface Signal {
   name: string;
   unit?: string | null;
-  comment?: string | null;
   timestamps: Float64Array;
   values: ChannelValue[];
 }

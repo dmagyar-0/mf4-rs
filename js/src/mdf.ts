@@ -76,4 +76,9 @@ export class Mdf {
   dispose(): void {
     this.inner.free();
   }
+
+  /** `using`/`Symbol.dispose` support: frees the underlying wasm memory. */
+  [Symbol.dispose](): void {
+    this.dispose();
+  }
 }

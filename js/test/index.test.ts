@@ -76,8 +76,34 @@ test("MdfIndex byteRanges()/signalByteRanges()/byteRangesForRecords() return non
   const signalRanges = index.signalByteRanges("Value", "Group1");
   assert.ok(signalRanges.length > 0);
 
-  const windowRanges = index.byteRangesForRecords("Value", 0n, 10n, "Group1");
+  const windowRanges = index.byteRangesForRecords("Value", 0, 10, "Group1");
   assert.ok(windowRanges.length > 0);
+
+  index.dispose();
+});
+
+test("MdfIndex.byteRangesForRecords rejects non-integer / negative args", () => {
+  const { bytes } = buildSampleFile(20);
+  const index = MdfIndex.fromBytes(bytes);
+  assert.throws(() => index.byteRangesForRecords("Value", -1, 5, "Group1"), RangeError);
+  assert.throws(() => index.byteRangesForRecords("Value", 0.5, 5, "Group1"), RangeError);
+  assert.throws(() => index.byteRangesForRecords("Value", 0, -5, "Group1"), RangeError);
+  index.dispose();
+});
+
+test("MdfIndex.byteRangesForRecords window bytes match the corresponding full-read slice", async () => {
+  const { bytes } = buildSampleFile(50);
+  const index = MdfIndex.fromBytes(bytes);
+  const source = new BytesRangeSource(bytes);
+
+  // A record window's ranges must point at the same file bytes as slicing the
+  // full data section at those records.
+  const windowRanges = index.byteRangesForRecords("Value", 5, 10, "Group1");
+  assert.ok(windowRanges.length > 0);
+  for (const [offset, length] of windowRanges) {
+    const chunk = await source.read(offset, length);
+    assert.deepEqual(Array.from(chunk), Array.from(bytes.subarray(offset, offset + length)));
+  }
 
   index.dispose();
 });

@@ -57,6 +57,8 @@ export class FetchRangeSource implements RangeSource {
   private readonly url: string;
   private readonly fetchImpl: FetchLike;
   private cachedSize: number | undefined;
+  /** Full body cached after a `200` (Range-ignoring) response, served locally. */
+  private cachedBody: Uint8Array | undefined;
 
   constructor(url: string, fetchImpl?: FetchLike) {
     this.url = url;
@@ -78,16 +80,19 @@ export class FetchRangeSource implements RangeSource {
     if (!res.ok) {
       throw new Error(`FetchRangeSource: HEAD-equivalent request failed with status ${res.status}`);
     }
-    const contentRange = res.headers.get("content-range");
-    if (contentRange) {
-      const total = contentRange.split("/")[1];
-      if (total && total !== "*") {
-        this.cachedSize = Number(total);
-        return this.cachedSize;
+    if (res.status === 206) {
+      const contentRange = res.headers.get("content-range");
+      if (contentRange) {
+        const total = contentRange.split("/")[1];
+        if (total && total !== "*") {
+          this.cachedSize = Number(total);
+          return this.cachedSize;
+        }
       }
     }
-    // Server ignored Range and sent the full body; use its length.
-    const buf = await res.arrayBuffer();
+    // Server ignored Range and sent the full body; cache it for later reads.
+    const buf = new Uint8Array(await res.arrayBuffer());
+    this.cachedBody = buf;
     this.cachedSize = buf.byteLength;
     return this.cachedSize;
   }
@@ -96,6 +101,11 @@ export class FetchRangeSource implements RangeSource {
     if (length <= 0) {
       return new Uint8Array(0);
     }
+    // A previous request revealed the server ignores Range; serve from cache.
+    if (this.cachedBody !== undefined) {
+      return this.sliceCached(offset, length);
+    }
+
     const end = offset + length - 1;
     const res = await this.fetchImpl(this.url, {
       headers: { Range: `bytes=${offset}-${end}` },
@@ -104,16 +114,44 @@ export class FetchRangeSource implements RangeSource {
       throw new Error(`FetchRangeSource: request failed with status ${res.status}`);
     }
     const buf = new Uint8Array(await res.arrayBuffer());
+
     if (res.status === 206) {
-      // Server honoured the Range request.
+      // Server honoured the Range request — validate what it returned.
+      const contentRange = res.headers.get("content-range");
+      if (contentRange) {
+        const match = /^bytes\s+(\d+)-\d+\/(?:\d+|\*)$/.exec(contentRange.trim());
+        if (match && Number(match[1]) !== offset) {
+          throw new Error(
+            `FetchRangeSource: server returned range starting at ${match[1]}, expected ${offset}`,
+          );
+        }
+      }
+      if (buf.byteLength !== length) {
+        throw new Error(
+          `FetchRangeSource: 206 response body is ${buf.byteLength} bytes but ${length} were ` +
+            `requested at offset ${offset}`,
+        );
+      }
       return buf;
     }
-    // Server returned 200 with the full body (ignored Range) — slice locally.
-    if (buf.byteLength === length) {
-      // Coincidentally exact-length response; treat as already-sliced.
-      return buf;
+
+    // Server returned 200 with the full body (ignored Range) — cache and slice.
+    this.cachedBody = buf;
+    if (this.cachedSize === undefined) {
+      this.cachedSize = buf.byteLength;
     }
-    return buf.subarray(offset, offset + length);
+    return this.sliceCached(offset, length);
+  }
+
+  private sliceCached(offset: number, length: number): Uint8Array {
+    const body = this.cachedBody!;
+    if (offset + length > body.byteLength) {
+      throw new RangeError(
+        `FetchRangeSource: requested [${offset}, ${offset + length}) exceeds cached body ` +
+          `length ${body.byteLength}`,
+      );
+    }
+    return body.subarray(offset, offset + length);
   }
 }
 
@@ -150,8 +188,20 @@ export class FileRangeSource implements RangeSource {
     }
     const fh = await this.handle();
     const buffer = Buffer.alloc(length);
-    const { bytesRead } = await fh.read(buffer, 0, length, offset);
-    return new Uint8Array(buffer.buffer, buffer.byteOffset, bytesRead);
+    // A single fh.read may return fewer bytes than requested; loop until the
+    // whole span is read, treating a 0-byte read as EOF.
+    let total = 0;
+    while (total < length) {
+      const { bytesRead } = await fh.read(buffer, total, length - total, offset + total);
+      if (bytesRead === 0) {
+        throw new Error(
+          `FileRangeSource: short read at offset ${offset + total} — wanted ${length - total} ` +
+            `more byte(s) but hit EOF (requested [${offset}, ${offset + length}))`,
+        );
+      }
+      total += bytesRead;
+    }
+    return new Uint8Array(buffer.buffer, buffer.byteOffset, length);
   }
 
   /** Close the underlying file handle, if opened. */
@@ -177,6 +227,15 @@ export class BytesRangeSource implements RangeSource {
   }
 
   async read(offset: number, length: number): Promise<Uint8Array> {
+    if (length <= 0) {
+      return new Uint8Array(0);
+    }
+    if (offset < 0 || offset + length > this.bytes.byteLength) {
+      throw new RangeError(
+        `BytesRangeSource: requested [${offset}, ${offset + length}) exceeds buffer length ` +
+          `${this.bytes.byteLength}`,
+      );
+    }
     return this.bytes.subarray(offset, offset + length);
   }
 }

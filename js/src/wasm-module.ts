@@ -69,6 +69,7 @@ export interface WasmMdfWriter {
   addFloatChannel(group_id: string, name: string): string;
   addIntChannel(group_id: string, name: string): string;
   addSintChannel(group_id: string, name: string): string;
+  addStringChannel(group_id: string, name: string): string;
   addTimeChannel(group_id: string, name: string): string;
   finalize(): Uint8Array;
   finishDataBlock(group_id: string): void;

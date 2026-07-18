@@ -54,6 +54,11 @@ asammdf_*.mf4
 *.json
 *_index.json
 *_test.json
+# ...but the js/ package manifests must be tracked (the blanket *.json above
+# would otherwise silently exclude them).
+!js/package.json
+!js/tsconfig.json
+!js/package-lock.json
 
 # Benchmark Data
 # Generated test data and results (optional - remove if you want to commit test data)

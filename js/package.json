@@ -1,0 +1,41 @@
+{
+  "name": "mf4-rs",
+  "version": "0.0.0",
+  "description": "Ergonomic TypeScript wrapper over the mf4-rs WebAssembly bindings for reading and writing ASAM MDF 4 files.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dmagyar-0/mf4-rs.git",
+    "directory": "js"
+  },
+  "keywords": [
+    "mdf",
+    "mdf4",
+    "mf4",
+    "asam",
+    "measurement",
+    "can",
+    "canedge",
+    "automotive",
+    "wasm",
+    "webassembly"
+  ],
+  "type": "commonjs",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "files": [
+    "dist/src",
+    "pkg-node",
+    "README.md"
+  ],
+  "scripts": {
+    "build:wasm": "cd .. && wasm-pack build --target nodejs --out-dir js/pkg-node -- --features wasm",
+    "build": "tsc",
+    "test": "node --test dist/test/**/*.test.js",
+    "prepublishOnly": "npm run build:wasm && npm run build && npm test"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/node": "^22.5.0"
+  }
+}

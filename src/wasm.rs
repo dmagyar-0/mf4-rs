@@ -86,6 +86,18 @@ fn data_type_from_str(name: &str) -> Result<DataType, JsError> {
     })
 }
 
+/// `true` for the text data types, which this writer stores as variable-length
+/// (VLSD) channels rather than fixed-length record fields.
+fn is_string_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::StringLatin1
+            | DataType::StringUtf8
+            | DataType::StringUtf16LE
+            | DataType::StringUtf16BE
+    )
+}
+
 /// Convert a single decoded value to a JS value, matching the Python
 /// `decoded_value_to_pyobject` mapping (large integers become `BigInt`).
 fn decoded_to_js(dv: &DecodedValue) -> JsValue {
@@ -196,35 +208,54 @@ struct FragmentRangeReader {
     fragments: Vec<(u64, Vec<u8>)>,
 }
 
+/// Narrow a `u64` byte count/offset to `usize`, erroring instead of truncating
+/// on a 32-bit (wasm) target where the value exceeds `usize::MAX`.
+fn u64_to_usize(v: u64) -> Result<usize, MdfError> {
+    usize::try_from(v).map_err(|_| {
+        MdfError::BlockSerializationError(format!("byte value {} exceeds addressable range", v))
+    })
+}
+
+/// End offset of a fragment, erroring on overflow instead of wrapping.
+fn fragment_end(fstart: u64, len: usize) -> Result<u64, MdfError> {
+    fstart.checked_add(len as u64).ok_or_else(|| {
+        MdfError::BlockSerializationError("fragment offset + length overflows u64".to_string())
+    })
+}
+
 impl ByteRangeReader for FragmentRangeReader {
     type Error = MdfError;
 
     fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
-        let req_end = offset + length;
+        let req_end = offset.checked_add(length).ok_or_else(|| {
+            MdfError::BlockSerializationError(
+                "requested byte range offset + length overflows u64".to_string(),
+            )
+        })?;
+        let len = u64_to_usize(length)?;
 
         // Fast path: a single fragment fully contains the request.
         for (start, bytes) in &self.fragments {
             let fstart = *start;
-            let fend = fstart + bytes.len() as u64;
+            let fend = fragment_end(fstart, bytes.len())?;
             if offset >= fstart && req_end <= fend {
-                let s = (offset - fstart) as usize;
-                return Ok(bytes[s..s + length as usize].to_vec());
+                let s = u64_to_usize(offset - fstart)?;
+                return Ok(bytes[s..s + len].to_vec());
             }
         }
 
         // Assembly path: stitch the request together from overlapping fragments.
-        let len = length as usize;
         let mut out = vec![0u8; len];
         let mut covered = vec![false; len];
         for (start, bytes) in &self.fragments {
             let fstart = *start;
-            let fend = fstart + bytes.len() as u64;
+            let fend = fragment_end(fstart, bytes.len())?;
             let lo = offset.max(fstart);
             let hi = req_end.min(fend);
             if lo < hi {
-                let dst_lo = (lo - offset) as usize;
-                let dst_hi = (hi - offset) as usize;
-                let src_lo = (lo - fstart) as usize;
+                let dst_lo = u64_to_usize(lo - offset)?;
+                let dst_hi = u64_to_usize(hi - offset)?;
+                let src_lo = u64_to_usize(lo - fstart)?;
                 out[dst_lo..dst_hi].copy_from_slice(&bytes[src_lo..src_lo + (dst_hi - dst_lo)]);
                 for c in &mut covered[dst_lo..dst_hi] {
                     *c = true;
@@ -273,18 +304,38 @@ fn build_fragment_reader(
             .get(i)
             .dyn_into::<Array>()
             .map_err(|_| JsError::new("each range must be an [offset, length] array"))?;
-        let offset = pair
-            .get(0)
-            .as_f64()
-            .ok_or_else(|| JsError::new("range offset must be a number"))? as u64;
+        let offset = f64_to_u64(pair.get(0).as_f64(), "range offset")?;
+        let length = f64_to_u64(pair.get(1).as_f64(), "range length")?;
         let bytes = frag_arr
             .get(i)
             .dyn_into::<Uint8Array>()
             .map_err(|_| JsError::new("each fragment must be a Uint8Array"))?
             .to_vec();
+        if bytes.len() as u64 != length {
+            return Err(JsError::new(&format!(
+                "fragment {} has {} bytes but its declared range length is {}",
+                i,
+                bytes.len(),
+                length
+            )));
+        }
         fragments_out.push((offset, bytes));
     }
     Ok(FragmentRangeReader { fragments: fragments_out })
+}
+
+/// Validate a JS number is a non-negative, finite integer and return it as
+/// `u64` — rejecting `NaN`, infinities, negatives and fractionals instead of
+/// silently saturating via `as u64`.
+fn f64_to_u64(v: Option<f64>, what: &str) -> Result<u64, JsError> {
+    let v = v.ok_or_else(|| JsError::new(&format!("{} must be a number", what)))?;
+    if !v.is_finite() || v < 0.0 || v.fract() != 0.0 || v > MAX_SAFE_INTEGER as f64 {
+        return Err(JsError::new(&format!(
+            "{} must be a non-negative integer within Number.MAX_SAFE_INTEGER, got {}",
+            what, v
+        )));
+    }
+    Ok(v as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -486,15 +537,31 @@ impl WasmMdfIndex {
         })
     }
 
-    /// Byte ranges covering both the channel and its group master (merged).
+    /// Full data-section byte ranges for the group owning `name`.
+    ///
+    /// Returns one `(file_offset + 24, size - 24)` span per `##DT`/`##DV`
+    /// fragment of the owning group (the 24 skips the block header), merged.
+    /// This is exactly what the fragment readers need: `valuesFromFragments` /
+    /// `readFromFragments` decode whole data sections, not just the requested
+    /// channel's columns, so the fragments must cover each full section.
     fn signal_ranges(&self, name: &str, group: Option<&str>) -> Result<Vec<(u64, u64)>, JsError> {
-        let (g, c) = self.locate(name, group)?;
+        let (g, _c) = self.locate(name, group)?;
         let grp = &self.index.channel_groups[g];
-        let mut ranges = self.index.get_channel_byte_ranges(g, c).map_err(err_to_js)?;
-        if let Some(mc) = grp.channels.iter().position(|ch| ch.is_master()) {
-            if mc != c {
-                ranges.extend(self.index.get_channel_byte_ranges(g, mc).map_err(err_to_js)?);
+        let mut ranges = Vec::with_capacity(grp.data_blocks.len());
+        for db in &grp.data_blocks {
+            if db.is_compressed {
+                return Err(JsError::new(
+                    "compressed (##DZ) data blocks are not supported for fragment reads",
+                ));
             }
+            let data_len = db.size.checked_sub(24).ok_or_else(|| {
+                JsError::new(&format!(
+                    "invalid index: data block at offset {} has size {} (smaller than the \
+                     24-byte block header)",
+                    db.file_offset, db.size
+                ))
+            })?;
+            ranges.push((db.file_offset + 24, data_len));
         }
         Ok(merge_ranges(ranges))
     }
@@ -605,12 +672,15 @@ impl WasmMdfIndex {
         ranges_to_js(ranges)
     }
 
-    /// Byte ranges covering both a channel and its group master, merged.
+    /// Full data-section byte ranges for the group owning `name`, merged.
     ///
-    /// Fetch these ranges and pass the fetched fragments to `readFromFragments`
-    /// so the reader can pair values with their time axis. For a typical
-    /// master-first record layout the merged union also covers each full data
-    /// section, so the same fragments work for `valuesFromFragments`.
+    /// Returns one span per data-block fragment covering the entire data
+    /// section (block bytes minus the 24-byte header). These are exactly the
+    /// ranges the fragment readers need: `valuesFromFragments` /
+    /// `readFromFragments` decode whole data sections (all channels are
+    /// interleaved per record), so fetch these and pass the fetched fragments
+    /// straight through — the requested channel and its master are both
+    /// covered regardless of record layout. Errors if any block is compressed.
     #[wasm_bindgen(js_name = signalByteRanges)]
     pub fn signal_byte_ranges(
         &self,
@@ -806,11 +876,13 @@ impl WasmMdfWriter {
         Ok(py_id)
     }
 
-    /// Add a generic channel using the data type's natural bit width.
+    /// Add a generic fixed-length channel using the data type's natural bit
+    /// width.
     ///
     /// `dataType` is a symbolic name such as `"FloatLE"`, `"UnsignedIntegerLE"`,
-    /// `"SignedIntegerLE"`, `"StringUtf8"` (float defaults to 32 bits — use
-    /// `addFloatChannel` for f64).
+    /// or `"SignedIntegerLE"` (float defaults to 32 bits — use
+    /// `addFloatChannel` for f64). String channels are **not** fixed-length in
+    /// this writer; use `addStringChannel` for text.
     #[wasm_bindgen(js_name = addChannel)]
     pub fn add_channel(
         &mut self,
@@ -819,8 +891,53 @@ impl WasmMdfWriter {
         data_type: &str,
     ) -> Result<String, JsError> {
         let dt = data_type_from_str(data_type)?;
+        if is_string_type(&dt) {
+            return Err(JsError::new(
+                "string data types are variable-length in this writer; use addStringChannel",
+            ));
+        }
         let bits = dt.default_bits();
         self.add_channel_with_bits(group_id, name, dt, bits)
+    }
+
+    /// Add a variable-length (VLSD) UTF-8 string channel.
+    ///
+    /// Mirrors the Python `add_string_channel`: the record slot holds a `u64`
+    /// offset into a `##SD` block the writer manages automatically. Pass JS
+    /// `string` values for this channel to `writeRecord`.
+    #[wasm_bindgen(js_name = addStringChannel)]
+    pub fn add_string_channel(&mut self, group_id: &str, name: &str) -> Result<String, JsError> {
+        let cg_id = self
+            .channel_groups
+            .get(group_id)
+            .ok_or_else(|| JsError::new("Channel group not found"))?
+            .clone();
+        let prev_channel_id = self
+            .last_channels
+            .get(group_id)
+            .and_then(|py_id| self.channels.get(py_id))
+            .cloned();
+        let name_owned = name.to_string();
+        let ch_id = self
+            .writer_mut()?
+            .add_channel(&cg_id, prev_channel_id.as_deref(), |ch| {
+                ch.data_type = DataType::StringUtf8;
+                ch.name = Some(name_owned.clone());
+                ch.channel_type = 1; // VLSD
+                ch.data = 1; // routed to the SD-block writer; patched on finish
+                ch.bit_count = 64; // record slot holds a u64 offset
+            })
+            .map_err(err_to_js)?;
+
+        let py_id = format!("ch_{}", self.next_id);
+        self.next_id += 1;
+        self.channels.insert(py_id.clone(), ch_id);
+        self.last_channels.insert(group_id.to_string(), py_id.clone());
+        self.channel_types
+            .entry(group_id.to_string())
+            .or_default()
+            .push(DataType::StringUtf8);
+        Ok(py_id)
     }
 
     /// Add a 64-bit float channel and mark it as the group's master/time
@@ -882,10 +999,18 @@ impl WasmMdfWriter {
     }
 
     /// Append a single record: one value per channel, in the order channels were
-    /// added. Values are `number` (encoded per each channel's data type) or
-    /// `string` (for string channels).
+    /// added. Each value is a `number` (encoded per the channel's data type), a
+    /// `string` (for string channels), or a `BigInt` — accepted for integer
+    /// channels so values beyond `Number.MAX_SAFE_INTEGER` round-trip (the
+    /// reader emits `BigInt` for those). A `BigInt` must fit the channel's
+    /// signed/unsigned 64-bit range.
     #[wasm_bindgen(js_name = writeRecord)]
     pub fn write_record(&mut self, group_id: &str, values: JsValue) -> Result<(), JsError> {
+        let cg_id = self
+            .channel_groups
+            .get(group_id)
+            .ok_or_else(|| JsError::new("Channel group not found"))?
+            .clone();
         let types = self
             .channel_types
             .get(group_id)
@@ -908,6 +1033,36 @@ impl WasmMdfWriter {
             let v = arr.get(i as u32);
             let decoded = if let Some(s) = v.as_string() {
                 DecodedValue::String(s)
+            } else if let Some(b) = v.dyn_ref::<js_sys::BigInt>() {
+                match dt {
+                    DataType::SignedIntegerLE | DataType::SignedIntegerBE => {
+                        let n = i64::try_from(b.clone()).map_err(|_| {
+                            JsError::new(&format!(
+                                "record value at index {} (BigInt) does not fit in a signed 64-bit \
+                                 integer",
+                                i
+                            ))
+                        })?;
+                        DecodedValue::SignedInteger(n)
+                    }
+                    DataType::UnsignedIntegerLE | DataType::UnsignedIntegerBE => {
+                        let n = u64::try_from(b.clone()).map_err(|_| {
+                            JsError::new(&format!(
+                                "record value at index {} (BigInt) does not fit in an unsigned \
+                                 64-bit integer",
+                                i
+                            ))
+                        })?;
+                        DecodedValue::UnsignedInteger(n)
+                    }
+                    _ => {
+                        return Err(JsError::new(&format!(
+                            "record value at index {} is a BigInt but that channel is not an \
+                             integer channel",
+                            i
+                        )));
+                    }
+                }
             } else if let Some(f) = v.as_f64() {
                 match dt {
                     DataType::FloatLE | DataType::FloatBE => DecodedValue::Float(f),
@@ -921,14 +1076,13 @@ impl WasmMdfWriter {
                 }
             } else {
                 return Err(JsError::new(&format!(
-                    "record value at index {} must be a number or string",
+                    "record value at index {} must be a number, string or BigInt",
                     i
                 )));
             };
             rust_values.push(decoded);
         }
 
-        let cg_id = self.channel_groups.get(group_id).unwrap().clone();
         self.writer_mut()?.write_record(&cg_id, &rust_values).map_err(err_to_js)?;
         Ok(())
     }

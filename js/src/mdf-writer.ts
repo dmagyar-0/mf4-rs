@@ -1,7 +1,11 @@
 import { loadWasmModule, type WasmMdfWriter } from "./wasm-module";
 
-/** A single record value: numeric for numeric channels, string for string channels. */
-export type RecordValue = number | string;
+/**
+ * A single record value: `number` for numeric channels, `string` for string
+ * channels, or `bigint` for integer channels whose value exceeds
+ * `Number.MAX_SAFE_INTEGER`.
+ */
+export type RecordValue = number | string | bigint;
 
 /**
  * Streaming writer that produces an MDF 4 file entirely in memory.
@@ -71,6 +75,14 @@ export class MdfWriter {
     return this.inner.addSintChannel(groupId, name);
   }
 
+  /**
+   * Add a variable-length (VLSD) UTF-8 string channel. Pass JS `string`
+   * values for this channel to `writeRecord`.
+   */
+  addStringChannel(groupId: string, name: string): string {
+    return this.inner.addStringChannel(groupId, name);
+  }
+
   /** Mark an existing channel as the group's master/time channel. */
   setTimeChannel(channelId: string): void {
     this.inner.setTimeChannel(channelId);
@@ -102,5 +114,10 @@ export class MdfWriter {
   /** Free the underlying wasm memory. Safe to call multiple times. */
   dispose(): void {
     this.inner.free();
+  }
+
+  /** `using`/`Symbol.dispose` support: frees the underlying wasm memory. */
+  [Symbol.dispose](): void {
+    this.dispose();
   }
 }

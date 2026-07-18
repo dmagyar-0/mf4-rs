@@ -1,6 +1,5 @@
 import { loadWasmModule, type WasmMdfIndex } from "./wasm-module";
 import { readAllRanges, type RangeSource } from "./range-source";
-import { mergeByteRanges } from "./byte-ranges";
 import type { ByteRange, IndexGroupInfo, Signal } from "./types";
 
 /**
@@ -68,33 +67,53 @@ export class MdfIndex {
   }
 
   /**
-   * Byte ranges `[[offset, length], ...]` occupied by a channel.
+   * Byte ranges `[[offset, length], ...]` occupied by a single channel.
    *
    * Power-user API: each span coalesces one data-block fragment and, because
    * records interleave all channels, includes neighbouring channels' bytes.
-   * It does **not** reliably cover the channel's master/time axis, nor
-   * necessarily whole data sections — prefer `signalByteRanges` for reads.
+   * It does **not** on its own guarantee full-data-section coverage, so it is
+   * not suitable to feed directly to the fragment decoders — prefer
+   * `signalByteRanges` for reads.
    */
   byteRanges(name: string, group?: string | null): ByteRange[] {
     return this.inner.byteRanges(name, group) as ByteRange[];
   }
 
-  /** Byte ranges covering a record window `[startRecord, startRecord+recordCount)`. */
+  /**
+   * Byte ranges covering a record window `[startRecord, startRecord+recordCount)`.
+   *
+   * `startRecord` and `recordCount` are plain integers (non-negative).
+   */
   byteRangesForRecords(
     name: string,
-    startRecord: bigint,
-    recordCount: bigint,
+    startRecord: number,
+    recordCount: number,
     group?: string | null,
   ): ByteRange[] {
-    return this.inner.byteRangesForRecords(name, startRecord, recordCount, group) as ByteRange[];
+    if (!Number.isInteger(startRecord) || startRecord < 0) {
+      throw new RangeError(`startRecord must be a non-negative integer, got ${startRecord}`);
+    }
+    if (!Number.isInteger(recordCount) || recordCount < 0) {
+      throw new RangeError(`recordCount must be a non-negative integer, got ${recordCount}`);
+    }
+    return this.inner.byteRangesForRecords(
+      name,
+      BigInt(startRecord),
+      BigInt(recordCount),
+      group,
+    ) as ByteRange[];
   }
 
   /**
-   * Byte ranges covering both a channel and its group master, merged.
+   * Full data-section byte ranges for the group owning `name`, merged.
    *
-   * This is the range set to fetch for `values`/`read` (and for
-   * `valuesFromFragments`/`readFromFragments` directly) — it also covers
-   * each full data section for the typical master-first record layout.
+   * Returns one span per data-block fragment covering the entire data section
+   * (block bytes minus the 24-byte header). This is exactly the range set the
+   * fragment readers need: `valuesFromFragments`/`readFromFragments` decode
+   * whole data sections (all channels interleave per record), so fetch these
+   * and pass the fetched fragments straight through — the requested channel
+   * and its master are both covered for any record layout. This is also what
+   * `values`/`read` fetch under the hood.
    */
   signalByteRanges(name: string, group?: string | null): ByteRange[] {
     return this.inner.signalByteRanges(name, group) as ByteRange[];
@@ -135,14 +154,14 @@ export class MdfIndex {
    * Lazily decode a numeric channel to a `Float64Array`, fetching only the
    * bytes it needs from `source`.
    *
-   * Computes the byte ranges to fetch, reads them from `source`
-   * concurrently, then decodes via `valuesFromFragments`. See
-   * `fullDataSectionRanges` for why this fetches more than
-   * `signalByteRanges` alone when the group has channels beyond the
-   * master and the requested one.
+   * Fetches the group's full data-section ranges (`signalByteRanges`) from
+   * `source` concurrently, then decodes via `valuesFromFragments`. The
+   * fragment decoders read whole data sections (records interleave every
+   * channel), so `signalByteRanges` is exactly the right range set for any
+   * group shape.
    */
   async values(name: string, source: RangeSource, group?: string | null): Promise<Float64Array> {
-    const ranges = this.fullDataSectionRanges(name, group);
+    const ranges = this.signalByteRanges(name, group);
     const fragments = await readAllRanges(source, ranges);
     return this.valuesFromFragments(name, group, ranges, fragments);
   }
@@ -151,50 +170,22 @@ export class MdfIndex {
    * Lazily decode a channel to a `Signal`, fetching only the bytes it needs
    * from `source`.
    *
-   * Computes the byte ranges to fetch, reads them from `source`
-   * concurrently, then decodes via `readFromFragments`. See
-   * `fullDataSectionRanges` for why this fetches more than
-   * `signalByteRanges` alone when the group has channels beyond the
-   * master and the requested one.
+   * Fetches the group's full data-section ranges (`signalByteRanges`) from
+   * `source` concurrently, then decodes via `readFromFragments`.
    */
   async read(name: string, source: RangeSource, group?: string | null): Promise<Signal> {
-    const ranges = this.fullDataSectionRanges(name, group);
+    const ranges = this.signalByteRanges(name, group);
     const fragments = await readAllRanges(source, ranges);
     return this.readFromFragments(name, group, ranges, fragments);
-  }
-
-  /**
-   * Byte ranges that reliably cover the *entire* data section(s) backing a
-   * channel's group, merged and coalesced.
-   *
-   * `valuesFromFragments`/`readFromFragments` decode by reading whole data
-   * blocks, not just the columns for the requested channel — in testing,
-   * `signalByteRanges` (master + requested channel only) undershoots
-   * whenever the group has additional channels declared after the
-   * requested one, because their trailing bytes in the final record are
-   * never included in the merged master+channel span. Unioning every
-   * channel's `byteRanges` in the owning group reliably covers the full
-   * data section (and degrades to exactly `signalByteRanges` for a plain
-   * two-channel master+data group, so there is no extra cost in the common
-   * case).
-   */
-  private fullDataSectionRanges(name: string, group?: string | null): ByteRange[] {
-    const groups = this.groups();
-    const owning =
-      groups.find((g) => (group ? g.name === group : g.channelNames.includes(name))) ??
-      groups.find((g) => g.channelNames.includes(name));
-    const channelNames = owning ? owning.channelNames : [name];
-    const resolvedGroup = group ?? owning?.name ?? undefined;
-
-    const all: ByteRange[] = [];
-    for (const channelName of channelNames) {
-      all.push(...this.byteRanges(channelName, resolvedGroup));
-    }
-    return mergeByteRanges(all);
   }
 
   /** Free the underlying wasm memory. Safe to call multiple times. */
   dispose(): void {
     this.inner.free();
+  }
+
+  /** `using`/`Symbol.dispose` support: frees the underlying wasm memory. */
+  [Symbol.dispose](): void {
+    this.dispose();
   }
 }
