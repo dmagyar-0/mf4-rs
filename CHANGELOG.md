@@ -1,3 +1,8 @@
+## v3.1.0 — 2026-07-18
+
+### Features
+- add WebAssembly bindings and TypeScript npm package (#82)
+
 ## v3.0.0 — 2026-07-09
 
 ### BREAKING CHANGES
