@@ -408,6 +408,14 @@ jobs:
     name: Publish to npm
     needs: bump-and-tag
     runs-on: ubuntu-latest
+    # Authentication uses npm Trusted Publishing (OIDC) — no npm token
+    # is stored. Requires a Trusted Publisher entry on the npm package
+    # (Settings -> Trusted Publisher: GitHub Actions, dmagyar-0/mf4-rs,
+    # workflow release.yml) and the id-token permission below. npm
+    # attaches provenance automatically when publishing via OIDC.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -423,6 +431,9 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+      # Trusted publishing needs npm >= 11.5.1; Node 22 bundles npm 10.
+      - name: Update npm for trusted publishing
+        run: npm install -g npm@latest && npm --version
       - name: Install npm dependencies
         working-directory: js
         run: npm ci
@@ -430,10 +441,6 @@ jobs:
       # builds the wasm bindings (wasm-pack), compiles the TypeScript
       # wrapper, and runs the full js test suite before anything is
       # uploaded — a test failure aborts the publish.
-      # Requires an NPM_TOKEN repository secret (npm automation token
-      # with publish rights on the `mf4-rs` package).
       - name: Publish
         working-directory: js
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public

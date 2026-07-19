@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commit & PR Title Format (MUST FOLLOW)
 
-This repository uses **automated releases driven by Conventional Commits**. Every push to `main` runs `.github/workflows/release.yml`, which inspects commit messages since the last `v*` tag, computes a SemVer bump, updates `Cargo.toml` / `pyproject.toml` / `Cargo.lock` / `js/package.json` / `js/package-lock.json` / `CHANGELOG.md`, tags `vX.Y.Z`, and publishes to PyPI, crates.io, and npm (the `publish-npm` job builds the wasm bindings with `wasm-pack`, compiles the TypeScript wrapper, runs the js test suite via `prepublishOnly`, and publishes `js/` as the `mf4-rs` npm package using the `NPM_TOKEN` secret).
+This repository uses **automated releases driven by Conventional Commits**. Every push to `main` runs `.github/workflows/release.yml`, which inspects commit messages since the last `v*` tag, computes a SemVer bump, updates `Cargo.toml` / `pyproject.toml` / `Cargo.lock` / `js/package.json` / `js/package-lock.json` / `CHANGELOG.md`, tags `vX.Y.Z`, and publishes to PyPI, crates.io, and npm (the `publish-npm` job builds the wasm bindings with `wasm-pack`, compiles the TypeScript wrapper, runs the js test suite via `prepublishOnly`, and publishes `js/` as the `mf4-rs` npm package via npm Trusted Publishing / OIDC — no npm token is stored).
 
 The repo squash-merges PRs, so **the PR title becomes the commit message on `main`** — and that is what the release pipeline parses. PR titles are also linted by `.github/workflows/pr-title.yml` (uses `amannn/action-semantic-pull-request`).
 
