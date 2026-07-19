@@ -146,6 +146,12 @@ jobs:
           "
           grep '^version' pyproject.toml
 
+      - name: Bump js/package.json
+        working-directory: js
+        run: |
+          npm version "${{ needs.compute-bump.outputs.new_version }}" --no-git-tag-version
+          grep '"version"' package.json | head -1
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Refresh Cargo.lock
@@ -219,7 +225,7 @@ jobs:
         run: |
           set -euo pipefail
           new='v${{ needs.compute-bump.outputs.new_version }}'
-          git add Cargo.toml Cargo.lock pyproject.toml CHANGELOG.md
+          git add Cargo.toml Cargo.lock pyproject.toml js/package.json js/package-lock.json CHANGELOG.md
           git commit -m "chore(release): ${new}"
           git tag -a "${new}" -m "Release ${new}"
           git push origin HEAD:main
@@ -397,3 +403,44 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --token "$CARGO_REGISTRY_TOKEN"
+
+  publish-npm:
+    name: Publish to npm
+    needs: bump-and-tag
+    runs-on: ubuntu-latest
+    # Authentication uses npm Trusted Publishing (OIDC) — no npm token
+    # is stored. Requires a Trusted Publisher entry on the npm package
+    # (Settings -> Trusted Publisher: GitHub Actions, dmagyar-0/mf4-rs,
+    # workflow release.yml) and the id-token permission below. npm
+    # attaches provenance automatically when publishing via OIDC.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump-and-tag.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # wasm-opt is disabled in Cargo.toml ([package.metadata.wasm-pack]),
+      # so wasm-pack needs no binaryen download at build time.
+      - name: Install wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      # Trusted publishing needs npm >= 11.5.1; Node 22 bundles npm 10.
+      - name: Update npm for trusted publishing
+        run: npm install -g npm@latest && npm --version
+      - name: Install npm dependencies
+        working-directory: js
+        run: npm ci
+      # `npm publish` runs the package's prepublishOnly script, which
+      # builds the wasm bindings (wasm-pack), compiles the TypeScript
+      # wrapper, and runs the full js test suite before anything is
+      # uploaded — a test failure aborts the publish.
+      - name: Publish
+        working-directory: js
+        run: npm publish --access public

@@ -29,7 +29,7 @@
     "README.md"
   ],
   "scripts": {
-    "build:wasm": "cd .. && wasm-pack build --target nodejs --out-dir js/pkg-node -- --features wasm",
+    "build:wasm": "cd .. && wasm-pack build --target nodejs --out-dir js/pkg-node -- --features wasm && node -e \"fs.rmSync('js/pkg-node/.gitignore',{force:true})\"",
     "build": "tsc",
     "test": "node --test dist/test/**/*.test.js",
     "prepublishOnly": "npm run build:wasm && npm run build && npm test"

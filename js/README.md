@@ -20,7 +20,23 @@ Built and tested against Node 22 on the `nodejs` wasm-pack target. The
 `FileRangeSource` (which uses `fs/promises`) — see **Browser usage** below
 for what that means in practice.
 
-## Prerequisites
+## Install
+
+```bash
+npm install mf4-rs
+```
+
+The published package ships the compiled TypeScript wrapper (`dist/src/`)
+and the prebuilt `nodejs`-target wasm module (`pkg-node/`) — no Rust
+toolchain needed. The package version tracks the repository's release
+version: every release tagged by `.github/workflows/release.yml` publishes
+the matching npm version alongside the PyPI wheels and the crates.io crate.
+
+## Building from source
+
+For development on the bindings themselves:
+
+### Prerequisites
 
 - Node >= 18 (tested on Node 22).
 - [`wasm-pack`](https://rustwasm.github.io/wasm-pack/) on `PATH` to build the
@@ -28,7 +44,7 @@ for what that means in practice.
 - The Rust crate must be compiled with the `wasm` feature (already the case
   via the `build:wasm` script below).
 
-## Install / build
+### Build
 
 ```bash
 cd js
@@ -44,8 +60,9 @@ npm run build
 npm test
 ```
 
-`pkg-node/` and `dist/` are build artifacts and are gitignored — run
-`build:wasm` and `build` after cloning, before importing the package.
+In a git checkout, `pkg-node/` and `dist/` are build artifacts and are
+gitignored — run `build:wasm` and `build` after cloning, before importing
+the package.
 
 ## Node quickstart
 
