@@ -1,3 +1,8 @@
+## v3.2.1 — 2026-07-19
+
+### Fixes
+- ship the WebAssembly module in the npm package and publish it on release (#84)
+
 ## v3.2.0 — 2026-07-18
 
 ### Features
