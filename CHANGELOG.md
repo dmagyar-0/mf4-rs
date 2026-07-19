@@ -1,3 +1,8 @@
+## v3.2.3 — 2026-07-19
+
+### Fixes
+- republish the npm package with the configured trusted publisher (#86)
+
 ## v3.2.2 — 2026-07-19
 
 ### Fixes
