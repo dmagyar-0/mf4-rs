@@ -1,3 +1,8 @@
+## v3.2.2 — 2026-07-19
+
+### Fixes
+- let npm trusted publishing authenticate the release npm publish (#85)
+
 ## v3.2.1 — 2026-07-19
 
 ### Fixes
