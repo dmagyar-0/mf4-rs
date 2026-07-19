@@ -427,10 +427,14 @@ jobs:
       # so wasm-pack needs no binaryen download at build time.
       - name: Install wasm-pack
         run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+      # Deliberately no `registry-url` here: setting it makes setup-node
+      # write an .npmrc with `_authToken=${NODE_AUTH_TOKEN}` (and export a
+      # placeholder value for that variable), and a configured auth token
+      # takes precedence over OIDC — npm then publishes with the bogus
+      # token and fails with E404 instead of using trusted publishing.
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
       # Trusted publishing needs npm >= 11.5.1; Node 22 bundles npm 10.
       - name: Update npm for trusted publishing
         run: npm install -g npm@latest && npm --version
