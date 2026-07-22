@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+// Register the Node wasm loader (the `.` package entry does this for real
+// consumers; tests import the wrapper classes from source directly).
+import "../src/wasm-module-node";
 import { Mdf } from "../src/mdf";
 import { MdfIndex } from "../src/mdf-index";
 import { MdfWriter } from "../src/mdf-writer";

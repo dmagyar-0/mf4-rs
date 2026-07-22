@@ -223,55 +223,110 @@ fn fragment_end(fstart: u64, len: usize) -> Result<u64, MdfError> {
     })
 }
 
+/// Outcome of trying to serve a read from a set of file fragments.
+enum Coverage {
+    /// The request was fully covered; here are the assembled bytes.
+    Full(Vec<u8>),
+    /// A gap was found: `offset`/`length` describe the first still-missing
+    /// sub-range of the request.
+    Gap { offset: u64, length: u64 },
+}
+
+/// Try to assemble the absolute range `[offset, offset + length)` from
+/// `fragments` (each an `(absolute_offset, bytes)` pair, possibly
+/// overlapping). Returns [`Coverage::Full`] with the bytes, or
+/// [`Coverage::Gap`] naming the first uncovered sub-range.
+fn assemble_from_fragments(
+    fragments: &[(u64, Vec<u8>)],
+    offset: u64,
+    length: u64,
+) -> Result<Coverage, MdfError> {
+    let req_end = offset.checked_add(length).ok_or_else(|| {
+        MdfError::BlockSerializationError(
+            "requested byte range offset + length overflows u64".to_string(),
+        )
+    })?;
+    let len = u64_to_usize(length)?;
+
+    // Fast path: a single fragment fully contains the request.
+    for (start, bytes) in fragments {
+        let fstart = *start;
+        let fend = fragment_end(fstart, bytes.len())?;
+        if offset >= fstart && req_end <= fend {
+            let s = u64_to_usize(offset - fstart)?;
+            return Ok(Coverage::Full(bytes[s..s + len].to_vec()));
+        }
+    }
+
+    // Assembly path: stitch the request together from overlapping fragments.
+    let mut out = vec![0u8; len];
+    let mut covered = vec![false; len];
+    for (start, bytes) in fragments {
+        let fstart = *start;
+        let fend = fragment_end(fstart, bytes.len())?;
+        let lo = offset.max(fstart);
+        let hi = req_end.min(fend);
+        if lo < hi {
+            let dst_lo = u64_to_usize(lo - offset)?;
+            let dst_hi = u64_to_usize(hi - offset)?;
+            let src_lo = u64_to_usize(lo - fstart)?;
+            out[dst_lo..dst_hi].copy_from_slice(&bytes[src_lo..src_lo + (dst_hi - dst_lo)]);
+            for c in &mut covered[dst_lo..dst_hi] {
+                *c = true;
+            }
+        }
+    }
+    match covered.iter().position(|&c| !c) {
+        None => Ok(Coverage::Full(out)),
+        Some(pos) => {
+            let miss_off = offset + pos as u64;
+            Ok(Coverage::Gap { offset: miss_off, length: req_end - miss_off })
+        }
+    }
+}
+
 impl ByteRangeReader for FragmentRangeReader {
     type Error = MdfError;
 
     fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
-        let req_end = offset.checked_add(length).ok_or_else(|| {
-            MdfError::BlockSerializationError(
-                "requested byte range offset + length overflows u64".to_string(),
-            )
-        })?;
-        let len = u64_to_usize(length)?;
-
-        // Fast path: a single fragment fully contains the request.
-        for (start, bytes) in &self.fragments {
-            let fstart = *start;
-            let fend = fragment_end(fstart, bytes.len())?;
-            if offset >= fstart && req_end <= fend {
-                let s = u64_to_usize(offset - fstart)?;
-                return Ok(bytes[s..s + len].to_vec());
-            }
-        }
-
-        // Assembly path: stitch the request together from overlapping fragments.
-        let mut out = vec![0u8; len];
-        let mut covered = vec![false; len];
-        for (start, bytes) in &self.fragments {
-            let fstart = *start;
-            let fend = fragment_end(fstart, bytes.len())?;
-            let lo = offset.max(fstart);
-            let hi = req_end.min(fend);
-            if lo < hi {
-                let dst_lo = u64_to_usize(lo - offset)?;
-                let dst_hi = u64_to_usize(hi - offset)?;
-                let src_lo = u64_to_usize(lo - fstart)?;
-                out[dst_lo..dst_hi].copy_from_slice(&bytes[src_lo..src_lo + (dst_hi - dst_lo)]);
-                for c in &mut covered[dst_lo..dst_hi] {
-                    *c = true;
-                }
-            }
-        }
-        if let Some(pos) = covered.iter().position(|&c| !c) {
-            return Err(MdfError::BlockSerializationError(format!(
+        match assemble_from_fragments(&self.fragments, offset, length)? {
+            Coverage::Full(bytes) => Ok(bytes),
+            Coverage::Gap { offset: miss, .. } => Err(MdfError::BlockSerializationError(format!(
                 "requested byte range {}..{} is not fully covered by the provided fragments \
                  (missing at offset {})",
                 offset,
-                req_end,
-                offset + pos as u64
-            )));
+                offset + length,
+                miss
+            ))),
         }
-        Ok(out)
+    }
+}
+
+/// A [`ByteRangeReader`] that drives an incremental, range-fetched index
+/// build. It serves reads from the fragments gathered so far; on the first
+/// read it cannot fully cover, it records the still-missing sub-range in
+/// [`miss`](Self::miss) and returns an error to abort the metadata walk. The
+/// JS driver fetches that range, appends the fragment, and retries — repeating
+/// until the walk completes. Only metadata blocks are ever requested, so the
+/// bulk sample data is never downloaded.
+struct RecordingRangeReader {
+    fragments: Vec<(u64, Vec<u8>)>,
+    miss: Option<(u64, u64)>,
+}
+
+impl ByteRangeReader for RecordingRangeReader {
+    type Error = MdfError;
+
+    fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
+        match assemble_from_fragments(&self.fragments, offset, length)? {
+            Coverage::Full(bytes) => Ok(bytes),
+            Coverage::Gap { offset: miss, length: needed } => {
+                self.miss = Some((miss, needed));
+                Err(MdfError::BlockSerializationError(
+                    "range not yet available; fetch and retry".to_string(),
+                ))
+            }
+        }
     }
 }
 
@@ -369,6 +424,19 @@ struct IndexGroupInfoJs {
     record_count: u64,
     channel_names: Vec<String>,
     master_channel: Option<String>,
+}
+
+/// One step of the incremental index build (`buildIndexStep`): either the
+/// finished index as JSON, or the next byte range the build still needs.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildStepJs {
+    done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json: Option<String>,
+    /// `[offset, length]` of the next range to fetch when `done` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    needed: Option<[f64; 2]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +657,49 @@ impl WasmMdfIndex {
     pub fn from_json(json: &str) -> Result<WasmMdfIndex, JsError> {
         let index = MdfIndex::from_json(json).map_err(err_to_js)?;
         Ok(WasmMdfIndex { index })
+    }
+
+    /// One step of an incremental, range-fetched index build.
+    ///
+    /// Drives the native metadata walk (which reads only structural blocks,
+    /// never sample data) against the `ranges`/`fragments` gathered so far.
+    /// Returns `{ done: true, json }` with the finished index once the walk
+    /// completes, or `{ done: false, needed: [offset, length] }` naming the
+    /// next byte range to fetch and feed back. The JS `MdfIndex.fromRangeSource`
+    /// wrapper loops over this; call it directly only for a custom driver.
+    ///
+    /// `fileSize` is the total file length (from a HEAD request or
+    /// `RangeSource.size()`); it is stored on the resulting index. `ranges` is
+    /// the `[[offset, length], ...]` array of fragments fetched so far and
+    /// `fragments` the parallel array of `Uint8Array` bytes.
+    #[wasm_bindgen(js_name = buildIndexStep)]
+    pub fn build_index_step(
+        file_size: f64,
+        ranges: JsValue,
+        fragments: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let file_size = f64_to_u64(Some(file_size), "file size")?;
+        let parsed = build_fragment_reader(&ranges, &fragments)?;
+        let mut reader = RecordingRangeReader { fragments: parsed.fragments, miss: None };
+        match MdfIndex::from_range_reader(&mut reader, file_size) {
+            Ok(index) => {
+                let json = index.to_json().map_err(err_to_js)?;
+                let step = BuildStepJs { done: true, json: Some(json), needed: None };
+                serde_wasm_bindgen::to_value(&step).map_err(|e| JsError::new(&e.to_string()))
+            }
+            Err(e) => match reader.miss {
+                Some((offset, length)) => {
+                    let step = BuildStepJs {
+                        done: false,
+                        json: None,
+                        needed: Some([offset as f64, length as f64]),
+                    };
+                    serde_wasm_bindgen::to_value(&step).map_err(|e| JsError::new(&e.to_string()))
+                }
+                // A real error (not a missing-range abort) — surface it.
+                None => Err(err_to_js(e)),
+            },
+        }
     }
 
     /// Serialise the index to a JSON string.

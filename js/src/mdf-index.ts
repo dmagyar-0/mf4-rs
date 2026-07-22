@@ -1,6 +1,19 @@
-import { loadWasmModule, type WasmMdfIndex } from "./wasm-module";
-import { readAllRanges, type RangeSource } from "./range-source";
+import { getWasmModule, type WasmMdfIndex } from "./wasm-module";
+import {
+  readAllRanges,
+  FetchRangeSource,
+  type RangeSource,
+  type FetchLike,
+} from "./range-source";
 import type { ByteRange, IndexGroupInfo, Signal } from "./types";
+
+/** Initial prefix fetched before the build loop — metadata usually starts at
+ * the front of the file, so seeding this often completes the build in one or
+ * two round-trips. */
+const BUILD_SEED_BYTES = 256 * 1024;
+/** Minimum bytes fetched per build round-trip; larger reduces round-trips at
+ * the cost of possibly fetching a little unused metadata. */
+const BUILD_LOOKAHEAD_BYTES = 64 * 1024;
 
 /**
  * A self-contained, JSON-serialisable index over an MDF 4 file.
@@ -24,13 +37,13 @@ export class MdfIndex {
    * self-contained afterwards (and can be serialised with `toJson`).
    */
   static fromBytes(data: Uint8Array): MdfIndex {
-    const wasm = loadWasmModule();
+    const wasm = getWasmModule();
     return new MdfIndex(wasm.MdfIndex.fromBytes(data));
   }
 
   /** Reload a previously serialised index from its JSON string. */
   static fromJson(json: string): MdfIndex {
-    const wasm = loadWasmModule();
+    const wasm = getWasmModule();
     return new MdfIndex(wasm.MdfIndex.fromJson(json));
   }
 
@@ -39,6 +52,75 @@ export class MdfIndex {
     const fsp = await import("node:fs/promises");
     const buf = await fsp.readFile(path);
     return MdfIndex.fromBytes(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+  }
+
+  /**
+   * Build a fresh index over any `RangeSource`, fetching **only** the file's
+   * metadata blocks — never the bulk sample data.
+   *
+   * The metadata walk runs incrementally in wasm: it reports which byte ranges
+   * it still needs, this loop fetches them (with look-ahead to keep the number
+   * of requests low), and the two repeat until the index is built. For a
+   * typical file this transfers a few KB regardless of the file's size. Use it
+   * with `FetchRangeSource` (HTTP), `FileRangeSource` (Node), or any custom
+   * source. `source.size()` must be implemented.
+   */
+  static async fromRangeSource(source: RangeSource): Promise<MdfIndex> {
+    const wasm = getWasmModule();
+    if (!source.size) {
+      throw new Error("MdfIndex.fromRangeSource requires a RangeSource with a size() method.");
+    }
+    const size = await source.size();
+
+    const ranges: ByteRange[] = [];
+    const fragments: Uint8Array[] = [];
+
+    const fetchInto = async (offset: number, length: number): Promise<void> => {
+      const clamped = Math.min(length, size - offset);
+      if (offset < 0 || offset >= size || clamped <= 0) {
+        throw new Error(
+          `MdfIndex.fromRangeSource: build requested bytes [${offset}, ${offset + length}) ` +
+            `outside the file (size ${size}); the source may be truncated or not an MDF file.`,
+        );
+      }
+      const bytes = await source.read(offset, clamped);
+      ranges.push([offset, bytes.length]);
+      fragments.push(bytes);
+    };
+
+    // Seed with a prefix so files whose metadata sits at the front finish in
+    // one round-trip.
+    if (size > 0) {
+      await fetchInto(0, Math.min(BUILD_SEED_BYTES, size));
+    }
+
+    // Bounded loop: each round-trip advances the first missing offset, so this
+    // terminates; the cap is a safety net against a malformed source.
+    const maxRounds = 100_000;
+    for (let round = 0; round < maxRounds; round++) {
+      const step = wasm.MdfIndex.buildIndexStep(size, ranges, fragments);
+      if (step.done) {
+        return MdfIndex.fromJson(step.json as string);
+      }
+      const [offset, length] = step.needed as [number, number];
+      await fetchInto(offset, Math.max(length, BUILD_LOOKAHEAD_BYTES));
+    }
+    throw new Error(
+      "MdfIndex.fromRangeSource: index build did not converge; the source may not be a valid MDF file.",
+    );
+  }
+
+  /**
+   * Build a fresh index from an HTTP(S) URL, fetching only metadata.
+   *
+   * Convenience wrapper over `fromRangeSource` with a `FetchRangeSource`, so
+   * only the file's metadata blocks are downloaded (a few KB) rather than the
+   * whole file — as long as the server honours `Range` requests. Servers that
+   * ignore `Range` fall back to a single full download. Once built, read with
+   * `values`/`read` over a `RangeSource` for lazy, partial sample reads.
+   */
+  static async fromUrl(url: string, fetchImpl?: FetchLike): Promise<MdfIndex> {
+    return MdfIndex.fromRangeSource(new FetchRangeSource(url, fetchImpl));
   }
 
   /** Serialise the index to a JSON string. */

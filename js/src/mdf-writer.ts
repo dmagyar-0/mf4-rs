@@ -1,4 +1,4 @@
-import { loadWasmModule, type WasmMdfWriter } from "./wasm-module";
+import { getWasmModule, type WasmMdfWriter } from "./wasm-module";
 
 /**
  * A single record value: `number` for numeric channels, `string` for string
@@ -21,7 +21,7 @@ export class MdfWriter {
   private readonly inner: WasmMdfWriter;
 
   constructor() {
-    const wasm = loadWasmModule();
+    const wasm = getWasmModule();
     this.inner = new wasm.MdfWriter();
   }
 

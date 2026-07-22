@@ -1,17 +1,22 @@
 /**
- * Loader for the generated wasm-bindgen package.
+ * Shared handle to the generated wasm-bindgen package.
  *
- * The wasm package lives at `js/pkg-node/` (built by `npm run build:wasm`,
- * i.e. `wasm-pack build --target nodejs --out-dir js/pkg-node`) and is a
- * gitignored build artifact — it does not exist until that command has been
- * run at least once.
+ * The wasm code is identical across targets; only the JS glue differs. Two
+ * builds are shipped:
  *
- * This module is compiled to `dist/src/wasm-module.js`, two directories
- * below `js/`, so the relative path back up to `js/pkg-node/mf4_rs.js` is
- * `../../pkg-node/mf4_rs.js`.
+ * - `js/pkg-node/` — `wasm-pack build --target nodejs` (synchronous, CommonJS),
+ *   loaded lazily on Node via `wasm-module-node.ts` (the `.` entry point).
+ * - `js/pkg-web/` — `wasm-pack build --target web` (async ESM), loaded in the
+ *   browser via `web.ts` after `await init()` (the `mf4-rs/web` entry point).
+ *
+ * Both are gitignored build artifacts — they do not exist until
+ * `npm run build:wasm` / `npm run build:wasm:web` has been run at least once.
+ *
+ * This module holds no target-specific loading logic so that bundling the web
+ * entry never pulls in the Node `require` of `pkg-node`. The Node entry
+ * registers a lazy loader via `registerWasmLoader`; the web entry sets the
+ * resolved module directly via `setWasmModule`.
  */
-
-/* eslint-disable @typescript-eslint/no-var-requires */
 
 export interface WasmMdf {
   free(): void;
@@ -59,6 +64,20 @@ export interface WasmMdfIndex {
 export interface WasmMdfIndexConstructor {
   fromBytes(data: Uint8Array): WasmMdfIndex;
   fromJson(json: string): WasmMdfIndex;
+  buildIndexStep(
+    file_size: number,
+    ranges: unknown,
+    fragments: unknown,
+  ): WasmBuildStep;
+}
+
+/** One step of the incremental `buildIndexStep` index build. */
+export interface WasmBuildStep {
+  done: boolean;
+  /** Finished index as JSON when `done` is true. */
+  json?: string;
+  /** `[offset, length]` of the next range to fetch when `done` is false. */
+  needed?: [number, number];
 }
 
 export interface WasmMdfWriter {
@@ -91,25 +110,43 @@ export interface WasmModule {
 }
 
 let cached: WasmModule | undefined;
+let loader: (() => WasmModule) | undefined;
 
 /**
- * Load (and cache) the generated `pkg-node` wasm-bindgen module.
- *
- * Throws a friendly error if `pkg-node` hasn't been built yet.
+ * Provide an already-resolved wasm module (used by the browser `web.ts`
+ * entry after `await init()` has instantiated it).
  */
-export function loadWasmModule(): WasmModule {
+export function setWasmModule(module: WasmModule): void {
+  cached = module;
+}
+
+/**
+ * Register a lazy, synchronous loader for the wasm module (used by the Node
+ * `wasm-module-node.ts` entry, which `require`s the `pkg-node` build on first
+ * use). Kept out of this shared module so the web bundle never references it.
+ */
+export function registerWasmLoader(fn: () => WasmModule): void {
+  loader = fn;
+}
+
+/**
+ * Return the resolved wasm module, invoking the registered lazy loader on
+ * first use if one is present.
+ *
+ * Throws a friendly error if no module has been provided yet — on Node that
+ * means `pkg-node` failed to build; in the browser it means `init()` from
+ * `mf4-rs/web` has not been awaited.
+ */
+export function getWasmModule(): WasmModule {
   if (cached) {
     return cached;
   }
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    cached = require("../../pkg-node/mf4_rs.js") as WasmModule;
+  if (loader) {
+    cached = loader();
     return cached;
-  } catch (err) {
-    throw new Error(
-      "Failed to load the mf4-rs wasm module from js/pkg-node. " +
-        "Build it first with `npm run build:wasm` (requires wasm-pack). " +
-        `Original error: ${(err as Error).message}`,
-    );
   }
+  throw new Error(
+    "mf4-rs wasm module is not initialised. On Node, import from 'mf4-rs'; " +
+      "in the browser, `await init()` from 'mf4-rs/web' before using the API.",
+  );
 }

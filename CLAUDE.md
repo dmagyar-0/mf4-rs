@@ -109,15 +109,17 @@ When adding a new `#[pyclass]`, `#[pymethods]`, or `#[pyfunction]`, place a matc
 # Check the wasm bindings compile (they also build on native targets for IDE friendliness)
 cargo check --features wasm
 
-# Build the wasm module into js/pkg-node/ (requires wasm-pack and the
-# wasm32-unknown-unknown target; wasm-opt is disabled via Cargo.toml metadata)
-cd js && npm run build:wasm
+# Build the wasm modules (requires wasm-pack and the wasm32-unknown-unknown
+# target; wasm-opt is disabled via Cargo.toml metadata)
+cd js && npm run build:wasm       # nodejs target -> js/pkg-node/
+npm run build:wasm:web            # web target    -> js/pkg-web/
 
-# Compile the TypeScript wrapper into js/dist/ and run the js test suite
-npm run build
+# Compile the TypeScript wrapper and run the js test suite
+npm run build                     # Node (CommonJS) -> js/dist/
+npm run build:web                 # browser (ESM)   -> js/dist-web/
 npm test
 ```
-`js/pkg-node/`, `js/dist/`, and `js/node_modules/` are gitignored build artifacts. The npm package version in `js/package.json` / `js/package-lock.json` is managed by the release workflow — never bump it by hand.
+`js/pkg-node/`, `js/pkg-web/`, `js/dist/`, `js/dist-web/`, and `js/node_modules/` are gitignored build artifacts. The npm package version in `js/package.json` / `js/package-lock.json` is managed by the release workflow — never bump it by hand. The package exposes two entry points: `mf4-rs` (Node, synchronous `pkg-node` build) and `mf4-rs/web` (browser, async `pkg-web` build with an `init()` step). `prepublishOnly` runs all four builds plus the tests so both targets ship in sync.
 
 ## Architecture
 
@@ -239,8 +241,9 @@ The codebase is organized into distinct layers. The module structure is defined 
 - `src/wasm.rs` is built only when the `wasm` feature is enabled (wasm-bindgen + js-sys + serde-wasm-bindgen); it also compiles on native targets for IDE friendliness
 - Mirrors the **name-based** API philosophy of the Python bindings: `Mdf` (in-memory reader from bytes), `MdfIndex` (self-contained index + fragment-based reads), `MdfWriter` (in-memory writer producing a `Uint8Array`)
 - The wasm module has no filesystem/network access — I/O lives on the JS side. `MdfIndex` exposes `signalByteRanges()` + `valuesFromFragments()`/`readFromFragments()` so callers fetch bytes themselves and pass fragments in
-- `js/` is the npm package (`mf4-rs`): a typed TypeScript wrapper (`js/src/`) over the generated `pkg-node/` wasm-bindgen module, adding Node convenience constructors (`Mdf.fromFile`, `fromUrl`) and the pluggable `RangeSource` abstraction (`FetchRangeSource`, `FileRangeSource`, `BytesRangeSource`) for lazy remote reads
-- Built with `wasm-pack build --target nodejs` (see `js/package.json` scripts); tests run with Node's built-in test runner (`npm test`, Node >= 18)
+- `js/` is the npm package (`mf4-rs`): a typed TypeScript wrapper (`js/src/`) over the generated wasm-bindgen module, adding convenience constructors (`Mdf.fromFile`, `Mdf.fromUrl`, `MdfIndex.fromFile`, `MdfIndex.fromRangeSource`, `MdfIndex.fromUrl`) and the pluggable `RangeSource` abstraction (`FetchRangeSource`, `FileRangeSource`, `BytesRangeSource`) for lazy remote reads. `MdfIndex.fromUrl`/`fromRangeSource` build the index **fetching only metadata** (never the sample data), mirroring the native `MdfIndex::from_url`: the wasm `MdfIndex.buildIndexStep` runs the native `from_range_reader` walk against a record-replay reader and reports the next byte range it needs, and the JS wrapper loops fetching those ranges (seed prefix + look-ahead) until the index is built
+- Two entry points share the same wrapper classes: `mf4-rs` (the `.` export) loads the synchronous `pkg-node/` (`--target nodejs`) build via `src/wasm-module-node.ts`; `mf4-rs/web` (the `./web` export, `src/web.ts`) loads the async `pkg-web/` (`--target web`) build and adds an `init()` that must be awaited once before use. The shared `src/wasm-module.ts` holds no target-specific loader (`getWasmModule()` + `registerWasmLoader`/`setWasmModule`) so bundling the web entry never pulls in the Node `require` of `pkg-node`. The web ESM output is post-processed (`scripts/fix-web-esm.mjs`) to carry explicit `.js` extensions so it runs natively (browser/Deno) as well as through bundlers
+- Built with `wasm-pack build --target nodejs` **and** `--target web` (see `js/package.json` scripts); tests run with Node's built-in test runner (`npm test`, Node >= 18), including a headless run of the `mf4-rs/web` build
 - See `WASM_FEASIBILITY.md` for the original design notes and `examples/wasm-smoke/` for a browser smoke test
 
 ## Key Design Patterns and Concepts

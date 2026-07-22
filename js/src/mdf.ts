@@ -1,4 +1,4 @@
-import { loadWasmModule, type WasmMdf } from "./wasm-module";
+import { getWasmModule, type WasmMdf } from "./wasm-module";
 import type { GroupInfo, Signal } from "./types";
 
 /**
@@ -16,7 +16,7 @@ export class Mdf {
 
   /** Parse an MDF 4 file from an owned byte buffer. */
   static fromBytes(data: Uint8Array): Mdf {
-    const wasm = loadWasmModule();
+    const wasm = getWasmModule();
     return new Mdf(wasm.Mdf.fromBytes(data));
   }
 
