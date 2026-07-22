@@ -1,3 +1,8 @@
+## v3.3.0 — 2026-07-22
+
+### Features
+- add browser (web-target) npm build and metadata-only MdfIndex.fromUrl (#87)
+
 ## v3.2.3 — 2026-07-19
 
 ### Fixes

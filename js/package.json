@@ -1,6 +1,6 @@
 {
   "name": "mf4-rs",
-  "version": "3.2.3",
+  "version": "3.3.0",
   "description": "Ergonomic TypeScript wrapper over the mf4-rs WebAssembly bindings for reading and writing ASAM MDF 4 files.",
   "license": "MIT",
   "repository": {
