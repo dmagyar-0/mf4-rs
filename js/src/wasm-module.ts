@@ -64,6 +64,20 @@ export interface WasmMdfIndex {
 export interface WasmMdfIndexConstructor {
   fromBytes(data: Uint8Array): WasmMdfIndex;
   fromJson(json: string): WasmMdfIndex;
+  buildIndexStep(
+    file_size: number,
+    ranges: unknown,
+    fragments: unknown,
+  ): WasmBuildStep;
+}
+
+/** One step of the incremental `buildIndexStep` index build. */
+export interface WasmBuildStep {
+  done: boolean;
+  /** Finished index as JSON when `done` is true. */
+  json?: string;
+  /** `[offset, length]` of the next range to fetch when `done` is false. */
+  needed?: [number, number];
 }
 
 export interface WasmMdfWriter {

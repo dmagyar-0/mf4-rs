@@ -148,6 +148,35 @@ const signal = await clientIndex.read("VehicleSpeed", source, "Group1");
 needs, fetch them from the `RangeSource` (concurrently), and decode
 client-side — the wasm module never needs the whole file.
 
+### Building the index from a URL (metadata-only)
+
+You don't need a server-side build step: `MdfIndex.fromUrl` (and the generic
+`MdfIndex.fromRangeSource`) build the index by fetching **only the file's
+metadata blocks** — a few KB regardless of file size — never the bulk
+samples. The metadata walk runs incrementally in wasm, reporting the byte
+ranges it still needs while the wrapper fetches them (with look-ahead to keep
+round-trips low).
+
+```ts
+import { MdfIndex, FetchRangeSource } from "mf4-rs";
+
+const url = "https://example.com/measurement.mf4";
+
+// Builds the index by fetching only metadata (needs a Range-capable server;
+// servers that ignore Range fall back to a single full download):
+const index = await MdfIndex.fromUrl(url);
+
+// Now read specific signals lazily over the same URL:
+const speed = await index.read("VehicleSpeed", new FetchRangeSource(url));
+
+// Or build from any RangeSource (Node file, in-memory bytes, custom):
+// const index = await MdfIndex.fromRangeSource(new FileRangeSource(path));
+```
+
+This mirrors the native Rust `MdfIndex::from_url`. Prefer the ship-the-JSON
+pattern above when many clients read the same file (build the index once);
+use `fromUrl` when a client wants to open an arbitrary remote file directly.
+
 ### `signalByteRanges` vs. `byteRanges`
 
 `signalByteRanges(name, group)` returns the **full data-section ranges** for
@@ -230,7 +259,7 @@ Node classes plus a headless run of the `mf4-rs/web` build).
   `groups()`, `channelNames()`, `values()`, `read()`, `startTimeNs()`,
   `dispose()`.
 - `MdfIndex` — self-contained index + lazy fragment reads: `fromBytes`,
-  `fromJson`, `fromFile` (Node), `fromUrl` (downloads in full), `toJson()`, `validate()`, `groups()`,
+  `fromJson`, `fromFile` (Node), `fromRangeSource` / `fromUrl` (metadata-only, over a `RangeSource` / HTTP), `toJson()`, `validate()`, `groups()`,
   `channelNames()`, `fileSize()`, `byteRanges()`, `byteRangesForRecords()`,
   `signalByteRanges()`, `valuesFromFragments()`, `readFromFragments()`,
   `values()` (lazy, over a `RangeSource`), `read()` (lazy), `dispose()`.
