@@ -1,4 +1,4 @@
-import { loadWasmModule, type WasmMdfIndex } from "./wasm-module";
+import { getWasmModule, type WasmMdfIndex } from "./wasm-module";
 import { readAllRanges, type RangeSource } from "./range-source";
 import type { ByteRange, IndexGroupInfo, Signal } from "./types";
 
@@ -24,13 +24,13 @@ export class MdfIndex {
    * self-contained afterwards (and can be serialised with `toJson`).
    */
   static fromBytes(data: Uint8Array): MdfIndex {
-    const wasm = loadWasmModule();
+    const wasm = getWasmModule();
     return new MdfIndex(wasm.MdfIndex.fromBytes(data));
   }
 
   /** Reload a previously serialised index from its JSON string. */
   static fromJson(json: string): MdfIndex {
-    const wasm = loadWasmModule();
+    const wasm = getWasmModule();
     return new MdfIndex(wasm.MdfIndex.fromJson(json));
   }
 
@@ -39,6 +39,27 @@ export class MdfIndex {
     const fsp = await import("node:fs/promises");
     const buf = await fsp.readFile(path);
     return MdfIndex.fromBytes(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+  }
+
+  /**
+   * Build a fresh index by downloading an MDF file in full over HTTP(S).
+   *
+   * Constructing the index requires parsing the whole file, so this downloads
+   * it entirely. Once built, use `values`/`read` with a `RangeSource` (e.g.
+   * `FetchRangeSource`) for lazy, partial reads that fetch only the bytes each
+   * signal needs.
+   */
+  static async fromUrl(url: string, fetchImpl?: typeof fetch): Promise<MdfIndex> {
+    const impl = fetchImpl ?? globalThis.fetch;
+    if (!impl) {
+      throw new Error("No fetch implementation available; pass one explicitly to fromUrl().");
+    }
+    const res = await impl(url);
+    if (!res.ok) {
+      throw new Error(`MdfIndex.fromUrl: request failed with status ${res.status}`);
+    }
+    const buf = new Uint8Array(await res.arrayBuffer());
+    return MdfIndex.fromBytes(buf);
   }
 
   /** Serialise the index to a JSON string. */

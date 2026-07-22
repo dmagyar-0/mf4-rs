@@ -442,9 +442,10 @@ jobs:
         working-directory: js
         run: npm ci
       # `npm publish` runs the package's prepublishOnly script, which
-      # builds the wasm bindings (wasm-pack), compiles the TypeScript
-      # wrapper, and runs the full js test suite before anything is
-      # uploaded — a test failure aborts the publish.
+      # builds both wasm bindings (wasm-pack: nodejs + web targets),
+      # compiles the TypeScript wrapper for Node and the browser, and runs
+      # the full js test suite before anything is uploaded — a test failure
+      # aborts the publish.
       - name: Publish
         working-directory: js
         run: npm publish --access public

@@ -23,16 +23,30 @@
   "type": "commonjs",
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    },
+    "./web": {
+      "types": "./dist-web/web.d.ts",
+      "import": "./dist-web/web.js"
+    }
+  },
   "files": [
     "dist/src",
+    "dist-web",
     "pkg-node",
+    "pkg-web",
     "README.md"
   ],
   "scripts": {
     "build:wasm": "cd .. && wasm-pack build --target nodejs --out-dir js/pkg-node -- --features wasm && node -e \"fs.rmSync('js/pkg-node/.gitignore',{force:true})\"",
+    "build:wasm:web": "cd .. && wasm-pack build --target web --out-dir js/pkg-web -- --features wasm && node -e \"fs.rmSync('js/pkg-web/.gitignore',{force:true})\"",
     "build": "tsc",
+    "build:web": "tsc -p tsconfig.web.json && node scripts/fix-web-esm.mjs",
     "test": "node --test dist/test/**/*.test.js",
-    "prepublishOnly": "npm run build:wasm && npm run build && npm test"
+    "prepublishOnly": "npm run build:wasm && npm run build:wasm:web && npm run build && npm run build:web && npm test"
   },
   "devDependencies": {
     "typescript": "^5.5.4",

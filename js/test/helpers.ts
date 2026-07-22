@@ -1,3 +1,6 @@
+// Register the Node wasm loader (the `.` package entry does this for real
+// consumers; tests import the wrapper classes from source directly).
+import "../src/wasm-module-node";
 import { MdfWriter } from "../src/mdf-writer";
 
 /**

@@ -26,11 +26,14 @@ for what that means in practice.
 npm install mf4-rs
 ```
 
-The published package ships the compiled TypeScript wrapper (`dist/src/`)
-and the prebuilt `nodejs`-target wasm module (`pkg-node/`) — no Rust
-toolchain needed. The package version tracks the repository's release
-version: every release tagged by `.github/workflows/release.yml` publishes
-the matching npm version alongside the PyPI wheels and the crates.io crate.
+The published package ships the compiled TypeScript wrapper (`dist/src/` for
+Node, `dist-web/` for browsers) and **both** prebuilt wasm modules — the
+synchronous `nodejs` target (`pkg-node/`, used by `import "mf4-rs"`) and the
+async `web` target (`pkg-web/`, used by `import "mf4-rs/web"`) — so no Rust
+toolchain is needed. See [Browser usage](#browser-usage) for the `mf4-rs/web`
+entry. The package version tracks the repository's release version: every
+release tagged by `.github/workflows/release.yml` publishes the matching npm
+version alongside the PyPI wheels and the crates.io crate.
 
 ## Building from source
 
@@ -50,19 +53,23 @@ For development on the bindings themselves:
 cd js
 npm install
 
-# Build the wasm bindings into js/pkg-node/ (run from js/, cds into the repo root)
-npm run build:wasm
+# Build the wasm bindings (run from js/, cds into the repo root):
+npm run build:wasm       # nodejs target -> js/pkg-node/
+npm run build:wasm:web   # web target    -> js/pkg-web/
 
-# Compile the TypeScript wrapper into js/dist/
-npm run build
+# Compile the TypeScript wrapper:
+npm run build            # Node (CommonJS) -> js/dist/
+npm run build:web        # browser (ESM)   -> js/dist-web/
 
 # Run the test suite
 npm test
 ```
 
-In a git checkout, `pkg-node/` and `dist/` are build artifacts and are
-gitignored — run `build:wasm` and `build` after cloning, before importing
-the package.
+In a git checkout, `pkg-node/`, `pkg-web/`, `dist/`, and `dist-web/` are
+build artifacts and are gitignored — run the `build:wasm*` and `build*`
+scripts after cloning, before importing the package. The `prepublishOnly`
+hook runs all four builds plus the tests, so a release always ships both
+targets in sync.
 
 ## Node quickstart
 
@@ -178,27 +185,44 @@ plug in S3, IndexedDB, or any other byte-addressable backend.
 
 ## Browser usage
 
-This package's `pkg-node/` wasm build is generated with
-`wasm-pack build --target nodejs`, which produces a CommonJS module that
-loads the `.wasm` file via `fs.readFileSync` — it only runs in Node.
+The package ships **two** wasm builds. The default `.` entry (`import
+"mf4-rs"`) uses the synchronous `nodejs`-target build and runs only in Node.
+For browsers, import the separate `mf4-rs/web` entry, which uses the
+`web`-target build (`pkg-web/`) — an ES module whose wasm is instantiated
+asynchronously.
 
-For browsers, build a separate `web` target instead:
+Because browser wasm instantiation cannot be synchronous, call and `await`
+`init()` **once** before constructing any class; everything else is
+identical to the Node API:
 
-```bash
-wasm-pack build --target web --out-dir js/pkg-web -- --features wasm
+```ts
+import { init, Mdf, MdfIndex, FetchRangeSource } from "mf4-rs/web";
+
+// Instantiate the wasm module. Idempotent — safe to await anywhere.
+await init();
+
+// Full in-memory read:
+const bytes = new Uint8Array(await (await fetch("/data.mf4")).arrayBuffer());
+const mdf = Mdf.fromBytes(bytes);
+console.log(mdf.channelNames());
+mdf.dispose();
+
+// Lazy, range-based remote read (only the needed bytes are fetched):
+const index = await MdfIndex.fromUrl("https://example.com/data.mf4");
+const signal = await index.read("Temperature", new FetchRangeSource("https://example.com/data.mf4"));
 ```
 
-That produces an ES module with an `init()` function that `fetch`es the
-`.wasm` binary, suitable for bundlers or `<script type="module">`. The
-TypeScript wrapper in `src/` is written against the same `Mdf` / `MdfIndex`
-/ `MdfWriter` shape either build exposes, and the fetch-based `RangeSource`
-(`FetchRangeSource`) has no Node-specific dependencies, so the wrapper
-classes work unmodified in a browser once pointed at a `web`-target build —
-**only `wasm-module.ts`'s `require("../../pkg-node/mf4_rs.js")` load path
-would need to change** to the `web`-target's `init()` call for a bundler
-build. This browser path is documented but not covered by this package's
-test suite, which only exercises the `nodejs` target — verify it yourself
-before relying on it in production.
+`init()` optionally accepts a URL / `Response` / `BufferSource` /
+`WebAssembly.Module` to control where `mf4_rs_bg.wasm` is loaded from (handy
+behind a CDN or a strict CSP); omit it to load the `.wasm` next to the
+module. The `web` entry omits `FileRangeSource` (it needs Node's `fs`); use
+`FetchRangeSource` or `BytesRangeSource` instead. The `mf4-rs/web` build is
+compiled as native ES modules (with explicit file extensions), so it works
+both through bundlers (Vite, webpack, Next, …) and in native
+`<script type="module">` / Deno.
+
+Both entry points are covered by the test suite (`npm test` exercises the
+Node classes plus a headless run of the `mf4-rs/web` build).
 
 ## API surface
 
@@ -206,7 +230,7 @@ before relying on it in production.
   `groups()`, `channelNames()`, `values()`, `read()`, `startTimeNs()`,
   `dispose()`.
 - `MdfIndex` — self-contained index + lazy fragment reads: `fromBytes`,
-  `fromJson`, `fromFile` (Node), `toJson()`, `validate()`, `groups()`,
+  `fromJson`, `fromFile` (Node), `fromUrl` (downloads in full), `toJson()`, `validate()`, `groups()`,
   `channelNames()`, `fileSize()`, `byteRanges()`, `byteRangesForRecords()`,
   `signalByteRanges()`, `valuesFromFragments()`, `readFromFragments()`,
   `values()` (lazy, over a `RangeSource`), `read()` (lazy), `dispose()`.
@@ -220,5 +244,8 @@ before relying on it in production.
   `BytesRangeSource`.
 - Types: `Signal`, `GroupInfo`, `IndexGroupInfo`, `ChannelInfo`,
   `ByteRange`, `ChannelValue`.
+- Entry points: `mf4-rs` (Node, synchronous) and `mf4-rs/web` (browser; adds
+  `init()` and re-exports the same classes minus the Node-only
+  `FileRangeSource`).
 
 See the inline TSDoc comments in `src/` for full parameter documentation.
