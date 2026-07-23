@@ -1,3 +1,8 @@
+## v3.4.1 — 2026-07-23
+
+### Performance
+- gather all missing ranges in one metadata-walk pass for incremental index builds (#89)
+
 ## v3.4.0 — 2026-07-23
 
 ### Features
