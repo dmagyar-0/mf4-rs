@@ -1,3 +1,8 @@
+## v3.4.0 — 2026-07-23
+
+### Features
+- defer conversion block resolution to read time for remote indexes
+
 ## v3.3.0 — 2026-07-22
 
 ### Features
