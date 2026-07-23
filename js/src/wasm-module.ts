@@ -83,8 +83,10 @@ export interface WasmBuildStep {
   done: boolean;
   /** Finished index as JSON when `done` is true. */
   json?: string;
-  /** `[offset, length]` of the next range to fetch when `done` is false. */
-  needed?: [number, number];
+  /** `[[offset, length], ...]` of every range still needed when `done` is
+   * false — the walk gathers them all in one pass so the driver can fetch them
+   * as a batch. */
+  needed?: [number, number][];
 }
 
 export interface WasmMdfWriter {

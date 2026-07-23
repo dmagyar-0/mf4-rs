@@ -241,10 +241,31 @@ pub struct MdfIndex {
 /// Trait for reading byte ranges from different sources (files, HTTP, etc.)
 pub trait ByteRangeReader {
     type Error;
-    
+
     /// Read bytes from the specified range
     /// Returns the requested bytes or an error
     fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, Self::Error>;
+
+    /// Read an *optional* metadata range that the walk can proceed without.
+    ///
+    /// Behaves exactly like [`read_range`](Self::read_range) by default, so
+    /// on-demand readers (file, HTTP) are unaffected. Incremental readers that
+    /// *gather* the ranges they still need — rather than fetching one at a time
+    /// — override this to record a gap and return `Ok(None)` instead of
+    /// aborting. That lets a single metadata walk collect **every** still-missing
+    /// leaf range (channel names, units, group comments) at once, turning an
+    /// O(N²) fetch-restart loop into a handful of passes. Returning `None` means
+    /// "these bytes are not available yet"; the caller treats the value as
+    /// absent for this pass. Structural reads (block headers whose bytes yield
+    /// the next link address) must keep using [`read_range`](Self::read_range) —
+    /// the walk cannot continue past those without the real bytes.
+    fn read_range_optional(
+        &mut self,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.read_range(offset, length).map(Some)
+    }
 }
 
 /// Local file reader implementation.

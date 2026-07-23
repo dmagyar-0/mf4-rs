@@ -11,9 +11,57 @@ import type { ByteRange, IndexGroupInfo, Signal } from "./types";
  * the front of the file, so seeding this often completes the build in one or
  * two round-trips. */
 const BUILD_SEED_BYTES = 256 * 1024;
-/** Minimum bytes fetched per build round-trip; larger reduces round-trips at
- * the cost of possibly fetching a little unused metadata. */
+/** Base bytes fetched per build round-trip. The window grows geometrically
+ * across rounds (see {@link lookaheadForRound}) so files whose metadata is
+ * scattered throughout (interleaved with data blocks) still converge in a
+ * handful of requests instead of one per metadata cluster. */
 const BUILD_LOOKAHEAD_BYTES = 64 * 1024;
+/** Cap on the per-round fetch window so the geometric growth never asks for an
+ * absurd single range on a huge file. */
+const BUILD_MAX_LOOKAHEAD_BYTES = 4 * 1024 * 1024;
+
+/** Per-round fetch window: `base * 2^round`, capped. Early rounds stay small
+ * (cheap for the common case where metadata sits contiguously at the front);
+ * later rounds grow large so a scattered-metadata file is covered in
+ * logarithmically many requests. */
+function lookaheadForRound(round: number): number {
+  const grown = BUILD_LOOKAHEAD_BYTES * 2 ** Math.min(round, 20);
+  return Math.min(grown, BUILD_MAX_LOOKAHEAD_BYTES);
+}
+
+/**
+ * Coalesce the ranges a build/conversion pass reported into a few fetch spans.
+ *
+ * The ranges arrive sorted and non-overlapping from wasm; here we bridge spans
+ * separated by a gap no larger than `bridge` (grabbing the intervening bytes in
+ * one request) and extend each span by `lookahead` so the next structural block
+ * is usually already covered. Bridging turns the many tiny name/unit gaps of a
+ * scattered-metadata file into a few large reads, while genuinely far-apart
+ * gaps (e.g. data-block headers megabytes apart) stay separate — keeping the
+ * transferred bytes small for the common contiguous-metadata case.
+ */
+function coalesceNeeded(
+  needed: [number, number][],
+  bridge: number,
+  lookahead: number,
+  size: number,
+): [number, number][] {
+  const sorted = [...needed].sort((a, b) => a[0] - b[0]);
+  const spans: [number, number][] = [];
+  for (const [offset, length] of sorted) {
+    const end = offset + length;
+    const last = spans[spans.length - 1];
+    if (last && offset <= last[0] + last[1] + bridge) {
+      last[1] = Math.max(last[1], end - last[0]);
+    } else {
+      spans.push([offset, length]);
+    }
+  }
+  return spans.map(([offset, length]): [number, number] => [
+    offset,
+    Math.min(Math.max(length, lookahead), size - offset),
+  ]);
+}
 
 /**
  * A self-contained, JSON-serialisable index over an MDF 4 file.
@@ -99,16 +147,21 @@ export class MdfIndex {
       await fetchInto(0, Math.min(BUILD_SEED_BYTES, size));
     }
 
-    // Bounded loop: each round-trip advances the first missing offset, so this
-    // terminates; the cap is a safety net against a malformed source.
-    const maxRounds = 100_000;
+    // Bounded loop: each round fetches every range the walk still needs (with a
+    // geometrically growing look-ahead), so a file with N metadata blocks
+    // converges in a handful of rounds rather than one per block. The cap is a
+    // safety net against a malformed source.
+    const maxRounds = 10_000;
     for (let round = 0; round < maxRounds; round++) {
       const step = wasm.MdfIndex.buildIndexStep(size, ranges, fragments);
       if (step.done) {
         return MdfIndex.fromJson(step.json as string);
       }
-      const [offset, length] = step.needed as [number, number];
-      await fetchInto(offset, Math.max(length, BUILD_LOOKAHEAD_BYTES));
+      const lookahead = lookaheadForRound(round);
+      const spans = coalesceNeeded(step.needed as [number, number][], lookahead, lookahead, size);
+      for (const [offset, length] of spans) {
+        await fetchInto(offset, length);
+      }
     }
     throw new Error(
       "MdfIndex.fromRangeSource: index build did not converge; the source may not be a valid MDF file.",
@@ -299,11 +352,17 @@ export class MdfIndex {
     for (let round = 0; round < maxRounds; round++) {
       const step = this.inner.conversionRangesStep(name, group, withMaster, ranges, fragments);
       if (step.done) return;
-      const [offset, length] = step.needed as [number, number];
-      const want = Math.min(Math.max(length, CONVERSION_LOOKAHEAD_BYTES), size - offset);
-      const bytes = await source.read(offset, want);
-      ranges.push([offset, bytes.length]);
-      fragments.push(bytes);
+      const spans = coalesceNeeded(
+        step.needed as [number, number][],
+        CONVERSION_LOOKAHEAD_BYTES,
+        CONVERSION_LOOKAHEAD_BYTES,
+        size,
+      );
+      for (const [offset, length] of spans) {
+        const bytes = await source.read(offset, length);
+        ranges.push([offset, bytes.length]);
+        fragments.push(bytes);
+      }
     }
     throw new Error(
       "MdfIndex: conversion resolution did not converge; the index or source may be inconsistent.",

@@ -194,6 +194,17 @@ fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     out
 }
 
+/// Collapse the raw gaps a build/conversion pass recorded into the compact
+/// `[[offset, length], ...]` list handed back to JS: merge overlapping and
+/// touching ranges (via [`merge_ranges`]) so the driver fetches a few spans
+/// rather than one request per tiny text block.
+fn misses_to_needed(misses: Vec<(u64, u64)>) -> Vec<[f64; 2]> {
+    merge_ranges(misses)
+        .into_iter()
+        .map(|(offset, length)| [offset as f64, length as f64])
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Fragment-backed byte-range reader
 // ---------------------------------------------------------------------------
@@ -303,15 +314,31 @@ impl ByteRangeReader for FragmentRangeReader {
 }
 
 /// A [`ByteRangeReader`] that drives an incremental, range-fetched index
-/// build. It serves reads from the fragments gathered so far; on the first
-/// read it cannot fully cover, it records the still-missing sub-range in
-/// [`miss`](Self::miss) and returns an error to abort the metadata walk. The
-/// JS driver fetches that range, appends the fragment, and retries — repeating
-/// until the walk completes. Only metadata blocks are ever requested, so the
-/// bulk sample data is never downloaded.
+/// build. It serves reads from the fragments gathered so far and **gathers**
+/// the ranges it still needs in [`misses`](Self::misses) rather than fetching
+/// them on demand.
+///
+/// The key to avoiding an O(N²) fetch-restart loop is that a single walk does
+/// not stop at the first miss:
+///
+/// - An *optional* leaf read (a channel name/unit/comment text block, via
+///   [`read_range_optional`](ByteRangeReader::read_range_optional)) records the
+///   gap and returns `Ok(None)`, so the walk carries on and collects every
+///   other reachable leaf's gap in the same pass.
+/// - A *structural* read (a block header whose bytes yield the next link
+///   address, via [`read_range`](ByteRangeReader::read_range)) cannot be
+///   satisfied with a placeholder, so it records the gap and returns an error
+///   to end this pass — but every optional gap seen up to that point is already
+///   recorded.
+///
+/// The JS driver fetches all recorded ranges (coalesced, with look-ahead) and
+/// retries, so a file with N metadata blocks builds in O(passes) ≈ a handful,
+/// not O(N). Only metadata blocks are ever requested, so the bulk sample data
+/// is never downloaded (unless look-ahead over-fetches interspersed metadata,
+/// which the driver accepts to keep the request count low).
 struct RecordingRangeReader {
     fragments: Vec<(u64, Vec<u8>)>,
-    miss: Option<(u64, u64)>,
+    misses: Vec<(u64, u64)>,
 }
 
 impl ByteRangeReader for RecordingRangeReader {
@@ -321,10 +348,24 @@ impl ByteRangeReader for RecordingRangeReader {
         match assemble_from_fragments(&self.fragments, offset, length)? {
             Coverage::Full(bytes) => Ok(bytes),
             Coverage::Gap { offset: miss, length: needed } => {
-                self.miss = Some((miss, needed));
+                self.misses.push((miss, needed));
                 Err(MdfError::BlockSerializationError(
                     "range not yet available; fetch and retry".to_string(),
                 ))
+            }
+        }
+    }
+
+    fn read_range_optional(
+        &mut self,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<Vec<u8>>, MdfError> {
+        match assemble_from_fragments(&self.fragments, offset, length)? {
+            Coverage::Full(bytes) => Ok(Some(bytes)),
+            Coverage::Gap { offset: miss, length: needed } => {
+                self.misses.push((miss, needed));
+                Ok(None)
             }
         }
     }
@@ -427,16 +468,21 @@ struct IndexGroupInfoJs {
 }
 
 /// One step of the incremental index build (`buildIndexStep`): either the
-/// finished index as JSON, or the next byte range the build still needs.
+/// finished index as JSON, or the byte ranges the build still needs.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BuildStepJs {
     done: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     json: Option<String>,
-    /// `[offset, length]` of the next range to fetch when `done` is false.
+    /// `[[offset, length], ...]` of every range the walk still needs when
+    /// `done` is false. A single walk gathers **all** the ranges it can
+    /// (every channel name/unit/comment reachable this pass, plus the structural
+    /// block that blocked further progress), so the JS driver fetches them in
+    /// one batch and the whole build finishes in a handful of passes instead of
+    /// one pass per metadata block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    needed: Option<[f64; 2]>,
+    needed: Option<Vec<[f64; 2]>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -673,9 +719,10 @@ impl WasmMdfIndex {
     /// Drives the native metadata walk (which reads only structural blocks,
     /// never sample data) against the `ranges`/`fragments` gathered so far.
     /// Returns `{ done: true, json }` with the finished index once the walk
-    /// completes, or `{ done: false, needed: [offset, length] }` naming the
-    /// next byte range to fetch and feed back. The JS `MdfIndex.fromRangeSource`
-    /// wrapper loops over this; call it directly only for a custom driver.
+    /// completes, or `{ done: false, needed: [[offset, length], ...] }` listing
+    /// **all** the byte ranges the walk still needs (gathered in one pass) to
+    /// fetch and feed back. The JS `MdfIndex.fromRangeSource` wrapper loops over
+    /// this; call it directly only for a custom driver.
     ///
     /// `fileSize` is the total file length (from a HEAD request or
     /// `RangeSource.size()`); it is stored on the resulting index. `ranges` is
@@ -689,25 +736,30 @@ impl WasmMdfIndex {
     ) -> Result<JsValue, JsError> {
         let file_size = f64_to_u64(Some(file_size), "file size")?;
         let parsed = build_fragment_reader(&ranges, &fragments)?;
-        let mut reader = RecordingRangeReader { fragments: parsed.fragments, miss: None };
-        match MdfIndex::from_range_reader(&mut reader, file_size) {
+        let mut reader = RecordingRangeReader { fragments: parsed.fragments, misses: Vec::new() };
+        let walk = MdfIndex::from_range_reader(&mut reader, file_size);
+
+        // The walk may have finished the linked-list traversal while still
+        // skipping optional leaf reads (names/units) whose bytes were not yet
+        // available — those are recorded in `misses`. So a build is only truly
+        // done when the walk succeeded *and* nothing was missed this pass.
+        if !reader.misses.is_empty() {
+            let step = BuildStepJs {
+                done: false,
+                json: None,
+                needed: Some(misses_to_needed(reader.misses)),
+            };
+            return serde_wasm_bindgen::to_value(&step).map_err(|e| JsError::new(&e.to_string()));
+        }
+
+        match walk {
             Ok(index) => {
                 let json = index.to_json().map_err(err_to_js)?;
                 let step = BuildStepJs { done: true, json: Some(json), needed: None };
                 serde_wasm_bindgen::to_value(&step).map_err(|e| JsError::new(&e.to_string()))
             }
-            Err(e) => match reader.miss {
-                Some((offset, length)) => {
-                    let step = BuildStepJs {
-                        done: false,
-                        json: None,
-                        needed: Some([offset as f64, length as f64]),
-                    };
-                    serde_wasm_bindgen::to_value(&step).map_err(|e| JsError::new(&e.to_string()))
-                }
-                // A real error (not a missing-range abort) — surface it.
-                None => Err(err_to_js(e)),
-            },
+            // No misses recorded, so this is a real parse error — surface it.
+            Err(e) => Err(err_to_js(e)),
         }
     }
 
@@ -719,8 +771,8 @@ impl WasmMdfIndex {
     /// the first read — so the fragment readers need those bytes fetched
     /// alongside the data sections. Drive this like `buildIndexStep`: it
     /// returns `{ done: true }` once every conversion block required for the
-    /// read is present in `fragments`, or `{ done: false, needed: [offset,
-    /// length] }` naming the next range to fetch and feed back. Pass
+    /// read is present in `fragments`, or `{ done: false, needed: [[offset,
+    /// length], ...] }` listing the ranges to fetch and feed back. Pass
     /// `withMaster = true` for a signal read (`read`/`readFromFragments`),
     /// whose timestamps decode the group master and thus also need the
     /// master's conversion; `false` for a plain values read. For a
@@ -737,7 +789,7 @@ impl WasmMdfIndex {
     ) -> Result<JsValue, JsError> {
         let (g, c) = self.locate(name, group.as_deref())?;
         let parsed = build_fragment_reader(&ranges, &fragments)?;
-        let mut reader = RecordingRangeReader { fragments: parsed.fragments, miss: None };
+        let mut reader = RecordingRangeReader { fragments: parsed.fragments, misses: Vec::new() };
 
         let mut targets = vec![c];
         if with_master {
@@ -747,22 +799,23 @@ impl WasmMdfIndex {
         }
 
         for idx in targets {
-            reader.miss = None;
+            let before = reader.misses.len();
             if let Err(e) = self.index.resolve_channel_conversion(g, idx, &mut reader) {
-                match reader.miss {
-                    Some((offset, length)) => {
-                        let step = BuildStepJs {
-                            done: false,
-                            json: None,
-                            needed: Some([offset as f64, length as f64]),
-                        };
-                        return serde_wasm_bindgen::to_value(&step)
-                            .map_err(|e| JsError::new(&e.to_string()));
-                    }
-                    // A real error (not a missing-range abort) — surface it.
-                    None => return Err(err_to_js(e)),
+                // If this target recorded no gap it is a genuine error, not a
+                // not-yet-fetched abort — surface it.
+                if reader.misses.len() == before {
+                    return Err(err_to_js(e));
                 }
             }
+        }
+
+        if !reader.misses.is_empty() {
+            let step = BuildStepJs {
+                done: false,
+                json: None,
+                needed: Some(misses_to_needed(reader.misses)),
+            };
+            return serde_wasm_bindgen::to_value(&step).map_err(|e| JsError::new(&e.to_string()));
         }
 
         let step = BuildStepJs { done: true, json: None, needed: None };
