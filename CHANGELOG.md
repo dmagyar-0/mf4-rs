@@ -1,3 +1,8 @@
+## v3.4.2 — 2026-07-23
+
+### Fixes
+- initialise the wasm module in the many-channel lazy-index test (#90)
+
 ## v3.4.1 — 2026-07-23
 
 ### Performance
