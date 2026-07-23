@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use crate::api::mdf::MDF;
-use crate::blocks::common::{DataType, BlockParse};
+use crate::blocks::common::{DataType, BlockHeader, BlockParse};
 use crate::blocks::conversion::{ConversionBlock, ConversionType};
 use crate::error::MdfError;
 use crate::parsing::decoder::{check_value_validity, decode_channel_value, decode_channel_value_with_validity, decode_f64_from_record, DecodedValue};
@@ -44,8 +44,26 @@ pub struct IndexedChannel {
     pub flags: u32,
     /// Position of invalidation bit within invalidation bytes
     pub pos_invalidation_bit: u32,
-    /// Conversion block for unit conversion (if any)
+    /// Conversion block for unit conversion (if any).
+    ///
+    /// May be `None` even when the channel *has* a conversion: index builds
+    /// that read a file over the network ([`MdfIndex::from_url`] /
+    /// [`MdfIndex::from_range_reader`]) do **not** fetch and resolve the
+    /// conversion block up front — they only record its file offset in
+    /// [`conversion_addr`](Self::conversion_addr) and resolve it lazily on the
+    /// first value read. Indexes built from a local file or an in-memory buffer
+    /// still resolve eagerly, so this stays populated for them. Read paths
+    /// prefer a resolved conversion here and otherwise fall back to
+    /// `conversion_addr`.
     pub conversion: Option<ConversionBlock>,
+    /// File offset of the channel's `##CC` conversion block (0 = none).
+    ///
+    /// Recorded so the conversion can be resolved lazily at read time when it
+    /// was not resolved during index building (the remote / range-reader
+    /// path). Defaults to 0 for older serialized indexes, which carry the fully
+    /// resolved [`conversion`](Self::conversion) instead.
+    #[serde(default)]
+    pub conversion_addr: u64,
     /// For VLSD channels: address of signal data blocks
     pub vlsd_data_address: Option<u64>,
     /// For VLSD channels: locations of the ##SD fragments in chain order.
@@ -436,9 +454,12 @@ impl<R: ByteRangeReader<Error = MdfError>> CachingRangeReader<R> {
         }
     }
 
-    /// When set, every read forwards directly to the underlying reader.
-    /// Use during value-read phases so large data-block fetches do not
-    /// populate the cache.
+    /// When set, reads are served from already-cached chunks when fully
+    /// covered, and otherwise forward directly to the underlying reader without
+    /// populating the cache. Use during value-read phases so large data-block
+    /// fetches do not pollute the cache, while small metadata reads that were
+    /// already pulled in during the index walk (such as a conversion block
+    /// resolved lazily on first read) remain free.
     pub fn set_bypass(&mut self, bypass: bool) {
         self.bypass = bypass;
     }
@@ -459,6 +480,47 @@ impl<R: ByteRangeReader<Error = MdfError>> CachingRangeReader<R> {
             return Ok(());
         }
         self.read_range(offset, length).map(|_| ())
+    }
+
+    /// Try to satisfy a read entirely from chunks already in the cache,
+    /// without issuing any underlying request. Returns `None` if any covering
+    /// chunk is absent or too short (e.g. an EOF-clamped tail), leaving the
+    /// caller to fetch. Used in bypass mode so small reads that land in
+    /// already-fetched metadata chunks (e.g. a lazily-resolved conversion
+    /// block) stay free, while large uncached data reads still forward straight
+    /// through.
+    fn try_serve_from_cache(&self, offset: u64, length: u64) -> Option<Vec<u8>> {
+        let first = offset / self.chunk_size;
+        let last = (offset + length - 1) / self.chunk_size;
+        let read_end = offset + length;
+        for i in first..=last {
+            let chunk = self.chunks.get(&i)?;
+            let chunk_start = i * self.chunk_size;
+            let cached_end = chunk_start + chunk.len() as u64;
+            let needed_end = read_end.min(chunk_start + self.chunk_size);
+            if cached_end < needed_end {
+                return None;
+            }
+        }
+        let mut out = Vec::with_capacity(length.min(1 << 24) as usize);
+        let mut remaining = length as usize;
+        let mut cursor = offset;
+        while remaining > 0 {
+            let chunk_index = cursor / self.chunk_size;
+            let chunk_offset = (cursor % self.chunk_size) as usize;
+            let chunk = self.chunks.get(&chunk_index)?;
+            if chunk_offset >= chunk.len() {
+                return None;
+            }
+            let take = std::cmp::min(remaining, chunk.len() - chunk_offset);
+            out.extend_from_slice(&chunk[chunk_offset..chunk_offset + take]);
+            cursor += take as u64;
+            remaining -= take;
+            if take == 0 {
+                return None;
+            }
+        }
+        Some(out)
     }
 
     fn ensure_chunks(&mut self, first: u64, last: u64, requested_end: u64) -> Result<(), MdfError> {
@@ -548,6 +610,14 @@ impl<R: ByteRangeReader<Error = MdfError>> ByteRangeReader for CachingRangeReade
             return Ok(Vec::new());
         }
         if self.bypass {
+            // Serve from already-cached chunks when possible (e.g. a small
+            // conversion block lazily resolved at read time that lands in a
+            // metadata chunk fetched during the index walk); otherwise forward
+            // the (typically large data-block) read straight through.
+            if let Some(bytes) = self.try_serve_from_cache(offset, length) {
+                self.cache_hits += 1;
+                return Ok(bytes);
+            }
             let bytes = self.inner.read_range(offset, length)?;
             self.underlying_requests += 1;
             return Ok(bytes);
@@ -864,6 +934,7 @@ impl MdfIndex {
                     flags: block.flags,
                     pos_invalidation_bit: block.pos_invalidation_bit,
                     conversion: resolved_conversion,
+                    conversion_addr: block.conversion_addr,
                     vlsd_data_address: if block.channel_type == 1 && block.data != 0 {
                         Some(block.data)
                     } else {
@@ -1018,7 +1089,11 @@ impl MdfIndex {
                     channel_type: block.channel_type,
                     flags: block.flags,
                     pos_invalidation_bit: block.pos_invalidation_bit,
-                    conversion: ch.conversion,
+                    // Remote / range-reader builds defer conversion resolution:
+                    // only the block's location is recorded here; it is fetched
+                    // and resolved lazily on the first value read.
+                    conversion: None,
+                    conversion_addr: ch.conversion_addr,
                     vlsd_data_address: if block.channel_type == 1 && block.data != 0 {
                         Some(block.data)
                     } else {
@@ -1417,17 +1492,74 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
+        let conversion = Self::resolve_conversion(channel, reader)?;
+
         if channel.channel_type == 1 {
-            return self.read_vlsd_channel_values(group, channel, reader);
+            return self.read_vlsd_channel_values(group, channel, conversion.as_ref(), reader);
         }
 
         // For regular channels, read from data blocks
-        self.read_regular_channel_values(group, channel, reader)
+        self.read_regular_channel_values(group, channel, conversion.as_ref(), reader)
+    }
+
+    /// Resolve a channel's conversion for reading.
+    ///
+    /// Prefers a conversion already resolved into the index (local-file /
+    /// in-memory builds, and older serialized indexes). Otherwise — the remote
+    /// / range-reader build path, which records only
+    /// [`IndexedChannel::conversion_addr`] — it fetches the `##CC` block and
+    /// resolves its dependency chain through `reader`, exactly when the caller
+    /// asks to read values. Returns `None` when the channel has no conversion.
+    fn resolve_conversion<R: ByteRangeReader<Error = MdfError>>(
+        channel: &IndexedChannel,
+        reader: &mut R,
+    ) -> Result<Option<ConversionBlock>, MdfError> {
+        if let Some(conv) = &channel.conversion {
+            return Ok(Some(conv.clone()));
+        }
+        if channel.conversion_addr == 0 {
+            return Ok(None);
+        }
+        let addr = channel.conversion_addr;
+        let header_bytes = reader.read_range(addr, 24)?;
+        let header = BlockHeader::from_bytes(&header_bytes)?;
+        if header.id != "##CC" {
+            return Err(MdfError::BlockIDError {
+                actual: header.id,
+                expected: "##CC".to_string(),
+            });
+        }
+        let full = reader.read_range(addr, header.block_len)?;
+        let mut cc = ConversionBlock::from_bytes(&full)?;
+        cc.resolve_all_dependencies_via_reader(reader, addr)?;
+        Ok(Some(cc))
+    }
+
+    /// Resolve the conversion of the channel at `(g, c)` using `reader`,
+    /// following the same lazy rules as the read paths. Crate-visible so the
+    /// wasm bindings can drive fragment-based conversion resolution: pointing a
+    /// gap-reporting reader at this lets the JS side discover exactly which
+    /// conversion-block byte ranges it must fetch before a fragment read.
+    #[allow(dead_code)] // used by the wasm bindings (wasm feature)
+    pub(crate) fn resolve_channel_conversion<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        g: usize,
+        c: usize,
+        reader: &mut R,
+    ) -> Result<Option<ConversionBlock>, MdfError> {
+        let channel = self
+            .channel_groups
+            .get(g)
+            .and_then(|grp| grp.channels.get(c))
+            .ok_or_else(|| {
+                MdfError::BlockSerializationError("Invalid channel index".to_string())
+            })?;
+        Self::resolve_conversion(channel, reader)
     }
 
     /// Extract linear conversion coefficients (a, b) for inline application.
-    fn get_linear_coeffs(channel: &IndexedChannel) -> Option<(f64, f64)> {
-        channel.conversion.as_ref().and_then(|conv| {
+    fn get_linear_coeffs(conversion: Option<&ConversionBlock>) -> Option<(f64, f64)> {
+        conversion.and_then(|conv| {
             if conv.cc_type == ConversionType::Linear && conv.cc_val.len() >= 2 {
                 Some((conv.cc_val[0], conv.cc_val[1]))
             } else {
@@ -1441,6 +1573,7 @@ impl MdfIndex {
         &self,
         group: &IndexedChannelGroup,
         channel: &IndexedChannel,
+        conversion: Option<&ConversionBlock>,
         reader: &mut R,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         let record_size = Self::checked_record_size(group)?;
@@ -1462,7 +1595,7 @@ impl MdfIndex {
         for data_block in &group.data_blocks {
             let block_data = reader
                 .read_range(data_block.file_offset + 24, Self::data_section_size(data_block)?)?;
-            Self::decode_records_to_values(&block_data, record_size, group, channel, &temp_cb, &mut values)?;
+            Self::decode_records_to_values(&block_data, record_size, group, conversion, &temp_cb, &mut values)?;
         }
 
         Ok(values)
@@ -1480,6 +1613,7 @@ impl MdfIndex {
         &self,
         group: &IndexedChannelGroup,
         channel: &IndexedChannel,
+        conversion: Option<&ConversionBlock>,
         reader: &mut R,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         // Compressed fragments (either the fixed records or the SD stream) are
@@ -1628,7 +1762,7 @@ impl MdfIndex {
                 let payload = &frag[start..end];
 
                 if let Some(value) = decode_channel_value(payload, 0, &payload_cb) {
-                    let final_value = if let Some(conversion) = &channel.conversion {
+                    let final_value = if let Some(conversion) = conversion {
                         conversion.apply_decoded(value, &[])?
                     } else {
                         value
@@ -1664,7 +1798,7 @@ impl MdfIndex {
         block_data: &[u8],
         record_size: usize,
         group: &IndexedChannelGroup,
-        channel: &IndexedChannel,
+        conversion: Option<&ConversionBlock>,
         temp_cb: &crate::blocks::channel_block::ChannelBlock,
         values: &mut Vec<Option<DecodedValue>>,
     ) -> Result<(), MdfError> {
@@ -1691,7 +1825,7 @@ impl MdfIndex {
                 record, record_id_len, cg_data_bytes, temp_cb,
             ) {
                 if decoded.is_valid {
-                    let final_value = if let Some(conversion) = &channel.conversion {
+                    let final_value = if let Some(conversion) = conversion {
                         conversion.apply_decoded(decoded.value, &[])?
                     } else {
                         decoded.value
@@ -1715,6 +1849,7 @@ impl MdfIndex {
         record_size: usize,
         group: &IndexedChannelGroup,
         channel: &IndexedChannel,
+        conversion: Option<&ConversionBlock>,
         temp_cb: &crate::blocks::channel_block::ChannelBlock,
         linear_coeffs: Option<(f64, f64)>,
         has_conversion: bool,
@@ -1772,7 +1907,7 @@ impl MdfIndex {
                     if let Some(decoded) = decode_channel_value_with_validity(
                         record, record_id_len, cg_data_bytes, temp_cb,
                     ) {
-                        match channel.conversion.as_ref().unwrap().apply_decoded(decoded.value, &[])? {
+                        match conversion.unwrap().apply_decoded(decoded.value, &[])? {
                             DecodedValue::Float(v) => values.push(v),
                             DecodedValue::UnsignedInteger(v) => values.push(v as f64),
                             DecodedValue::SignedInteger(v) => values.push(v as f64),
@@ -1798,7 +1933,7 @@ impl MdfIndex {
                         if let Some(decoded) = decode_channel_value_with_validity(
                             record, record_id_len, cg_data_bytes, temp_cb,
                         ) {
-                            match channel.conversion.as_ref().unwrap().apply_decoded(decoded.value, &[])? {
+                            match conversion.unwrap().apply_decoded(decoded.value, &[])? {
                                 DecodedValue::Float(v) => values.push(v),
                                 DecodedValue::UnsignedInteger(v) => values.push(v as f64),
                                 DecodedValue::SignedInteger(v) => values.push(v as f64),
@@ -2037,6 +2172,45 @@ impl MdfIndex {
                 let mut cached = CachingRangeReader::new(http);
                 cached.set_bypass(true);
                 self.read_channel_values(g, c, &mut cached)
+            }
+        }
+    }
+
+    /// Resolve a channel's conversion, fetching it through the attached source
+    /// if it was not resolved at index-build time (the remote / range-reader
+    /// path records only its location — see [`IndexedChannel::conversion_addr`]).
+    ///
+    /// Returns `None` when the channel has no conversion. Errors if resolution
+    /// needs the source (a deferred conversion) but none is attached — attach
+    /// one with [`set_file`](Self::set_file) / [`set_url`](Self::set_url).
+    pub fn conversion(&self, name: &str) -> Result<Option<ConversionBlock>, MdfError> {
+        let (g, c) = self.locate(name).ok_or_else(|| {
+            MdfError::BlockSerializationError(format!("Channel '{}' not found", name))
+        })?;
+        let channel = &self.channel_groups[g].channels[c];
+        if let Some(conv) = &channel.conversion {
+            return Ok(Some(conv.clone()));
+        }
+        if channel.conversion_addr == 0 {
+            return Ok(None);
+        }
+        match self.require_source()? {
+            #[cfg(not(target_arch = "wasm32"))]
+            Source::File(path) => {
+                let file = std::fs::File::open(path).map_err(MdfError::IOError)?;
+                let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(MdfError::IOError)?;
+                let mut slice_reader = BorrowedSliceReader { data: &mmap };
+                Self::resolve_conversion(channel, &mut slice_reader)
+            }
+            #[cfg(target_arch = "wasm32")]
+            Source::File(_) => Err(MdfError::BlockSerializationError(
+                "file sources are not available on wasm32".to_string(),
+            )),
+            #[cfg(feature = "http")]
+            Source::Url(url) => {
+                let http = HttpRangeReader::new(url)?;
+                let mut cached = CachingRangeReader::new(http);
+                Self::resolve_conversion(channel, &mut cached)
             }
         }
     }
@@ -2290,8 +2464,10 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
+        let conversion = Self::resolve_conversion(channel, reader)?;
+
         if channel.channel_type == 1 {
-            let vals = self.read_vlsd_channel_values(group, channel, reader)?;
+            let vals = self.read_vlsd_channel_values(group, channel, conversion.as_ref(), reader)?;
             return Ok(Self::vlsd_values_to_f64(vals));
         }
 
@@ -2312,13 +2488,13 @@ impl MdfIndex {
         let mut values = Vec::with_capacity(total_records.min(1 << 24));
 
         let temp_cb = channel.to_decode_only_channel_block();
-        let linear_coeffs = Self::get_linear_coeffs(channel);
-        let has_conversion = channel.conversion.is_some();
+        let linear_coeffs = Self::get_linear_coeffs(conversion.as_ref());
+        let has_conversion = conversion.is_some();
 
         for data_block in &group.data_blocks {
             let block_data = reader
                 .read_range(data_block.file_offset + 24, Self::data_section_size(data_block)?)?;
-            Self::decode_records_to_f64(&block_data, record_size, group, channel, &temp_cb, linear_coeffs, has_conversion, &mut values)?;
+            Self::decode_records_to_f64(&block_data, record_size, group, channel, conversion.as_ref(), &temp_cb, linear_coeffs, has_conversion, &mut values)?;
         }
 
         Ok(values)
@@ -2341,9 +2517,11 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
+        let mut slice_reader = BorrowedSliceReader { data: file_data };
+        let conversion = Self::resolve_conversion(channel, &mut slice_reader)?;
+
         if channel.channel_type == 1 {
-            let mut slice_reader = BorrowedSliceReader { data: file_data };
-            return self.read_vlsd_channel_values(group, channel, &mut slice_reader);
+            return self.read_vlsd_channel_values(group, channel, conversion.as_ref(), &mut slice_reader);
         }
 
         let record_size = Self::checked_record_size(group)?;
@@ -2364,7 +2542,7 @@ impl MdfIndex {
 
         for data_block in &group.data_blocks {
             let block_data = Self::slice_data_block(file_data, data_block)?;
-            Self::decode_records_to_values(block_data, record_size, group, channel, &temp_cb, &mut values)?;
+            Self::decode_records_to_values(block_data, record_size, group, conversion.as_ref(), &temp_cb, &mut values)?;
         }
 
         Ok(values)
@@ -2387,9 +2565,11 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
+        let mut slice_reader = BorrowedSliceReader { data: file_data };
+        let conversion = Self::resolve_conversion(channel, &mut slice_reader)?;
+
         if channel.channel_type == 1 {
-            let mut slice_reader = BorrowedSliceReader { data: file_data };
-            let vals = self.read_vlsd_channel_values(group, channel, &mut slice_reader)?;
+            let vals = self.read_vlsd_channel_values(group, channel, conversion.as_ref(), &mut slice_reader)?;
             return Ok(Self::vlsd_values_to_f64(vals));
         }
 
@@ -2408,12 +2588,12 @@ impl MdfIndex {
         // vector still grows as needed; real reads fail earlier at the reader.
         let mut values = Vec::with_capacity(total_records.min(1 << 24));
         let temp_cb = channel.to_decode_only_channel_block();
-        let linear_coeffs = Self::get_linear_coeffs(channel);
-        let has_conversion = channel.conversion.is_some();
+        let linear_coeffs = Self::get_linear_coeffs(conversion.as_ref());
+        let has_conversion = conversion.is_some();
 
         for data_block in &group.data_blocks {
             let block_data = Self::slice_data_block(file_data, data_block)?;
-            Self::decode_records_to_f64(block_data, record_size, group, channel, &temp_cb, linear_coeffs, has_conversion, &mut values)?;
+            Self::decode_records_to_f64(block_data, record_size, group, channel, conversion.as_ref(), &temp_cb, linear_coeffs, has_conversion, &mut values)?;
         }
 
         Ok(values)

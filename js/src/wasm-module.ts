@@ -44,6 +44,13 @@ export interface WasmMdfIndex {
   channelNames(): string[];
   fileSize(): number;
   groups(): unknown;
+  conversionRangesStep(
+    name: string,
+    group: string | null | undefined,
+    with_master: boolean,
+    ranges: unknown,
+    fragments: unknown,
+  ): WasmBuildStep;
   readFromFragments(
     name: string,
     group: string | null | undefined,

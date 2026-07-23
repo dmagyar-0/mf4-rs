@@ -605,6 +605,15 @@ impl WasmMdfIndex {
         })
     }
 
+    /// Index of the group's master channel, if any, excluding `c` itself.
+    fn master_index(&self, g: usize, c: usize) -> Option<usize> {
+        let grp = self.index.channel_groups.get(g)?;
+        grp.channels
+            .iter()
+            .position(|ch| ch.is_master())
+            .filter(|&m| m != c)
+    }
+
     /// Full data-section byte ranges for the group owning `name`.
     ///
     /// Returns one `(file_offset + 24, size - 24)` span per `##DT`/`##DV`
@@ -700,6 +709,64 @@ impl WasmMdfIndex {
                 None => Err(err_to_js(e)),
             },
         }
+    }
+
+    /// Report the next conversion-block byte range still needed to read `name`
+    /// from fragments, or that all the conversion metadata is already present.
+    ///
+    /// Indexes built over the network (`fromUrl`/`fromRangeSource`) record only
+    /// each channel's conversion-block **location** and resolve it lazily on
+    /// the first read — so the fragment readers need those bytes fetched
+    /// alongside the data sections. Drive this like `buildIndexStep`: it
+    /// returns `{ done: true }` once every conversion block required for the
+    /// read is present in `fragments`, or `{ done: false, needed: [offset,
+    /// length] }` naming the next range to fetch and feed back. Pass
+    /// `withMaster = true` for a signal read (`read`/`readFromFragments`),
+    /// whose timestamps decode the group master and thus also need the
+    /// master's conversion; `false` for a plain values read. For a
+    /// self-contained index (built from bytes, or a channel with no
+    /// conversion) it returns `done` immediately with no fetching.
+    #[wasm_bindgen(js_name = conversionRangesStep)]
+    pub fn conversion_ranges_step(
+        &self,
+        name: &str,
+        group: Option<String>,
+        with_master: bool,
+        ranges: JsValue,
+        fragments: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let (g, c) = self.locate(name, group.as_deref())?;
+        let parsed = build_fragment_reader(&ranges, &fragments)?;
+        let mut reader = RecordingRangeReader { fragments: parsed.fragments, miss: None };
+
+        let mut targets = vec![c];
+        if with_master {
+            if let Some(m) = self.master_index(g, c) {
+                targets.push(m);
+            }
+        }
+
+        for idx in targets {
+            reader.miss = None;
+            if let Err(e) = self.index.resolve_channel_conversion(g, idx, &mut reader) {
+                match reader.miss {
+                    Some((offset, length)) => {
+                        let step = BuildStepJs {
+                            done: false,
+                            json: None,
+                            needed: Some([offset as f64, length as f64]),
+                        };
+                        return serde_wasm_bindgen::to_value(&step)
+                            .map_err(|e| JsError::new(&e.to_string()));
+                    }
+                    // A real error (not a missing-range abort) — surface it.
+                    None => return Err(err_to_js(e)),
+                }
+            }
+        }
+
+        let step = BuildStepJs { done: true, json: None, needed: None };
+        serde_wasm_bindgen::to_value(&step).map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Serialise the index to a JSON string.

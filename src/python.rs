@@ -1383,12 +1383,15 @@ impl PyMdfIndex {
     /// describing it (``conversion_type``, ``values``, ``resolved_texts``,
     /// ``formula`` …).
     fn conversion_info(&self, name: &str) -> PyResult<Option<HashMap<String, PyObject>>> {
-        let (g, c) = self.index.locate(name).ok_or_else(|| {
-            MdfException::new_err(format!("Channel '{}' not found", name))
-        })?;
-        let channel = &self.index.groups()[g].channels[c];
+        // Resolve lazily through the attached source: indexes built over the
+        // network record only the conversion block's location, fetching it on
+        // demand (here, or on the first value read).
+        let resolved = self
+            .index
+            .conversion(name)
+            .map_err(|e| MdfException::new_err(e.to_string()))?;
 
-        if let Some(conversion) = &channel.conversion {
+        if let Some(conversion) = resolved.as_ref() {
             Python::with_gil(|py| {
                 let mut info = HashMap::new();
                 info.insert("conversion_type".to_string(), format!("{:?}", conversion.cc_type).to_object(py));

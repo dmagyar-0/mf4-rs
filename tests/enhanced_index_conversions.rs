@@ -261,6 +261,7 @@ fn test_index_serialization_with_resolved_data() -> Result<(), MdfError> {
         flags: 0,
         pos_invalidation_bit: 0,
         conversion: Some(conversion),
+        conversion_addr: 0,
         vlsd_data_address: None,
         vlsd_data_blocks: Vec::new(),
     };
