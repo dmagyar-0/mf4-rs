@@ -9,8 +9,7 @@
 
 use crate::blocks::channel_block::ChannelBlock;
 use crate::blocks::channel_group_block::ChannelGroupBlock;
-use crate::blocks::common::{read_string_block_via_reader, BlockHeader, BlockParse};
-use crate::blocks::conversion::ConversionBlock;
+use crate::blocks::common::{read_string_block_via_reader, BlockParse};
 use crate::blocks::data_group_block::DataGroupBlock;
 use crate::blocks::header_block::HeaderBlock;
 use crate::blocks::identification_block::IdentificationBlock;
@@ -21,7 +20,14 @@ pub(crate) struct WalkedChannel {
     pub block: ChannelBlock,
     pub name: Option<String>,
     pub unit: Option<String>,
-    pub conversion: Option<ConversionBlock>,
+    /// File offset of the channel's `##CC` conversion block (0 = none).
+    ///
+    /// The walk deliberately does **not** fetch or resolve the conversion
+    /// block: doing so up front would issue a burst of range requests (the
+    /// block, its referenced text blocks, and any nested conversions) for
+    /// every channel while building the index. Only the address is recorded;
+    /// the index resolves it lazily on the first value read.
+    pub conversion_addr: u64,
 }
 
 pub(crate) struct WalkedGroup {
@@ -85,30 +91,15 @@ where
                 let name = read_string_block_via_reader(reader, cn.name_addr)?;
                 let unit = read_string_block_via_reader(reader, cn.unit_addr)?;
 
-                let conversion = if cn.conversion_addr != 0 {
-                    let cc_header_bytes = reader.read_range(cn.conversion_addr, 24)?;
-                    let cc_header = BlockHeader::from_bytes(&cc_header_bytes)?;
-                    let cc_full =
-                        reader.read_range(cn.conversion_addr, cc_header.block_len)?;
-                    let mut cc = ConversionBlock::from_bytes(&cc_full)?;
-                    if let Err(e) =
-                        cc.resolve_all_dependencies_via_reader(reader, cn.conversion_addr)
-                    {
-                        eprintln!(
-                            "Warning: failed to resolve conversion for channel {:?}: {e}",
-                            name.as_deref().unwrap_or("<unnamed>")
-                        );
-                    }
-                    Some(cc)
-                } else {
-                    None
-                };
+                // Record where the conversion lives, but do not fetch/resolve
+                // it now — that happens lazily on the first value read.
+                let conversion_addr = cn.conversion_addr;
 
                 channels.push(WalkedChannel {
                     block: cn,
                     name,
                     unit,
-                    conversion,
+                    conversion_addr,
                 });
 
                 ch_addr = next_ch_addr;

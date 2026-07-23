@@ -206,7 +206,7 @@ The codebase is organized into distinct layers. The module structure is defined 
   - Lazy reads via the attached source: `read(name)` / `read_in(group, name)` return a [`Signal`](src/signal.rs) (values paired with the group master/time axis); `source()` / `set_file()` / `set_url()` / `set_source()` manage the source
   - Explicit/custom readers: bind with `open(reader)` / `open_file(path)` → returns an `MdfReader` with `values(name)` / `values_in()` / `values_f64()` / `signal(name)` / `signal_in()`; `reader_mut()` / `into_inner()` expose the underlying `ByteRangeReader`
   - Byte ranges (power-user / partial reads): `byte_ranges(name)`, `byte_ranges_in(group, name)`, `byte_ranges_for_records(name, start, count)` — refused for VLSD channels, whose offset indirection a static range cannot express (use `read()` / `values()` instead)
-  - Conversions are resolved during index creation, enabling reads with empty `file_data` (`&[]`)
+  - Conversions: local builds (`from_file` / `from_bytes`) resolve them eagerly into `IndexedChannel.conversion`, so reads can apply them with empty `file_data` (`&[]`). Remote / range-reader builds (`from_url` / `from_range_reader`) **defer** resolution — they record only `IndexedChannel.conversion_addr` and fetch + resolve the conversion block lazily on the first value read (so building an index never pays for conversion blocks you never read). Read paths prefer a resolved `conversion` and otherwise resolve via `conversion_addr` through the reader; `MdfIndex::conversion(name)` resolves one on demand via the attached source. `CachingRangeReader` in bypass mode now serves reads already covered by cached metadata chunks, so a lazily-resolved conversion block that was pulled in during the walk stays free.
 - `Signal` (`src/signal.rs`) is the Rust equivalent of a pandas `Series`: `{ name, unit, timestamps: Vec<f64>, values: Vec<Option<DecodedValue>> }`, with `values_f64()` / `has_timestamps()`. Produced by `MDF::signal()`, `ChannelGroup::signal()`, `MdfReader::signal()`, and `MdfIndex::read()`.
 
 ### 6. File Operations
@@ -329,9 +329,11 @@ Channels with `channel_type == 1` and a non-zero `data` field store variable-len
 - `OpenDataBlock` tracks all state for an in-progress data block including DT fragment positions for later DL creation
 
 ### When Modifying the Index System
-- The index must be fully self-contained: no file references, all conversions pre-resolved
-- `IndexedChannel.conversion` stores a `ConversionBlock` with `resolved_texts`, `resolved_conversions`, and `default_conversion` populated
-- When reading via index, conversions are applied with empty file data (`&[]`) since all dependencies are resolved
+- The index metadata is self-contained (no file references). Conversions are self-contained only for **local** builds; **remote** (range-reader / URL) builds record only `IndexedChannel.conversion_addr` and resolve lazily on read (see below)
+- `IndexedChannel.conversion` stores a fully resolved `ConversionBlock` (with `resolved_texts`, `resolved_conversions`, and `default_conversion` populated) for local builds; it is `None` for remote builds, where `IndexedChannel.conversion_addr` holds the `##CC` block's file offset instead
+- Conversion resolution at read time is centralized in `MdfIndex::resolve_conversion` (prefers a resolved `conversion`, else fetches + resolves via the reader using `conversion_addr`). The decode helpers (`decode_records_to_values` / `decode_records_to_f64` / `read_vlsd_channel_values`) take the resolved `Option<&ConversionBlock>` as a parameter rather than reading it off the channel
+- When a resolved conversion is present, it is applied with empty file data (`&[]`) since all dependencies are pre-resolved
+- The wasm fragment-read path resolves deferred conversions via `conversionRangesStep` (a `RecordingRangeReader`-driven gap loop in `js/src/mdf-index.ts`), so the JS side fetches the conversion blocks a network-built index needs before decoding
 - `ByteRangeReader` trait allows plugging in HTTP, S3, or other data sources
 - VLSD channels (`channel_type == 1`) are readable through the index: each channel's `##SD` fragment chain is captured at build time in `IndexedChannel.vlsd_data_blocks`, and `read()` / `values()` resolve each record's inline 8-byte offset into that stream. `byte_ranges()` still refuses VLSD channels (a static range cannot express the offset indirection). Old JSON indexes without `vlsd_data_blocks` load fine but error on VLSD reads with a "rebuild the index" message.
 - Compressed blocks (`##DZ`) are not yet supported in the index reader

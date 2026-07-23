@@ -64,6 +64,11 @@ export class MdfIndex {
    * typical file this transfers a few KB regardless of the file's size. Use it
    * with `FetchRangeSource` (HTTP), `FileRangeSource` (Node), or any custom
    * source. `source.size()` must be implemented.
+   *
+   * Channel conversions are **not** fetched during the build — only their
+   * locations are recorded. `values`/`read` fetch and resolve a channel's
+   * conversion lazily on first read, so building the index never pays for
+   * conversion blocks you never read.
    */
   static async fromRangeSource(source: RangeSource): Promise<MdfIndex> {
     const wasm = getWasmModule();
@@ -246,6 +251,9 @@ export class MdfIndex {
   async values(name: string, source: RangeSource, group?: string | null): Promise<Float64Array> {
     const ranges = this.signalByteRanges(name, group);
     const fragments = await readAllRanges(source, ranges);
+    // Indexes built over the network resolve conversions lazily; fetch the
+    // channel's conversion blocks (if any) so the decoder can apply them.
+    await this.#fetchConversionRanges(name, group, false, source, ranges, fragments);
     return this.valuesFromFragments(name, group, ranges, fragments);
   }
 
@@ -259,7 +267,47 @@ export class MdfIndex {
   async read(name: string, source: RangeSource, group?: string | null): Promise<Signal> {
     const ranges = this.signalByteRanges(name, group);
     const fragments = await readAllRanges(source, ranges);
+    // A signal read decodes the group master too, so resolve the master's
+    // conversion as well as the channel's (withMaster = true).
+    await this.#fetchConversionRanges(name, group, true, source, ranges, fragments);
     return this.readFromFragments(name, group, ranges, fragments);
+  }
+
+  /**
+   * Fetch the conversion-block byte ranges a lazy (network-built) index needs
+   * to apply conversions, appending them to `ranges`/`fragments` in place.
+   *
+   * A no-op for self-contained indexes (built from bytes) and channels with no
+   * conversion — `conversionRangesStep` reports `done` immediately. Otherwise
+   * it drives the same gap-fetch loop as the index build, fetching each
+   * reported range from `source` until every conversion block for the read is
+   * present.
+   */
+  async #fetchConversionRanges(
+    name: string,
+    group: string | null | undefined,
+    withMaster: boolean,
+    source: RangeSource,
+    ranges: ByteRange[],
+    fragments: Uint8Array[],
+  ): Promise<void> {
+    const size = this.fileSize();
+    // Conversion chains are short; a small look-ahead keeps this to one or two
+    // round-trips even when a block and its text refs sit adjacently.
+    const CONVERSION_LOOKAHEAD_BYTES = 8 * 1024;
+    const maxRounds = 10_000;
+    for (let round = 0; round < maxRounds; round++) {
+      const step = this.inner.conversionRangesStep(name, group, withMaster, ranges, fragments);
+      if (step.done) return;
+      const [offset, length] = step.needed as [number, number];
+      const want = Math.min(Math.max(length, CONVERSION_LOOKAHEAD_BYTES), size - offset);
+      const bytes = await source.read(offset, want);
+      ranges.push([offset, bytes.length]);
+      fragments.push(bytes);
+    }
+    throw new Error(
+      "MdfIndex: conversion resolution did not converge; the index or source may be inconsistent.",
+    );
   }
 
   /** Free the underlying wasm memory. Safe to call multiple times. */
