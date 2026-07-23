@@ -258,6 +258,13 @@ pub fn read_string_block(mmap: &[u8], address: u64) -> Result<Option<String>, Md
 /// Mirrors [`read_string_block`] but fetches the block bytes through a range
 /// reader instead of a memory-mapped slice. Returns `Ok(None)` for `address ==
 /// 0` or non-text block IDs.
+///
+/// A name/unit/comment text block is a *leaf*: the walk does not follow a link
+/// out of it, so reads go through
+/// [`read_range_optional`](crate::index::ByteRangeReader::read_range_optional).
+/// For on-demand readers that is identical to `read_range`; for an incremental
+/// gap-gathering reader it lets the walk record a not-yet-fetched text block and
+/// carry on (returning `Ok(None)` here) instead of aborting on the first miss.
 pub fn read_string_block_via_reader<R>(
     reader: &mut R,
     address: u64,
@@ -269,18 +276,21 @@ where
         return Ok(None);
     }
 
-    let header_bytes = reader.read_range(address, 24)?;
+    let header_bytes = match reader.read_range_optional(address, 24)? {
+        Some(bytes) => bytes,
+        None => return Ok(None),
+    };
     let header = BlockHeader::from_bytes(&header_bytes)?;
 
     match header.id.as_str() {
-        "##TX" => {
-            let bytes = reader.read_range(address, header.block_len)?;
-            Ok(Some(TextBlock::from_bytes(&bytes)?.text))
-        }
-        "##MD" => {
-            let bytes = reader.read_range(address, header.block_len)?;
-            Ok(Some(MetadataBlock::from_bytes(&bytes)?.xml))
-        }
+        "##TX" => match reader.read_range_optional(address, header.block_len)? {
+            Some(bytes) => Ok(Some(TextBlock::from_bytes(&bytes)?.text)),
+            None => Ok(None),
+        },
+        "##MD" => match reader.read_range_optional(address, header.block_len)? {
+            Some(bytes) => Ok(Some(MetadataBlock::from_bytes(&bytes)?.xml)),
+            None => Ok(None),
+        },
         _ => Ok(None),
     }
 }
