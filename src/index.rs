@@ -266,6 +266,17 @@ pub trait ByteRangeReader {
     ) -> Result<Option<Vec<u8>>, Self::Error> {
         self.read_range(offset, length).map(Some)
     }
+
+    /// True when this reader is a gap-discovery probe: it cannot serve every
+    /// range and records the misses instead of returning data. Metadata walks
+    /// may then skip an unreadable subtree and keep discovering gaps elsewhere
+    /// rather than aborting on the first miss.
+    ///
+    /// A walk driven by a probing reader produces a **partial** result: callers
+    /// MUST discard it and retry once the recorded ranges have been supplied.
+    fn is_probing(&self) -> bool {
+        false
+    }
 }
 
 /// Local file reader implementation.
@@ -1149,6 +1160,18 @@ impl MdfIndex {
 
     /// Mirror of [`Self::extract_data_blocks`] that fetches headers via a
     /// [`ByteRangeReader`] instead of slicing into a memory map.
+    ///
+    /// When `reader.is_probing()` (an incremental gap-discovery pass — see
+    /// [`ByteRangeReader::is_probing`]), a failed read stops walking this
+    /// group's data-block chain and returns what was collected so far instead
+    /// of propagating the error: the reader has already recorded the miss, so
+    /// the caller can fetch it and retry. The resulting index is **partial**
+    /// and must be discarded while any reader miss remains — this is exactly
+    /// the batched gap-discovery contract `MdfIndex::from_range_reader`
+    /// callers (`buildIndexStep`/`IndexBuilder::step`) already enforce by only
+    /// reporting `done` once a pass records zero misses. On-demand readers
+    /// (the default `is_probing() == false`) are unaffected: a failed read is
+    /// still fatal, exactly as before.
     fn extract_data_blocks_via_reader<R>(
         reader: &mut R,
         data_block_addr: u64,
@@ -1157,10 +1180,28 @@ impl MdfIndex {
         R: ByteRangeReader<Error = MdfError>,
     {
         let mut data_blocks = Vec::new();
+
+        // Read a range, but when probing and the read fails, stop walking
+        // this chain and hand back what's been collected so far rather than
+        // aborting the whole build.
+        macro_rules! probe_read {
+            ($offset:expr, $len:expr) => {
+                match reader.read_range($offset, $len) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        if reader.is_probing() {
+                            return Ok(data_blocks);
+                        }
+                        return Err(e);
+                    }
+                }
+            };
+        }
+
         let mut current_block_address = data_block_addr;
 
         while current_block_address != 0 {
-            let header_bytes = reader.read_range(current_block_address, 24)?;
+            let header_bytes = probe_read!(current_block_address, 24);
             let block_header =
                 crate::blocks::common::BlockHeader::from_bytes(&header_bytes)?;
 
@@ -1182,13 +1223,12 @@ impl MdfIndex {
                     current_block_address = 0;
                 }
                 "##DL" => {
-                    let dl_bytes =
-                        reader.read_range(current_block_address, block_header.block_len)?;
+                    let dl_bytes = probe_read!(current_block_address, block_header.block_len);
                     let data_list_block =
                         crate::blocks::data_list_block::DataListBlock::from_bytes(&dl_bytes)?;
 
                     for &fragment_address in &data_list_block.data_links {
-                        let frag_header_bytes = reader.read_range(fragment_address, 24)?;
+                        let frag_header_bytes = probe_read!(fragment_address, 24);
                         let fragment_header = crate::blocks::common::BlockHeader::from_bytes(
                             &frag_header_bytes,
                         )?;
@@ -1224,6 +1264,12 @@ impl MdfIndex {
     /// validates that a variable-length `##DL`'s per-fragment virtual offsets
     /// reproduce the running sum of prior fragments' data-section sizes — the
     /// invariant the offset-based reader relies on.
+    ///
+    /// When `reader.is_probing()`, a failed read stops walking this VLSD
+    /// chain and returns what was collected so far instead of propagating the
+    /// error — see the identical rationale on
+    /// [`Self::extract_data_blocks_via_reader`]. Non-probing readers keep
+    /// today's fatal-on-first-miss behavior.
     fn extract_vlsd_data_blocks<R>(
         reader: &mut R,
         data_addr: u64,
@@ -1232,6 +1278,24 @@ impl MdfIndex {
         R: ByteRangeReader<Error = MdfError>,
     {
         let mut data_blocks: Vec<DataBlockInfo> = Vec::new();
+
+        // See `extract_data_blocks_via_reader`'s `probe_read!` for the
+        // rationale: batched gap discovery skips an unreadable subtree
+        // instead of aborting the whole pass, but only when probing.
+        macro_rules! probe_read {
+            ($offset:expr, $len:expr) => {
+                match reader.read_range($offset, $len) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        if reader.is_probing() {
+                            return Ok(data_blocks);
+                        }
+                        return Err(e);
+                    }
+                }
+            };
+        }
+
         let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
         // Running sum of fragment data-section sizes (size - 24), i.e. the
         // virtual start offset of the next fragment in the concatenated stream.
@@ -1239,7 +1303,7 @@ impl MdfIndex {
         let mut current = data_addr;
 
         while current != 0 {
-            let header_bytes = reader.read_range(current, 24)?;
+            let header_bytes = probe_read!(current, 24);
             let header = crate::blocks::common::BlockHeader::from_bytes(&header_bytes)?;
 
             match header.id.as_str() {
@@ -1268,14 +1332,14 @@ impl MdfIndex {
                             current
                         )));
                     }
-                    let dl_bytes = reader.read_range(current, header.block_len)?;
+                    let dl_bytes = probe_read!(current, header.block_len);
                     let dl = crate::blocks::data_list_block::DataListBlock::from_bytes(&dl_bytes)?;
 
                     for (i, &fragment_address) in dl.data_links.iter().enumerate() {
                         if fragment_address == 0 {
                             continue;
                         }
-                        let frag_header_bytes = reader.read_range(fragment_address, 24)?;
+                        let frag_header_bytes = probe_read!(fragment_address, 24);
                         let frag_header =
                             crate::blocks::common::BlockHeader::from_bytes(&frag_header_bytes)?;
                         let is_compressed = match frag_header.id.as_str() {

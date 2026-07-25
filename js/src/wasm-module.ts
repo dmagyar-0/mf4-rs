@@ -71,11 +71,33 @@ export interface WasmMdfIndex {
 export interface WasmMdfIndexConstructor {
   fromBytes(data: Uint8Array): WasmMdfIndex;
   fromJson(json: string): WasmMdfIndex;
+  /**
+   * Thin compatibility shim: re-marshals the whole `ranges`/`fragments`
+   * arrays from JS on every call (`O(F)` copy per round). Prefer
+   * `IndexBuilder`, which copies each fetched fragment into wasm memory
+   * exactly once and keeps them across `step()` calls.
+   */
   buildIndexStep(
     file_size: number,
     ranges: unknown,
     fragments: unknown,
   ): WasmBuildStep;
+}
+
+/**
+ * Stateful, non-quadratic driver for an incremental range-fetched index
+ * build (see `WasmMdfIndexConstructor.buildIndexStep` for the shim this
+ * replaces). Fragments pushed via `push` are copied into wasm memory once and
+ * kept in a sorted store across `step()` calls.
+ */
+export interface WasmIndexBuilder {
+  free(): void;
+  push(offset: number, bytes: Uint8Array): void;
+  step(): WasmBuildStep;
+}
+
+export interface WasmIndexBuilderConstructor {
+  new (file_size: number): WasmIndexBuilder;
 }
 
 /** One step of the incremental `buildIndexStep` index build. */
@@ -116,6 +138,7 @@ export interface WasmModule {
   Mdf: WasmMdfConstructor;
   MdfIndex: WasmMdfIndexConstructor;
   MdfWriter: WasmMdfWriterConstructor;
+  IndexBuilder: WasmIndexBuilderConstructor;
 }
 
 let cached: WasmModule | undefined;

@@ -106,11 +106,16 @@ export class MdfIndex {
    * Build a fresh index over any `RangeSource`, fetching **only** the file's
    * metadata blocks — never the bulk sample data.
    *
-   * The metadata walk runs incrementally in wasm: it reports which byte ranges
-   * it still needs, this loop fetches them (with look-ahead to keep the number
-   * of requests low), and the two repeat until the index is built. For a
-   * typical file this transfers a few KB regardless of the file's size. Use it
-   * with `FetchRangeSource` (HTTP), `FileRangeSource` (Node), or any custom
+   * The metadata walk runs incrementally in wasm, driven by a stateful
+   * `IndexBuilder`: each pass reports the byte ranges it still needs — a
+   * *batch* covering every independent gap discovered so far (a scattered
+   * file's metadata across many channel groups converges in a handful of
+   * passes, not one per group) — this loop fetches all of them **concurrently**
+   * and pushes the results into the builder, and the two repeat until the
+   * index is built. Fetched bytes are copied into wasm memory once, via
+   * `push`, and stay there across passes (no re-marshalling every round). For
+   * a typical file this transfers a few KB regardless of the file's size. Use
+   * it with `FetchRangeSource` (HTTP), `FileRangeSource` (Node), or any custom
    * source. `source.size()` must be implemented.
    *
    * Channel conversions are **not** fetched during the build — only their
@@ -125,47 +130,53 @@ export class MdfIndex {
     }
     const size = await source.size();
 
-    const ranges: ByteRange[] = [];
-    const fragments: Uint8Array[] = [];
+    const builder = new wasm.IndexBuilder(size);
+    try {
+      const fetchInto = async (offset: number, length: number): Promise<void> => {
+        const clamped = Math.min(length, size - offset);
+        if (offset < 0 || offset >= size || clamped <= 0) {
+          throw new Error(
+            `MdfIndex.fromRangeSource: build requested bytes [${offset}, ${offset + length}) ` +
+              `outside the file (size ${size}); the source may be truncated or not an MDF file.`,
+          );
+        }
+        const bytes = await source.read(offset, clamped);
+        builder.push(offset, bytes);
+      };
 
-    const fetchInto = async (offset: number, length: number): Promise<void> => {
-      const clamped = Math.min(length, size - offset);
-      if (offset < 0 || offset >= size || clamped <= 0) {
-        throw new Error(
-          `MdfIndex.fromRangeSource: build requested bytes [${offset}, ${offset + length}) ` +
-            `outside the file (size ${size}); the source may be truncated or not an MDF file.`,
+      // Seed with a prefix so files whose metadata sits at the front finish in
+      // one round-trip.
+      if (size > 0) {
+        await fetchInto(0, Math.min(BUILD_SEED_BYTES, size));
+      }
+
+      // Bounded loop: each round fetches every range the walk still needs
+      // (concurrently, with a geometrically growing look-ahead), so a file
+      // with N metadata blocks converges in a handful of rounds rather than
+      // one per block. The cap is a safety net against a malformed source.
+      const maxRounds = 10_000;
+      for (let round = 0; round < maxRounds; round++) {
+        const step = builder.step();
+        if (step.done) {
+          return MdfIndex.fromJson(step.json as string);
+        }
+        const lookahead = lookaheadForRound(round);
+        const spans = coalesceNeeded(
+          step.needed as [number, number][],
+          lookahead,
+          lookahead,
+          size,
         );
+        await Promise.all(spans.map(([offset, length]) => fetchInto(offset, length)));
       }
-      const bytes = await source.read(offset, clamped);
-      ranges.push([offset, bytes.length]);
-      fragments.push(bytes);
-    };
-
-    // Seed with a prefix so files whose metadata sits at the front finish in
-    // one round-trip.
-    if (size > 0) {
-      await fetchInto(0, Math.min(BUILD_SEED_BYTES, size));
+      throw new Error(
+        "MdfIndex.fromRangeSource: index build did not converge; the source may not be a valid MDF file.",
+      );
+    } finally {
+      // The builder holds wasm-side fragment memory; release it on both the
+      // success and error paths.
+      builder.free();
     }
-
-    // Bounded loop: each round fetches every range the walk still needs (with a
-    // geometrically growing look-ahead), so a file with N metadata blocks
-    // converges in a handful of rounds rather than one per block. The cap is a
-    // safety net against a malformed source.
-    const maxRounds = 10_000;
-    for (let round = 0; round < maxRounds; round++) {
-      const step = wasm.MdfIndex.buildIndexStep(size, ranges, fragments);
-      if (step.done) {
-        return MdfIndex.fromJson(step.json as string);
-      }
-      const lookahead = lookaheadForRound(round);
-      const spans = coalesceNeeded(step.needed as [number, number][], lookahead, lookahead, size);
-      for (const [offset, length] of spans) {
-        await fetchInto(offset, length);
-      }
-    }
-    throw new Error(
-      "MdfIndex.fromRangeSource: index build did not converge; the source may not be a valid MDF file.",
-    );
   }
 
   /**
@@ -174,8 +185,12 @@ export class MdfIndex {
    * Convenience wrapper over `fromRangeSource` with a `FetchRangeSource`, so
    * only the file's metadata blocks are downloaded (a few KB) rather than the
    * whole file — as long as the server honours `Range` requests. Servers that
-   * ignore `Range` fall back to a single full download. Once built, read with
-   * `values`/`read` over a `RangeSource` for lazy, partial sample reads.
+   * ignore `Range` fall back to a single full download. Each round of the
+   * build fetches every byte range the walk still needs concurrently (see
+   * `fromRangeSource`), so a file with many channel groups converges in a
+   * handful of round-trips rather than one request per group. Once built,
+   * read with `values`/`read` over a `RangeSource` for lazy, partial sample
+   * reads.
    */
   static async fromUrl(url: string, fetchImpl?: FetchLike): Promise<MdfIndex> {
     return MdfIndex.fromRangeSource(new FetchRangeSource(url, fetchImpl));
@@ -358,9 +373,14 @@ export class MdfIndex {
         CONVERSION_LOOKAHEAD_BYTES,
         size,
       );
-      for (const [offset, length] of spans) {
-        const bytes = await source.read(offset, length);
-        ranges.push([offset, bytes.length]);
+      const fetched = await Promise.all(
+        spans.map(async ([offset, length]): Promise<[ByteRange, Uint8Array]> => {
+          const bytes = await source.read(offset, length);
+          return [[offset, bytes.length], bytes];
+        }),
+      );
+      for (const [range, bytes] of fetched) {
+        ranges.push(range);
         fragments.push(bytes);
       }
     }
