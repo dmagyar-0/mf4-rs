@@ -11,22 +11,123 @@ import type { ByteRange, IndexGroupInfo, Signal } from "./types";
  * the front of the file, so seeding this often completes the build in one or
  * two round-trips. */
 const BUILD_SEED_BYTES = 256 * 1024;
-/** Base bytes fetched per build round-trip. The window grows geometrically
- * across rounds (see {@link lookaheadForRound}) so files whose metadata is
- * scattered throughout (interleaved with data blocks) still converge in a
- * handful of requests instead of one per metadata cluster. */
+/** Base bytes fetched per build round-trip, and the window the read-ahead
+ * heuristic falls back to whenever the walk jumps to a new metadata cluster
+ * (see {@link nextLookahead}). Large enough to swallow a typical cluster in one
+ * request. */
 const BUILD_LOOKAHEAD_BYTES = 64 * 1024;
-/** Cap on the per-round fetch window so the geometric growth never asks for an
- * absurd single range on a huge file. */
-const BUILD_MAX_LOOKAHEAD_BYTES = 4 * 1024 * 1024;
+/** Cap on the per-round fetch window, reached only while the walk is streaming
+ * sequentially through one large metadata cluster. */
+const BUILD_MAX_LOOKAHEAD_BYTES = 1024 * 1024;
+/** Distance between two needed ranges that still gets bridged into a single
+ * request. Constant, and deliberately much smaller than the look-ahead cap:
+ * bridging pulls **every** intervening byte, so a large bridge on a file whose
+ * metadata is interleaved with data blocks would transfer the data blocks too. */
+const BUILD_BRIDGE_BYTES = 64 * 1024;
 
-/** Per-round fetch window: `base * 2^round`, capped. Early rounds stay small
- * (cheap for the common case where metadata sits contiguously at the front);
- * later rounds grow large so a scattered-metadata file is covered in
- * logarithmically many requests. */
-function lookaheadForRound(round: number): number {
-  const grown = BUILD_LOOKAHEAD_BYTES * 2 ** Math.min(round, 20);
-  return Math.min(grown, BUILD_MAX_LOOKAHEAD_BYTES);
+/**
+ * Tuning for the incremental index build, for callers who know their file's
+ * shape. All sizes are in bytes; omitted fields keep the defaults.
+ *
+ * The defaults suit files whose metadata sits contiguously at the front. They
+ * are wrong in opposite directions for two other shapes, which is why they are
+ * exposed:
+ *
+ * - **Metadata interleaved with data blocks** (a per-message bus logger, or any
+ *   writer that emits each group's data before the next group's metadata):
+ *   look-ahead spans straddle the data blocks between metadata clusters and
+ *   transfer them. Lowering `maxLookaheadBytes` toward a single cluster's size
+ *   trades more round-trips for far fewer bytes.
+ * - **Very large metadata** (thousands of channels in one group): raising
+ *   `seedBytes` and `maxLookaheadBytes` converges in fewer round-trips.
+ *
+ * There is no universally right answer — it is a bandwidth-versus-latency
+ * trade, so measure against your own files.
+ */
+export interface IndexBuildOptions {
+  /** Prefix fetched before the first pass. Default 256 KiB. */
+  seedBytes?: number;
+  /** Base per-round fetch window, and the size the window resets to whenever
+   * the walk jumps to a new metadata cluster. Default 64 KiB. */
+  lookaheadBytes?: number;
+  /** Ceiling on the per-round fetch window, reached only while the walk streams
+   * sequentially through one large cluster. Default 1 MiB. */
+  maxLookaheadBytes?: number;
+  /** Two needed ranges closer than this are fetched as one request, including
+   * the bytes between them. Default 64 KiB. */
+  bridgeBytes?: number;
+}
+
+interface ResolvedBuildOptions {
+  seedBytes: number;
+  lookaheadBytes: number;
+  maxLookaheadBytes: number;
+  bridgeBytes: number;
+}
+
+function positiveSize(value: number | undefined, fallback: number, what: string): number {
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`MdfIndex build option ${what} must be a positive integer, got ${value}`);
+  }
+  return value;
+}
+
+function resolveBuildOptions(options?: IndexBuildOptions): ResolvedBuildOptions {
+  const lookaheadBytes = positiveSize(
+    options?.lookaheadBytes,
+    BUILD_LOOKAHEAD_BYTES,
+    "lookaheadBytes",
+  );
+  const maxLookaheadBytes = positiveSize(
+    options?.maxLookaheadBytes,
+    BUILD_MAX_LOOKAHEAD_BYTES,
+    "maxLookaheadBytes",
+  );
+  return {
+    seedBytes: positiveSize(options?.seedBytes, BUILD_SEED_BYTES, "seedBytes"),
+    lookaheadBytes,
+    // A base above the ceiling would silently ignore the ceiling.
+    maxLookaheadBytes: Math.max(lookaheadBytes, maxLookaheadBytes),
+    bridgeBytes: positiveSize(options?.bridgeBytes, BUILD_BRIDGE_BYTES, "bridgeBytes"),
+  };
+}
+
+/** Smallest offset in a batch of needed ranges, without spreading a
+ * potentially huge array into `Math.min`. */
+function minOffset(needed: [number, number][]): number {
+  let min = Infinity;
+  for (const [offset] of needed) {
+    if (offset < min) min = offset;
+  }
+  return min;
+}
+
+/**
+ * Next fetch window, using a read-ahead heuristic rather than the round number.
+ *
+ * Growing purely with the round count is wrong on a file whose metadata is
+ * interleaved with data blocks: the window ratchets up to its ceiling within a
+ * few rounds and then stays there for every remaining round, so each small
+ * metadata cluster is fetched with a multi-megabyte request that drags in the
+ * data blocks around it.
+ *
+ * Instead, grow only while the walk is reading *sequentially* — the next thing
+ * it needs continues on from what was just fetched, i.e. we are streaming
+ * through one large metadata cluster and want bigger reads. When the walk
+ * instead jumps somewhere far away (the next channel group's metadata, past a
+ * data block), reset to the base window: the new cluster is probably small, and
+ * a large window here is pure over-fetch.
+ */
+function nextLookahead(
+  needed: [number, number][],
+  previousFetchEnd: number,
+  current: number,
+  opts: ResolvedBuildOptions,
+): number {
+  const sequential = minOffset(needed) <= previousFetchEnd + opts.bridgeBytes;
+  if (!sequential) return opts.lookaheadBytes;
+  return Math.min(current * 2, opts.maxLookaheadBytes);
 }
 
 /**
@@ -122,12 +223,22 @@ export class MdfIndex {
    * locations are recorded. `values`/`read` fetch and resolve a channel's
    * conversion lazily on first read, so building the index never pays for
    * conversion blocks you never read.
+   *
+   * How much gets transferred depends on how the file interleaves metadata with
+   * data, and the fetch-window defaults can be overridden per call — see
+   * {@link IndexBuildOptions}. On a file whose metadata is interleaved with
+   * data blocks, lowering `maxLookaheadBytes` toward one metadata cluster's
+   * size trades extra round-trips for a large reduction in bytes.
    */
-  static async fromRangeSource(source: RangeSource): Promise<MdfIndex> {
+  static async fromRangeSource(
+    source: RangeSource,
+    options?: IndexBuildOptions,
+  ): Promise<MdfIndex> {
     const wasm = getWasmModule();
     if (!source.size) {
       throw new Error("MdfIndex.fromRangeSource requires a RangeSource with a size() method.");
     }
+    const opts = resolveBuildOptions(options);
     const size = await source.size();
 
     const builder = new wasm.IndexBuilder(size);
@@ -146,9 +257,13 @@ export class MdfIndex {
 
       // Seed with a prefix so files whose metadata sits at the front finish in
       // one round-trip.
+      let previousFetchEnd = 0;
       if (size > 0) {
-        await fetchInto(0, Math.min(BUILD_SEED_BYTES, size));
+        const seed = Math.min(opts.seedBytes, size);
+        await fetchInto(0, seed);
+        previousFetchEnd = seed;
       }
+      let lookahead = opts.lookaheadBytes;
 
       // Bounded loop: each round fetches every range the walk still needs
       // (concurrently, with a geometrically growing look-ahead), so a file
@@ -160,13 +275,15 @@ export class MdfIndex {
         if (step.done) {
           return MdfIndex.fromJson(step.json as string);
         }
-        const lookahead = lookaheadForRound(round);
-        const spans = coalesceNeeded(
-          step.needed as [number, number][],
-          lookahead,
-          lookahead,
-          size,
-        );
+        // Bridge and look-ahead are separate knobs: bridging pulls every
+        // intervening byte, so it stays small and constant, while the
+        // per-span look-ahead grows only while the walk reads sequentially.
+        const needed = step.needed as [number, number][];
+        lookahead = nextLookahead(needed, previousFetchEnd, lookahead, opts);
+        const spans = coalesceNeeded(needed, opts.bridgeBytes, lookahead, size);
+        for (const [offset, length] of spans) {
+          previousFetchEnd = Math.max(previousFetchEnd, offset + length);
+        }
         await Promise.all(spans.map(([offset, length]) => fetchInto(offset, length)));
       }
       throw new Error(
@@ -191,9 +308,16 @@ export class MdfIndex {
    * handful of round-trips rather than one request per group. Once built,
    * read with `values`/`read` over a `RangeSource` for lazy, partial sample
    * reads.
+   *
+   * Pass `options` to tune the fetch windows for your file's shape — see
+   * {@link IndexBuildOptions}.
    */
-  static async fromUrl(url: string, fetchImpl?: FetchLike): Promise<MdfIndex> {
-    return MdfIndex.fromRangeSource(new FetchRangeSource(url, fetchImpl));
+  static async fromUrl(
+    url: string,
+    fetchImpl?: FetchLike,
+    options?: IndexBuildOptions,
+  ): Promise<MdfIndex> {
+    return MdfIndex.fromRangeSource(new FetchRangeSource(url, fetchImpl), options);
   }
 
   /** Serialise the index to a JSON string. */
