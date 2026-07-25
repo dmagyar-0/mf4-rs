@@ -1,3 +1,8 @@
+## v3.5.0 — 2026-07-25
+
+### Features
+- batch gap discovery and add IndexBuilder for wasm index builds (#91)
+
 ## v3.4.2 — 2026-07-23
 
 ### Fixes
