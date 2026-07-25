@@ -50,7 +50,7 @@ export function init(input?: InitInput): Promise<void> {
 }
 
 export { Mdf } from "./mdf";
-export { MdfIndex } from "./mdf-index";
+export { MdfIndex, type IndexBuildOptions } from "./mdf-index";
 export { MdfWriter, type RecordValue } from "./mdf-writer";
 
 export {
