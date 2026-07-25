@@ -1,3 +1,8 @@
+## v3.6.0 — 2026-07-25
+
+### Features
+- expose index-build fetch windows as options and reset read-ahead on a seek (#92)
+
 ## v3.5.0 — 2026-07-25
 
 ### Features
