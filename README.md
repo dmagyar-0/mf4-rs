@@ -249,6 +249,11 @@ series = mdf.read("Data")     # pandas Series with DatetimeIndex
 array = mdf.values("Data")    # numpy float64 array (no pandas needed)
 same = mdf["Data"]            # __getitem__ is read()
 
+# Many channels at once: ONE sweep over the record data per group
+# (multi-threaded), instead of one full pass per channel.
+cols = mdf.values_many(["Data", "Speed", "Rpm"])     # {name: ndarray}
+df = mdf.to_dataframe(group="MyGroup")               # all channels, DatetimeIndex
+
 # Lazy remote/indexed reads
 index = mf4_rs.MdfIndex.from_file("output.mf4")
 index.save("output_index.json")
@@ -276,21 +281,36 @@ See [`js/README.md`](js/README.md) for the full API, the writer, remote reads vi
 
 ## Performance
 
-`mf4-rs` is designed for high performance:
-- Use `write_records` for batch operations instead of multiple `write_record` calls
-- Data blocks automatically split when they exceed 4MB to maintain performance
-- Memory-mapped file access minimizes memory usage for large files
-- Channel values are decoded lazily only when accessed
-- **Use indexing for repeated access** to the same files to avoid re-parsing overhead
+Python bindings vs asammdf 8.8.27, Linux x86-64, 2 cores, warm page cache,
+fresh process per measurement, median of 3. `values_many` / `to_dataframe`
+decode all requested channels of a group in **one sweep** over the records,
+tiled for cache locality and split across threads.
 
-*Note: Previous benchmarks have been removed as they are being updated.*
+| Scenario | mf4-rs | asammdf |
+|---|---|---|
+| Open 400 MB file (500 ch) | 0.002 s | 0.39 s |
+| Read 4 × f64 × 1M samples | 0.073 s | 0.49 s |
+| Read 10 of 500 channels (200k samples) | 0.10 s | 0.49 s |
+| Read all 500 channels | 0.44 s | 1.44 s |
+| `to_dataframe`, 500 channels | 0.70 s | 12.4 s |
+| `##DZ` (transposed) file, 10 channels | 1.04 s | 2.19 s |
+| `##DZ` (transposed) file, all 500 channels | 1.45 s | 3.42 s |
+| Algebraic conversion, 1M samples | 0.13 s | 0.49 s |
+
+Notes:
+- Compressed data groups are inflated once (in parallel) and cached on the
+  open `Mdf`, so repeat reads are as fast as uncompressed reads; the cost is
+  holding the uncompressed group in memory while the file is open.
+- Set `MF4RS_THREADS=1` to force single-threaded decoding.
+- Writing: prefer `write_columns_f64` / `write_columns` (bulk) over
+  per-record `write_record`.
 
 ## Dependencies
 
 - `nom` - Binary parsing combinators
 - `byteorder` - Endianness handling  
 - `memmap2` - Memory-mapped file I/O
-- `meval` - Mathematical expression evaluation for formula conversions
+- `flate2` (pure-Rust `zlib-rs` backend) - `##DZ` block decompression
 - `thiserror` - Error handling derive macros
 - `serde` / `serde_json` - JSON serialization for the index system
 

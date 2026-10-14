@@ -140,3 +140,6 @@ Icon
 *.backup
 *.old
 .claude/
+
+# Small asammdf-written regression fixtures (HL/DL/DZ chains)
+!tests/fixtures/*.mf4

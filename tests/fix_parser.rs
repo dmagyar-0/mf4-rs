@@ -140,7 +140,7 @@ fn cyclic_dt_chain_errors() {
 
     let mut dg = DataGroupBlock::default();
     dg.data_block_addr = dl_offset;
-    let raw_dg = RawDataGroup { block: dg, channel_groups: Vec::new() };
+    let raw_dg = RawDataGroup::new(dg, Vec::new());
     let result = raw_dg.data_blocks(&image);
     assert!(matches!(result, Err(MdfError::BlockLinkError(_))));
 }
@@ -410,10 +410,7 @@ fn unsorted_data_group_data_access_errors() {
         block.samples_byte_nr = 4;
         RawChannelGroup { block, raw_channels: Vec::new() }
     };
-    let raw_dg = RawDataGroup {
-        block: dg,
-        channel_groups: vec![cg(1), cg(2)],
-    };
+    let raw_dg = RawDataGroup::new(dg, vec![cg(1), cg(2)]);
     let result = raw_dg.data_blocks(&[]);
     assert!(
         matches!(result, Err(MdfError::BlockSerializationError(_))),
@@ -425,7 +422,7 @@ fn unsorted_data_group_data_access_errors() {
     let mut dg = DataGroupBlock::default();
     dg.record_id_len = 1;
     dg.data_block_addr = 0; // no data: empty result, but no error
-    let raw_dg = RawDataGroup { block: dg, channel_groups: vec![cg(1)] };
+    let raw_dg = RawDataGroup::new(dg, vec![cg(1)]);
     assert!(raw_dg.data_blocks(&[]).unwrap().is_empty());
 }
 

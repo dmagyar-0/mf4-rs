@@ -319,6 +319,47 @@ class Mdf:
         """
         ...
 
+    def values_many(self, names:typing.Sequence[builtins.str], group:typing.Optional[builtins.str]) -> typing.Any:
+        r"""
+        Read many numeric channels at once as ``{name: numpy.float64 array}``.
+        
+        All requested channels of the same group are decoded in a **single
+        sweep** over the record data (multi-threaded), so this is much faster
+        than calling :py:meth:`values` in a loop on wide files. Semantics per
+        channel match :py:meth:`values` (physical values, ``NaN`` for invalid
+        or non-numeric samples).
+        
+        Parameters
+        ----------
+        names : list[str]
+        group : Optional[str]
+            Restrict name resolution to one group.
+        """
+        ...
+
+    def to_dataframe(self, names:typing.Optional[typing.Sequence[builtins.str]], group:typing.Optional[builtins.str]) -> typing.Any:
+        r"""
+        Read channels of **one** channel group into a ``pandas.DataFrame``
+        indexed by that group's master/time channel.
+        
+        One sweep over the record data decodes every column (see
+        :py:meth:`values_many`). With ``names=None`` all non-master channels
+        of the group are read; then ``group`` is required when the file has
+        more than one channel group.
+        
+        Parameters
+        ----------
+        names : Optional[list[str]]
+        group : Optional[str]
+        
+        Raises
+        ------
+        MdfException
+            If the channels span several groups (different time bases), a
+            name is unknown, or pandas is not installed.
+        """
+        ...
+
     def __getitem__(self, key:typing.Any) -> typing.Any:
         r"""
         ``mdf["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).

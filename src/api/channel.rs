@@ -1,7 +1,7 @@
 use crate::error::MdfError;
 use crate::blocks::channel_block::ChannelBlock;
 use crate::blocks::conversion::ConversionType;
-use crate::parsing::decoder::{ DecodedValue, decode_channel_value, decode_channel_value_with_validity, decode_f64_from_record, check_value_validity };
+use crate::parsing::decoder::{ DecodedValue, decode_channel_value, decode_channel_value_with_validity, decode_f64_from_record };
 use crate::parsing::raw_channel_group::RawChannelGroup;
 use crate::parsing::raw_data_group::RawDataGroup;
 use crate::parsing::raw_channel::RawChannel;
@@ -221,34 +221,16 @@ impl<'a> Channel<'a> {
             return Ok(out);
         }
 
-        // Fast path: iterate over data blocks directly without Box<dyn Iterator>
-        let sample_byte_len = cg_data_bytes as usize;
-        let invalidation_bytes = self.raw_channel_group.block.invalidation_bytes_nr as usize;
-        let record_size = record_id_len + sample_byte_len + invalidation_bytes;
-
-        if record_size == 0 {
-            return Ok(out);
-        }
-
-        let blocks = self.raw_data_group.data_blocks(self.mmap)?;
-        for data_block in &blocks {
-            let raw = data_block.data;
-            let valid_len = (raw.len() / record_size) * record_size;
-            let mut offset = 0;
-            while offset + record_size <= valid_len {
-                let rec = &raw[offset..offset + record_size];
-                if all_invalid
-                    || (invalidation_bytes > 0
-                        && !check_value_validity(rec, record_id_len, cg_data_bytes, self.block))
-                {
-                    out.push(f64::NAN);
-                } else {
-                    convert_record(rec, &mut out)?;
-                }
-                offset += record_size;
-            }
-        }
-        Ok(out)
+        // Fixed-length channels: tiled single-channel sweep with a kernel
+        // chosen once per channel (see parsing::columnar).
+        let _ = (cg_data_bytes, capacity);
+        let mut cols = crate::parsing::columnar::decode_columns_f64(
+            self.raw_data_group,
+            self.raw_channel_group,
+            &[self.block],
+            self.mmap,
+        )?;
+        Ok(cols.pop().unwrap_or_default())
     }
 
     /// Get the channel block (for internal use)

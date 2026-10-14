@@ -1,7 +1,6 @@
 use crate::blocks::channel_block::ChannelBlock;
-use crate::blocks::data_list_block::DataListBlock;
-use crate::blocks::signal_data_block::SignalDataBlock;
-use crate::blocks::common::BlockParse;
+use crate::parsing::compression::{collect_fragments, coalesce, Fragment};
+use std::sync::OnceLock;
 use crate::parsing::raw_channel_group::RawChannelGroup;
 use crate::parsing::raw_data_group::RawDataGroup;
 use crate::error::MdfError;
@@ -10,6 +9,36 @@ use crate::error::MdfError;
 #[derive(Debug)]
 pub struct RawChannel {
     pub block:  ChannelBlock,
+    /// Decompressed signal data for VLSD channels stored in `##DZ` blocks.
+    sd_coalesced: OnceLock<Vec<u8>>,
+}
+
+impl RawChannel {
+    pub fn new(block: ChannelBlock) -> Self {
+        Self { block, sd_coalesced: OnceLock::new() }
+    }
+
+    /// Payload slices of this VLSD channel's signal data, one per fragment.
+    /// Plain `##SD` fragments are borrowed from the mmap; if any fragment is
+    /// compressed, the whole chain is inflated once and cached.
+    pub fn signal_data_fragments<'a>(&'a self, mmap: &'a [u8]) -> Result<Vec<&'a [u8]>, MdfError> {
+        if let Some(buf) = self.sd_coalesced.get() {
+            return Ok(vec![buf.as_slice()]);
+        }
+        let fragments = collect_fragments(mmap, self.block.data, &["##SD"])?;
+        if fragments.iter().all(|f| !f.is_compressed()) {
+            return Ok(fragments
+                .into_iter()
+                .map(|f| match f {
+                    Fragment::Raw(r) => r,
+                    Fragment::Dz(_) => unreachable!(),
+                })
+                .collect());
+        }
+        let buf = coalesce(&fragments)?;
+        let _ = self.sd_coalesced.set(buf);
+        Ok(vec![self.sd_coalesced.get().expect("just set").as_slice()])
+    }
 }
 
 impl<'a> RawChannel {
@@ -28,140 +57,44 @@ impl<'a> RawChannel {
     /// An iterator over byte slices containing each raw record, or an
     /// [`MdfError`] if the underlying blocks could not be parsed.
     pub fn records(
-        &self,
+        &'a self,
         data_group: &'a RawDataGroup,
         channel_group: &'a RawChannelGroup,
         mmap: &'a [u8],
     ) -> Result<Box<dyn Iterator<Item = Result<&'a [u8], MdfError>> + 'a>, MdfError> {
-        // 1) VLSD path: channel has its own data pointer => SD/DL chain
+        // 1) VLSD path: channel has its own data pointer => SD chain
+        //    (##SD, ##DL of ##SD, ##HL/##DZ-compressed variants).
         if self.block.channel_type == 1 && self.block.data != 0 {
-            // Capture the file bytes and channel pointer
-            let bytes = mmap;
-            let mut next_addr = self.block.data;
-            let mut data_links = Vec::new();
-            let mut link_idx = 0;
-            let mut current_sdb: Option<SignalDataBlock> = None;
-            let mut sdb_pos = 0;
-            let mut visited_dl: std::collections::HashSet<u64> = std::collections::HashSet::new();
-
-            // Build a from_fn iterator carrying that mutable state
+            let fragments = self.signal_data_fragments(mmap)?;
+            let mut frag_idx = 0usize;
+            let mut pos = 0usize;
             let vlsd_iter = std::iter::from_fn(move || -> Option<Result<&'a [u8], MdfError>> {
                 loop {
-                    // 1) Yield from an open SDBLOCK if any
-                    if let Some(sdb) = &current_sdb {
-                        let buf = sdb.data;
-                        if sdb_pos + 4 <= buf.len() {
-                            let len = u32::from_le_bytes(
-                                buf[sdb_pos..sdb_pos+4].try_into().unwrap()
-                            ) as usize;
-                            let start = sdb_pos + 4;
-                            let end = start + len;
-                            if end > buf.len() {
+                    let buf: &'a [u8] = fragments.get(frag_idx)?;
+                    if pos + 4 <= buf.len() {
+                        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+                        let start = pos + 4;
+                        let end = match start.checked_add(len) {
+                            Some(e) if e <= buf.len() => e,
+                            _ => {
+                                // Poison the iterator so a corrupt entry is
+                                // reported exactly once.
+                                frag_idx = usize::MAX;
                                 return Some(Err(MdfError::TooShortBuffer {
                                     actual:   buf.len(),
-                                    expected: end,
-                                    file:     file!(),
-                                    line:     line!(),
-                                }));
-                            }
-                            let slice = &buf[start..end];
-                            sdb_pos = end;
-                            return Some(Ok(slice));
-                        }
-                        // exhausted
-                        current_sdb = None;
-                    }
-
-                    // 2) Next link in current DL batch?
-                    if link_idx < data_links.len() {
-                        let frag_addr = data_links[link_idx];
-                        link_idx += 1;
-                        if frag_addr == 0 {
-                            continue; // null link
-                        }
-                        let off = frag_addr as usize;
-                        if off >= bytes.len() {
-                            return Some(Err(MdfError::TooShortBuffer {
-                                actual:   bytes.len(),
-                                expected: off.saturating_add(24),
-                                file:     file!(),
-                                line:     line!(),
-                            }));
-                        }
-                        match SignalDataBlock::from_bytes(&bytes[off..]) {
-                            Ok(sdb) => {
-                                // Prepare to yield from it on the next loop
-                                current_sdb = Some(sdb);
-                                sdb_pos = 0;
-                                continue;
-                            }
-                            Err(e) => return Some(Err(e.into())),
-                        }
-                    }
-
-                    // 3) If we have a next_addr, peek its ID to decide what it is
-                    if next_addr != 0 {
-                        // Cycle detection: a chain that revisits an address
-                        // would otherwise loop forever.
-                        if !visited_dl.insert(next_addr) {
-                            return Some(Err(MdfError::BlockLinkError(format!(
-                                "cycle detected in VLSD data chain at address {:#x}",
-                                next_addr
-                            ))));
-                        }
-                        let off = next_addr as usize;
-                        // read the 4-byte ID (bounds-checked)
-                        let id = match bytes.get(off..off.saturating_add(4)) {
-                            Some(id) => id,
-                            None => {
-                                return Some(Err(MdfError::TooShortBuffer {
-                                    actual:   bytes.len(),
-                                    expected: off.saturating_add(4),
+                                    expected: start.saturating_add(len),
                                     file:     file!(),
                                     line:     line!(),
                                 }));
                             }
                         };
-                        match id {
-                            b"##DL" => {
-                                // Data List Block
-                                match DataListBlock::from_bytes(&bytes[off..]) {
-                                    Ok(dl) => {
-                                        data_links = dl.data_links.clone();
-                                        link_idx = 0;
-                                        next_addr = dl.next;
-                                        continue;  // back to loop start
-                                    }
-                                    Err(e) => return Some(Err(e)),
-                                }
-                            }
-                            b"##SD" => {
-                                // Direct Signal Data Block
-                                match SignalDataBlock::from_bytes(&bytes[off..]) {
-                                    Ok(sdb) => {
-                                        current_sdb = Some(sdb);
-                                        sdb_pos = 0;
-                                        next_addr = 0; // no list chain
-                                        continue;
-                                    }
-                                    Err(e) => return Some(Err(e)),
-                                }
-                            }
-                            other => {
-                                // unexpected block type
-                                return Some(Err(MdfError::BlockIDError {
-                                    actual:   String::from_utf8_lossy(other).into(),
-                                    expected: "##DL or ##SD".to_string(),
-                                }));
-                            }
-                        }
+                        pos = end;
+                        return Some(Ok(&buf[start..end]));
                     }
-
-                    // 4) Done
-                    return None;
+                    frag_idx += 1;
+                    pos = 0;
                 }
             });
-
             return Ok(Box::new(vlsd_iter));
         }
 

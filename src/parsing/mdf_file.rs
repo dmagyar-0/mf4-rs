@@ -133,7 +133,7 @@ impl MdfFile {
 
                 let raw_channels: Vec<RawChannel> = channels
                     .into_iter()
-                    .map(|channel_block| RawChannel { block: channel_block })
+                    .map(RawChannel::new)
                     .collect();
 
                 raw_channel_groups.push(RawChannelGroup {
@@ -141,10 +141,7 @@ impl MdfFile {
                     raw_channels,
                 });
             }
-            data_groups.push(RawDataGroup {
-                block: data_group_block,
-                channel_groups: raw_channel_groups,
-            });
+            data_groups.push(RawDataGroup::new(data_group_block, raw_channel_groups));
 
             dg_addr = next_dg_addr;
         }

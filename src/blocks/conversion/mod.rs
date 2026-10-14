@@ -1,6 +1,7 @@
 pub mod base;
 pub mod types;
 pub mod formula;
+pub mod expr;
 pub mod logic;
 pub mod linear;
 pub mod table_lookup;

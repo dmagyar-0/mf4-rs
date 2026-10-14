@@ -112,6 +112,54 @@ impl<'a> ChannelGroup<'a> {
         }))
     }
 
+    /// Index of the first master channel (`channel_type == 2`), if any.
+    pub fn master_index(&self) -> Option<usize> {
+        self.raw_channel_group
+            .raw_channels
+            .iter()
+            .position(|c| c.block.channel_type == 2)
+    }
+
+    /// Decode several channels of this group as physical `f64` in **one
+    /// sweep** over the record data.
+    ///
+    /// `indices` are positions in [`channels`](Self::channels). Semantics per
+    /// channel match [`Channel::values_as_f64`]. Fixed-length channels share
+    /// a single pass (tiled, multi-threaded); VLSD channels fall back to
+    /// their own iterator. Output order follows `indices`.
+    pub fn values_f64_many(&self, indices: &[usize]) -> Result<Vec<Vec<f64>>, MdfError> {
+        let raw = &self.raw_channel_group.raw_channels;
+        if let Some(&bad) = indices.iter().find(|&&i| i >= raw.len()) {
+            return Err(MdfError::BlockSerializationError(format!(
+                "channel index {} out of range ({} channels)",
+                bad,
+                raw.len()
+            )));
+        }
+        let is_vlsd = |i: usize| raw[i].block.channel_type == 1 && raw[i].block.data != 0;
+        let fixed: Vec<usize> = indices.iter().copied().filter(|&i| !is_vlsd(i)).collect();
+        let blocks: Vec<&crate::blocks::channel_block::ChannelBlock> =
+            fixed.iter().map(|&i| &raw[i].block).collect();
+        let mut decoded = crate::parsing::columnar::decode_columns_f64(
+            self.raw_data_group,
+            self.raw_channel_group,
+            &blocks,
+            self.mmap,
+        )?
+        .into_iter();
+
+        let channels = self.channels();
+        let mut out = Vec::with_capacity(indices.len());
+        for &i in indices {
+            if is_vlsd(i) {
+                out.push(channels[i].values_as_f64()?);
+            } else {
+                out.push(decoded.next().expect("one column per fixed channel"));
+            }
+        }
+        Ok(out)
+    }
+
     /// Get the raw data group (for internal use)
     pub fn raw_data_group(&self) -> &RawDataGroup {
         self.raw_data_group
