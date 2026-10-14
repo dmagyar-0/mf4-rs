@@ -111,7 +111,7 @@ impl<'a> Channel<'a> {
             return Ok(out);
         }
 
-        let blocks = self.raw_data_group.data_blocks(self.mmap)?;
+        let blocks = self.raw_data_group.data_blocks_for(self.raw_channel_group, self.mmap)?;
 
         if invalidation_bytes_nr == 0 && !all_invalid {
             // Fast path: no invalidation bytes and no all-invalid flag

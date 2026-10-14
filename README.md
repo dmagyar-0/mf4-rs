@@ -253,6 +253,25 @@ same = mdf["Data"]            # __getitem__ is read()
 # (multi-threaded), instead of one full pass per channel.
 cols = mdf.values_many(["Data", "Speed", "Rpm"])     # {name: ndarray}
 df = mdf.to_dataframe(group="MyGroup")               # all channels, DatetimeIndex
+```
+
+### Bus logging (CAN / CAN FD / Ethernet)
+
+ASAM bus-logging files are supported as written by hardware loggers and by
+python-can / asammdf: composed frame structures (`CAN_DataFrame.ID`,
+`ETH_Frame.DataBytes`, ...), **unsorted** data groups (record-id multiplexed),
+payloads in VLSD channel groups or `##SD` blocks, and `##DZ` compression.
+
+```python
+mdf = mf4_rs.Mdf("drive_log.mf4")
+f = mdf.values_many(["CAN_DataFrame.ID", "CAN_DataFrame.DLC", "CAN_DataFrame.BusChannel"])
+
+# Payloads in Arrow layout: frame i = data[offsets[i]:offsets[i+1]]
+data, offsets = mdf.values_bytes("CAN_DataFrame.DataBytes")
+
+# Logs larger than RAM: stream payloads in windows (O(1) seek)
+for a in range(0, n_frames, 1_000_000):
+    data, offsets = mdf.values_bytes("ETH_Frame.DataBytes", None, a, a + 1_000_000)
 
 # Lazy remote/indexed reads
 index = mf4_rs.MdfIndex.from_file("output.mf4")
@@ -297,10 +316,25 @@ tiled for cache locality and split across threads.
 | `##DZ` (transposed) file, all 500 channels | 1.45 s | 3.42 s |
 | Algebraic conversion, 1M samples | 0.13 s | 0.49 s |
 
+**Bus log larger than RAM** — 9.0 GB unsorted CAN FD + Ethernet log
+(21M frames), 7 GB RAM machine:
+
+| Step | mf4-rs | asammdf |
+|---|---|---|
+| Open | 0.00 s | 31.8 s |
+| First read (CAN ID, DLC, DataLength — demultiplexes the file) | 6.3 s | 1.2 s |
+| Next read (ETH DataLength, EtherType) | 0.07 s | 1.2 s |
+| All 10.5M CAN FD payloads | 0.21 s | 3.2 s |
+| All 8.1 GB of Ethernet payloads, streamed in 1M-frame windows | 9.1 s (≤ 2.4 GB heap) | — (needs > RAM) |
+
 Notes:
-- Compressed data groups are inflated once (in parallel) and cached on the
-  open `Mdf`, so repeat reads are as fast as uncompressed reads; the cost is
-  holding the uncompressed group in memory while the file is open.
+- Compressed and unsorted data groups are decoded once and cached on the open
+  `Mdf`, so repeat reads are as fast as for plain files. Unsorted groups are
+  demultiplexed in a single pass; large VLSD payload streams (e.g. Ethernet)
+  are not copied but read in place.
+- Decoded buffers of 1 GiB or more spill to an unlinked, memory-mapped temp
+  file (`MF4RS_SPILL_BYTES` sets the threshold, `MF4RS_TMPDIR` the location),
+  so multi-GB logs do not need matching RAM.
 - Set `MF4RS_THREADS=1` to force single-threaded decoding.
 - Writing: prefer `write_columns_f64` / `write_columns` (bulk) over
   per-record `write_record`.

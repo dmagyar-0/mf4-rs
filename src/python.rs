@@ -808,6 +808,49 @@ impl PyMDF {
         Ok(dict.into())
     }
 
+    /// Raw bytes of a byte-oriented channel — e.g. bus frame payloads
+    /// (``CAN_DataFrame.DataBytes``, ``ETH_Frame.DataBytes``), MAC
+    /// addresses or strings — as ``(data, offsets)``.
+    ///
+    /// ``data`` is a flat ``numpy.uint8`` array and ``offsets`` an
+    /// ``int64`` array of length ``n + 1``: sample ``i`` is
+    /// ``data[offsets[i]:offsets[i + 1]]`` (Apache Arrow layout). This avoids
+    /// one Python object per frame, which matters for logs with millions of
+    /// frames. For fixed-width channels every sample has the same width, so
+    /// ``data.reshape(n, width)`` gives a 2-D view.
+    ///
+    /// Works for fixed-width channels and VLSD channels (signal-data blocks
+    /// or VLSD channel groups in unsorted logger files). No conversion is
+    /// applied.
+    ///
+    /// Pass ``start`` / ``stop`` (sample indices, like a slice) to read a
+    /// window — e.g. to stream the payloads of a log larger than memory in
+    /// chunks. Seeking is O(1) for fixed-width channels and for payloads of
+    /// unsorted logger files.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    /// group : Optional[str]
+    /// start : Optional[int]
+    /// stop : Optional[int]
+    fn values_bytes(
+        &self,
+        py: Python,
+        name: &str,
+        group: Option<&str>,
+        start: Option<usize>,
+        stop: Option<usize>,
+    ) -> PyResult<PyObject> {
+        let (g, idx) = self.find_group_channel(group, name)?;
+        let (a, z) = (start.unwrap_or(0), stop.unwrap_or(usize::MAX));
+        let (data, offsets) = py.allow_threads(|| g.bytes_column_range(idx, a, z))?;
+        let offsets: Vec<i64> = offsets.into_iter().map(|o| o as i64).collect();
+        let d = PyArray1::from_vec_bound(py, data);
+        let o = PyArray1::from_vec_bound(py, offsets);
+        Ok((d, o).to_object(py))
+    }
+
     /// Read channels of **one** channel group into a ``pandas.DataFrame``
     /// indexed by that group's master/time channel.
     ///

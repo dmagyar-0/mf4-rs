@@ -129,8 +129,20 @@ where
             let cg_comment = read_string_block_via_reader(reader, cg.comment_addr)?;
 
             let mut channels = Vec::new();
-            let mut ch_addr = cg.first_ch_addr;
-            while ch_addr != 0 {
+            // Depth-first over next links and ##CN compositions (structure
+            // members such as CAN_DataFrame.ID), matching the mmap parser.
+            let mut ch_stack = vec![cg.first_ch_addr];
+            let mut ch_visited = std::collections::HashSet::new();
+            while let Some(ch_addr) = ch_stack.pop() {
+                if ch_addr == 0 {
+                    continue;
+                }
+                if !ch_visited.insert(ch_addr) {
+                    return Err(MdfError::BlockLinkError(format!(
+                        "cycle detected in channel linked list at address {:#x}",
+                        ch_addr
+                    )));
+                }
                 let cn_bytes = match reader.read_range(ch_addr, CN_BLOCK_LEN) {
                     Ok(b) => b,
                     Err(e) => {
@@ -146,7 +158,12 @@ where
                     }
                 };
                 let cn = ChannelBlock::from_bytes(&cn_bytes)?;
-                let next_ch_addr = cn.next_ch_addr;
+                ch_stack.push(cn.next_ch_addr);
+                if cn.component_addr != 0
+                    && reader.read_range(cn.component_addr, 4).is_ok_and(|h| h == b"##CN")
+                {
+                    ch_stack.push(cn.component_addr);
+                }
 
                 let name = read_string_block_via_reader(reader, cn.name_addr)?;
                 let unit = read_string_block_via_reader(reader, cn.unit_addr)?;
@@ -161,8 +178,6 @@ where
                     unit,
                     conversion_addr,
                 });
-
-                ch_addr = next_ch_addr;
             }
 
             groups.push(WalkedGroup {

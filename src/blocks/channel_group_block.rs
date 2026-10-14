@@ -144,10 +144,18 @@ impl ChannelGroupBlock {
     /// channel cannot be decoded.
     pub fn read_channels(&mut self, mmap: &[u8]) -> Result<Vec<ChannelBlock>, MdfError> {
         let mut channels = Vec::new();
-        let mut current_ch_addr = self.first_ch_addr;
         let mut visited = std::collections::HashSet::new();
+        // Depth-first walk: a channel, then its composition children
+        // (cn_composition -> ##CN structure members, e.g. CAN_DataFrame.ID),
+        // then its next sibling. Children are flattened into the group in
+        // the same order asammdf lists them. Array compositions (##CA) are
+        // left untouched (the parent stays readable as a byte array).
+        let mut stack = vec![self.first_ch_addr];
 
-        while current_ch_addr != 0 {
+        while let Some(current_ch_addr) = stack.pop() {
+            if current_ch_addr == 0 {
+                continue;
+            }
             if !visited.insert(current_ch_addr) {
                 return Err(MdfError::BlockLinkError(format!(
                     "cycle detected in channel linked list at address {:#x}",
@@ -163,12 +171,25 @@ impl ChannelGroupBlock {
             })?;
             let mut channel = ChannelBlock::from_bytes(bytes)?;
             channel.resolve_conversion(mmap)?;
-            current_ch_addr = channel.next_ch_addr;
+            stack.push(channel.next_ch_addr);
+            if is_cn_block(mmap, channel.component_addr) {
+                stack.push(channel.component_addr);
+            }
             channels.push(channel);
         }
 
         Ok(channels)
     }
+}
+
+/// True if `addr` points at a `##CN` block (structure composition), as
+/// opposed to `##CA` (array) or nothing.
+pub fn is_cn_block(mmap: &[u8], addr: u64) -> bool {
+    addr != 0
+        && usize::try_from(addr)
+            .ok()
+            .and_then(|a| mmap.get(a..a.checked_add(4)?))
+            .is_some_and(|id| id == b"##CN")
 }
 
 impl Default for ChannelGroupBlock {

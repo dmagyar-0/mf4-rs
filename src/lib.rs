@@ -26,6 +26,7 @@ pub mod parsing {
     pub mod source_info;
     pub(crate) mod reader_walk;
     pub mod compression;
+    pub mod owned_bytes;
     pub mod columnar;
 }
 

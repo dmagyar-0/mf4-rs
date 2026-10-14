@@ -10,7 +10,7 @@ use crate::error::MdfError;
 pub struct RawChannel {
     pub block:  ChannelBlock,
     /// Decompressed signal data for VLSD channels stored in `##DZ` blocks.
-    sd_coalesced: OnceLock<Vec<u8>>,
+    sd_coalesced: OnceLock<crate::parsing::owned_bytes::OwnedBytes>,
 }
 
 impl RawChannel {
@@ -23,7 +23,7 @@ impl RawChannel {
     /// compressed, the whole chain is inflated once and cached.
     pub fn signal_data_fragments<'a>(&'a self, mmap: &'a [u8]) -> Result<Vec<&'a [u8]>, MdfError> {
         if let Some(buf) = self.sd_coalesced.get() {
-            return Ok(vec![buf.as_slice()]);
+            return Ok(vec![&buf[..]]);
         }
         let fragments = collect_fragments(mmap, self.block.data, &["##SD"])?;
         if fragments.iter().all(|f| !f.is_compressed()) {
@@ -37,7 +37,7 @@ impl RawChannel {
         }
         let buf = coalesce(&fragments)?;
         let _ = self.sd_coalesced.set(buf);
-        Ok(vec![self.sd_coalesced.get().expect("just set").as_slice()])
+        Ok(vec![&self.sd_coalesced.get().expect("just set")[..]])
     }
 }
 
@@ -65,7 +65,22 @@ impl<'a> RawChannel {
         // 1) VLSD path: channel has its own data pointer => SD chain
         //    (##SD, ##DL of ##SD, ##HL/##DZ-compressed variants).
         if self.block.channel_type == 1 && self.block.data != 0 {
-            let fragments = self.signal_data_fragments(mmap)?;
+            // Unsorted logger files: payloads live in a VLSD channel group;
+            // read them in place via the entry offsets (zero-copy).
+            let fragments = match vlsd_channel_group_index(mmap, self.block.data, data_group)? {
+                Some(gi) => match data_group.vlsd_group(gi, mmap)? {
+                    crate::parsing::raw_data_group::VlsdGroup::Packed(stream) => vec![stream],
+                    crate::parsing::raw_data_group::VlsdGroup::Offsets(src, offsets) => {
+                        let iter = offsets.iter().map(move |&o| {
+                            let o = o as usize;
+                            let len = u32::from_le_bytes(src[o..o + 4].try_into().unwrap()) as usize;
+                            Ok(&src[o + 4..o + 4 + len])
+                        });
+                        return Ok(Box::new(iter));
+                    }
+                },
+                None => self.signal_data_fragments(mmap)?,
+            };
             let mut frag_idx = 0usize;
             let mut pos = 0usize;
             let vlsd_iter = std::iter::from_fn(move || -> Option<Result<&'a [u8], MdfError>> {
@@ -112,7 +127,7 @@ impl<'a> RawChannel {
         }
 
         // Gather all DataBlock fragments (DT, DV or DZ):
-        let blocks = data_group.data_blocks(mmap)?;
+        let blocks = data_group.data_blocks_for(channel_group, mmap)?;
 
         // Build a single iterator that:
         //  - goes block by block
@@ -133,3 +148,29 @@ impl<'a> RawChannel {
     }
 }
 
+
+/// If a VLSD channel's data link points at a `##CG` (MDF 4.1 "VLSD channel
+/// group", used by bus loggers in unsorted data groups), return that group's
+/// index within `data_group`.
+pub(crate) fn vlsd_channel_group_index(
+    mmap: &[u8],
+    addr: u64,
+    data_group: &RawDataGroup,
+) -> Result<Option<usize>, MdfError> {
+    let Some(start) = usize::try_from(addr).ok() else { return Ok(None) };
+    if mmap.get(start..start.saturating_add(4)) != Some(b"##CG".as_slice()) {
+        return Ok(None);
+    }
+    let cg = <crate::blocks::channel_group_block::ChannelGroupBlock as crate::blocks::common::BlockParse>::from_bytes(&mmap[start..])?;
+    data_group
+        .channel_groups
+        .iter()
+        .position(|g| g.block.record_id == cg.record_id && g.block.flags & 0x01 != 0)
+        .map(Some)
+        .ok_or_else(|| {
+            MdfError::BlockSerializationError(format!(
+                "VLSD channel group (record id {}) not found in its data group",
+                cg.record_id
+            ))
+        })
+}

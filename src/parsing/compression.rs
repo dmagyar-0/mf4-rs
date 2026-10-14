@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use crate::blocks::common::{BlockHeader, BlockParse};
 use crate::blocks::data_list_block::DataListBlock;
 use crate::error::MdfError;
+use crate::parsing::owned_bytes::{alloc_zeroed, OwnedBytes};
 
 /// One fragment of a data section.
 #[derive(Debug, Clone, Copy)]
@@ -289,7 +290,7 @@ pub fn untranspose(data: Vec<u8>, cols: usize) -> Vec<u8> {
 /// inflated (or copied) **straight into its final position** — no
 /// intermediate per-fragment buffers, so peak memory is the output size.
 /// Fragments are processed in parallel on native targets.
-pub fn coalesce(fragments: &[Fragment<'_>]) -> Result<Vec<u8>, MdfError> {
+pub fn coalesce(fragments: &[Fragment<'_>]) -> Result<OwnedBytes, MdfError> {
     let mut sizes = Vec::with_capacity(fragments.len());
     for f in fragments {
         sizes.push(match f {
@@ -301,10 +302,10 @@ pub fn coalesce(fragments: &[Fragment<'_>]) -> Result<Vec<u8>, MdfError> {
         .iter()
         .try_fold(0usize, |acc, &n| acc.checked_add(n))
         .ok_or_else(|| MdfError::BlockSerializationError("data section size overflows".into()))?;
-    let mut out = vec![0u8; total];
+    let mut out = alloc_zeroed(total)?;
 
     let mut work: Vec<(Fragment<'_>, &mut [u8])> = Vec::with_capacity(fragments.len());
-    let mut rest: &mut [u8] = &mut out;
+    let mut rest: &mut [u8] = &mut out[..];
     for (f, &n) in fragments.iter().zip(&sizes) {
         let (head, tail) = rest.split_at_mut(n);
         work.push((*f, head));

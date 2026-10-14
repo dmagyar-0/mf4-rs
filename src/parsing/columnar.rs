@@ -319,7 +319,7 @@ pub fn decode_columns_f64(
         return Ok(vec![Vec::new(); channels.len()]);
     }
 
-    let blocks = dg.data_blocks(mmap)?;
+    let blocks = dg.data_blocks_for(cg, mmap)?;
     let mut runs = Vec::with_capacity(blocks.len());
     let mut total = 0usize;
     for b in &blocks {
