@@ -19,8 +19,8 @@ required-features = ["pyo3"]
 [dependencies]
 nom = "8"  # Used for parsing binary MDF data
 byteorder = "1.5"  # Helps with reading binary data
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }  # ##DZ inflate (pure Rust, wasm-friendly)
 memmap2 = "0.9.9"
-meval = "0.2"  # Used for evaluating mathematical expressions
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -53,6 +53,10 @@ pyo3-stub-gen = { version = "0.7", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Spill multi-GB decompressed / demultiplexed buffers to an unlinked temp file.
+tempfile = "3"
 
 [dev-dependencies]
 tiny_http = "0.12"

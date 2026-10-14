@@ -437,6 +437,33 @@ fn parse_lookup_key(key: &Bound<'_, PyAny>) -> PyResult<(String, Option<String>)
 /// seconds added to the file start); otherwise the raw seconds are used. When
 /// `timestamps` is empty (no master, or the channel *is* the master) a default
 /// integer index is used. The series ``name`` is set to the channel name.
+/// Build the index for a timestamp-indexed pandas object: ``None`` when there
+/// is no master, a ``datetime64[ns]`` array when the file has a start time
+/// (computed in Rust, ~35x faster than ``pd.to_timedelta``), otherwise raw
+/// float seconds. Falls back to seconds if anything overflows i64 ns.
+fn build_time_index(py: Python, timestamps: &[f64], start_time_ns: Option<u64>) -> PyObject {
+    if timestamps.is_empty() {
+        return py.None();
+    }
+    let dt_index = start_time_ns.and_then(|start_ns| {
+        let start_i64 = i64::try_from(start_ns).ok()?;
+        let mut ns: Vec<i64> = Vec::with_capacity(timestamps.len());
+        for &t in timestamps {
+            let rel = t * 1e9;
+            if !rel.is_finite() || rel.abs() >= i64::MAX as f64 {
+                return None;
+            }
+            ns.push(start_i64.checked_add(rel.round() as i64)?);
+        }
+        let arr = PyArray1::from_vec_bound(py, ns);
+        arr.call_method1("view", ("datetime64[ns]",)).ok().map(|a| a.to_object(py))
+    });
+    match dt_index {
+        Some(idx) => idx,
+        None => PyArray1::from_vec_bound(py, timestamps.to_vec()).into(),
+    }
+}
+
 fn signal_to_series(
     py: Python,
     pd: &PyObject,
@@ -472,31 +499,7 @@ fn signal_to_series(
             .to_object(py)
     };
 
-    let index: PyObject = if timestamps.is_empty() {
-        py.None()
-    } else {
-        // Fast path: compute absolute nanosecond timestamps in Rust and hand
-        // numpy a datetime64[ns] view — ~35x faster than pd.to_timedelta.
-        // Falls back to raw float seconds if anything overflows i64 range
-        // (e.g. beyond pandas' year-2262 bound).
-        let dt_index = start_time_ns.and_then(|start_ns| {
-            let start_i64 = i64::try_from(start_ns).ok()?;
-            let mut ns: Vec<i64> = Vec::with_capacity(timestamps.len());
-            for &t in timestamps {
-                let rel = t * 1e9;
-                if !rel.is_finite() || rel.abs() >= i64::MAX as f64 {
-                    return None;
-                }
-                ns.push(start_i64.checked_add(rel.round() as i64)?);
-            }
-            let arr = PyArray1::from_vec_bound(py, ns);
-            arr.call_method1("view", ("datetime64[ns]",)).ok().map(|a| a.to_object(py))
-        });
-        match dt_index {
-            Some(idx) => idx,
-            None => PyArray1::from_vec_bound(py, timestamps.to_vec()).into(),
-        }
-    };
+    let index: PyObject = build_time_index(py, timestamps, start_time_ns);
 
     let series_class = pd.getattr(py, "Series")?;
     let series = if index.is_none(py) {
@@ -529,32 +532,100 @@ fn signal_to_series(
 pub struct PyMDF {
     mdf: Box<MDF>,
     path: String,
+    /// Lazily built channel-name lookup (O(1) instead of a linear scan that
+    /// decodes every name's text block on each call).
+    lookup: std::sync::OnceLock<ChannelLookup>,
+}
+
+/// name -> [(group position, channel position)] in file order, plus each
+/// group's name.
+struct ChannelLookup {
+    by_name: HashMap<String, Vec<(usize, usize)>>,
+    group_names: Vec<Option<String>>,
 }
 
 impl PyMDF {
+    fn lookup(&self) -> PyResult<&ChannelLookup> {
+        if let Some(l) = self.lookup.get() {
+            return Ok(l);
+        }
+        let mut by_name: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        let mut group_names = Vec::new();
+        for (gi, g) in self.mdf.channel_groups().iter().enumerate() {
+            group_names.push(g.name()?);
+            for (ci, ch) in g.channels().iter().enumerate() {
+                if let Some(n) = ch.name()? {
+                    by_name.entry(n).or_default().push((gi, ci));
+                }
+            }
+        }
+        let _ = self.lookup.set(ChannelLookup { by_name, group_names });
+        Ok(self.lookup.get().expect("just set"))
+    }
+
+    /// Resolve (optional group, name) to (group position, channel position),
+    /// first match in file order.
+    fn resolve(&self, group: Option<&str>, name: &str) -> PyResult<(usize, usize)> {
+        let l = self.lookup()?;
+        l.by_name
+            .get(name)
+            .and_then(|hits| {
+                hits.iter().copied().find(|&(gi, _)| match group {
+                    None => true,
+                    Some(gn) => l.group_names[gi].as_deref() == Some(gn),
+                })
+            })
+            .ok_or_else(|| {
+                MdfException::new_err(match group {
+                    Some(gn) => format!("Channel '{}' not found in group '{}'", name, gn),
+                    None => format!("Channel '{}' not found", name),
+                })
+            })
+    }
+
     /// Locate a live channel group + channel index by (optional group) name.
     fn find_group_channel<'a>(
         &'a self,
         group: Option<&str>,
         name: &str,
     ) -> PyResult<(crate::api::channel_group::ChannelGroup<'a>, usize)> {
-        for g in self.mdf.channel_groups() {
-            if let Some(gn) = group {
-                if g.name()?.as_deref() != Some(gn) {
-                    continue;
+        let (gi, ci) = self.resolve(group, name)?;
+        let g = self.mdf.channel_groups().into_iter().nth(gi).expect("lookup index valid");
+        Ok((g, ci))
+    }
+
+    /// Decode `names` grouped by channel group, one sweep per group.
+    /// Returns values in the order of `names`.
+    fn decode_many(
+        &self,
+        py: Python,
+        names: &[String],
+        group: Option<&str>,
+    ) -> PyResult<(Vec<(usize, usize)>, Vec<Vec<f64>>)> {
+        let positions: Vec<(usize, usize)> = names
+            .iter()
+            .map(|n| self.resolve(group, n))
+            .collect::<PyResult<_>>()?;
+        let groups = self.mdf.channel_groups();
+        let decoded = py.allow_threads(|| -> Result<Vec<Vec<f64>>, MdfError> {
+            let mut out: Vec<Option<Vec<f64>>> = (0..positions.len()).map(|_| None).collect();
+            let mut by_group: Vec<(usize, Vec<usize>)> = Vec::new();
+            for (k, &(gi, _)) in positions.iter().enumerate() {
+                match by_group.iter_mut().find(|(g, _)| *g == gi) {
+                    Some((_, ks)) => ks.push(k),
+                    None => by_group.push((gi, vec![k])),
                 }
             }
-            let chans = g.channels();
-            for (i, ch) in chans.iter().enumerate() {
-                if ch.name()?.as_deref() == Some(name) {
-                    return Ok((g, i));
+            for (gi, ks) in by_group {
+                let idxs: Vec<usize> = ks.iter().map(|&k| positions[k].1).collect();
+                let cols = groups[gi].values_f64_many(&idxs)?;
+                for (k, col) in ks.into_iter().zip(cols) {
+                    out[k] = Some(col);
                 }
             }
-        }
-        Err(MdfException::new_err(match group {
-            Some(gn) => format!("Channel '{}' not found in group '{}'", name, gn),
-            None => format!("Channel '{}' not found", name),
-        }))
+            Ok(out.into_iter().map(|c| c.expect("every name decoded")).collect())
+        })?;
+        Ok((positions, decoded))
     }
 }
 
@@ -576,7 +647,7 @@ impl PyMDF {
     #[new]
     fn new(path: &str) -> PyResult<Self> {
         let mdf = Box::new(MDF::from_file(path)?);
-        Ok(PyMDF { mdf, path: path.to_string() })
+        Ok(PyMDF { mdf, path: path.to_string(), lookup: std::sync::OnceLock::new() })
     }
 
     /// The file path this reader was opened from.
@@ -713,6 +784,151 @@ impl PyMDF {
         // Decode without holding the GIL so other Python threads can run.
         let values = py.allow_threads(|| g.channels()[idx].values_as_f64())?;
         Ok(PyArray1::from_vec_bound(py, values).into())
+    }
+
+    /// Read many numeric channels at once as ``{name: numpy.float64 array}``.
+    ///
+    /// All requested channels of the same group are decoded in a **single
+    /// sweep** over the record data (multi-threaded), so this is much faster
+    /// than calling :py:meth:`values` in a loop on wide files. Semantics per
+    /// channel match :py:meth:`values` (physical values, ``NaN`` for invalid
+    /// or non-numeric samples).
+    ///
+    /// Parameters
+    /// ----------
+    /// names : list[str]
+    /// group : Optional[str]
+    ///     Restrict name resolution to one group.
+    fn values_many(&self, py: Python, names: Vec<String>, group: Option<&str>) -> PyResult<PyObject> {
+        let (_, cols) = self.decode_many(py, &names, group)?;
+        let dict = pyo3::types::PyDict::new_bound(py);
+        for (n, col) in names.iter().zip(cols) {
+            dict.set_item(n, PyArray1::from_vec_bound(py, col))?;
+        }
+        Ok(dict.into())
+    }
+
+    /// Raw bytes of a byte-oriented channel — e.g. bus frame payloads
+    /// (``CAN_DataFrame.DataBytes``, ``ETH_Frame.DataBytes``), MAC
+    /// addresses or strings — as ``(data, offsets)``.
+    ///
+    /// ``data`` is a flat ``numpy.uint8`` array and ``offsets`` an
+    /// ``int64`` array of length ``n + 1``: sample ``i`` is
+    /// ``data[offsets[i]:offsets[i + 1]]`` (Apache Arrow layout). This avoids
+    /// one Python object per frame, which matters for logs with millions of
+    /// frames. For fixed-width channels every sample has the same width, so
+    /// ``data.reshape(n, width)`` gives a 2-D view.
+    ///
+    /// Works for fixed-width channels and VLSD channels (signal-data blocks
+    /// or VLSD channel groups in unsorted logger files). No conversion is
+    /// applied.
+    ///
+    /// Pass ``start`` / ``stop`` (sample indices, like a slice) to read a
+    /// window — e.g. to stream the payloads of a log larger than memory in
+    /// chunks. Seeking is O(1) for fixed-width channels and for payloads of
+    /// unsorted logger files.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    /// group : Optional[str]
+    /// start : Optional[int]
+    /// stop : Optional[int]
+    fn values_bytes(
+        &self,
+        py: Python,
+        name: &str,
+        group: Option<&str>,
+        start: Option<usize>,
+        stop: Option<usize>,
+    ) -> PyResult<PyObject> {
+        let (g, idx) = self.find_group_channel(group, name)?;
+        let (a, z) = (start.unwrap_or(0), stop.unwrap_or(usize::MAX));
+        let (data, offsets) = py.allow_threads(|| g.bytes_column_range(idx, a, z))?;
+        let offsets: Vec<i64> = offsets.into_iter().map(|o| o as i64).collect();
+        let d = PyArray1::from_vec_bound(py, data);
+        let o = PyArray1::from_vec_bound(py, offsets);
+        Ok((d, o).to_object(py))
+    }
+
+    /// Read channels of **one** channel group into a ``pandas.DataFrame``
+    /// indexed by that group's master/time channel.
+    ///
+    /// One sweep over the record data decodes every column (see
+    /// :py:meth:`values_many`). With ``names=None`` all non-master channels
+    /// of the group are read; then ``group`` is required when the file has
+    /// more than one channel group.
+    ///
+    /// Parameters
+    /// ----------
+    /// names : Optional[list[str]]
+    /// group : Optional[str]
+    ///
+    /// Raises
+    /// ------
+    /// MdfException
+    ///     If the channels span several groups (different time bases), a
+    ///     name is unknown, or pandas is not installed.
+    fn to_dataframe(&self, py: Python, names: Option<Vec<String>>, group: Option<&str>) -> PyResult<PyObject> {
+        let pd = check_pandas_available(py)?;
+        let groups = self.mdf.channel_groups();
+        let names: Vec<String> = match names {
+            Some(n) => n,
+            None => {
+                let gi = match group {
+                    Some(gn) => {
+                        let l = self.lookup()?;
+                        l.group_names
+                            .iter()
+                            .position(|g| g.as_deref() == Some(gn))
+                            .ok_or_else(|| MdfException::new_err(format!("Channel group '{}' not found", gn)))?
+                    }
+                    None if groups.len() == 1 => 0,
+                    None => {
+                        return Err(MdfException::new_err(
+                            "to_dataframe(names=None) needs group= when the file has several channel groups",
+                        ))
+                    }
+                };
+                let g = &groups[gi];
+                let master = g.master_index();
+                let mut v = Vec::new();
+                for (ci, ch) in g.channels().iter().enumerate() {
+                    if Some(ci) == master {
+                        continue;
+                    }
+                    if let Some(n) = ch.name()? {
+                        v.push(n);
+                    }
+                }
+                v
+            }
+        };
+        let (positions, cols) = self.decode_many(py, &names, group)?;
+        let gi = positions.first().map(|p| p.0);
+        if positions.iter().any(|p| Some(p.0) != gi) {
+            return Err(MdfException::new_err(
+                "to_dataframe: channels belong to different channel groups (different time bases); \
+                 pass group= or read the groups separately",
+            ));
+        }
+        let index = match gi {
+            Some(gi) => match groups[gi].master_index() {
+                Some(mi) => {
+                    let ts = py.allow_threads(|| groups[gi].values_f64_many(&[mi]))?;
+                    build_time_index(py, &ts[0], self.mdf.start_time_ns())
+                }
+                None => py.None(),
+            },
+            None => py.None(),
+        };
+        let data = pyo3::types::PyDict::new_bound(py);
+        for (n, col) in names.iter().zip(cols) {
+            data.set_item(n, PyArray1::from_vec_bound(py, col))?;
+        }
+        let kwargs = [("data", data.to_object(py)), ("index", index), ("copy", false.to_object(py))].into_py_dict_bound(py);
+        let df = pd.bind(py).getattr("DataFrame")?.call((), Some(&kwargs))?;
+        Ok(df.into())
     }
 
     /// ``mdf["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).

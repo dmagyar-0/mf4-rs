@@ -249,6 +249,30 @@ series = mdf.read("Data")     # pandas Series with DatetimeIndex
 array = mdf.values("Data")    # numpy float64 array (no pandas needed)
 same = mdf["Data"]            # __getitem__ is read()
 
+# Many channels at once: ONE sweep over the record data per group
+# (multi-threaded), instead of one full pass per channel.
+cols = mdf.values_many(["Data", "Speed", "Rpm"])     # {name: ndarray}
+df = mdf.to_dataframe(group="MyGroup")               # all channels, DatetimeIndex
+```
+
+### Bus logging (CAN / CAN FD / Ethernet)
+
+ASAM bus-logging files are supported as written by hardware loggers and by
+python-can / asammdf: composed frame structures (`CAN_DataFrame.ID`,
+`ETH_Frame.DataBytes`, ...), **unsorted** data groups (record-id multiplexed),
+payloads in VLSD channel groups or `##SD` blocks, and `##DZ` compression.
+
+```python
+mdf = mf4_rs.Mdf("drive_log.mf4")
+f = mdf.values_many(["CAN_DataFrame.ID", "CAN_DataFrame.DLC", "CAN_DataFrame.BusChannel"])
+
+# Payloads in Arrow layout: frame i = data[offsets[i]:offsets[i+1]]
+data, offsets = mdf.values_bytes("CAN_DataFrame.DataBytes")
+
+# Logs larger than RAM: stream payloads in windows (O(1) seek)
+for a in range(0, n_frames, 1_000_000):
+    data, offsets = mdf.values_bytes("ETH_Frame.DataBytes", None, a, a + 1_000_000)
+
 # Lazy remote/indexed reads
 index = mf4_rs.MdfIndex.from_file("output.mf4")
 index.save("output_index.json")
@@ -276,21 +300,51 @@ See [`js/README.md`](js/README.md) for the full API, the writer, remote reads vi
 
 ## Performance
 
-`mf4-rs` is designed for high performance:
-- Use `write_records` for batch operations instead of multiple `write_record` calls
-- Data blocks automatically split when they exceed 4MB to maintain performance
-- Memory-mapped file access minimizes memory usage for large files
-- Channel values are decoded lazily only when accessed
-- **Use indexing for repeated access** to the same files to avoid re-parsing overhead
+Python bindings vs asammdf 8.8.27, Linux x86-64, 2 cores, warm page cache,
+fresh process per measurement, median of 3. `values_many` / `to_dataframe`
+decode all requested channels of a group in **one sweep** over the records,
+tiled for cache locality and split across threads.
 
-*Note: Previous benchmarks have been removed as they are being updated.*
+| Scenario | mf4-rs | asammdf |
+|---|---|---|
+| Open 400 MB file (500 ch) | 0.002 s | 0.39 s |
+| Read 4 × f64 × 1M samples | 0.073 s | 0.49 s |
+| Read 10 of 500 channels (200k samples) | 0.10 s | 0.49 s |
+| Read all 500 channels | 0.44 s | 1.44 s |
+| `to_dataframe`, 500 channels | 0.70 s | 12.4 s |
+| `##DZ` (transposed) file, 10 channels | 1.04 s | 2.19 s |
+| `##DZ` (transposed) file, all 500 channels | 1.45 s | 3.42 s |
+| Algebraic conversion, 1M samples | 0.13 s | 0.49 s |
+
+**Bus log larger than RAM** — 9.0 GB unsorted CAN FD + Ethernet log
+(21M frames), 7 GB RAM machine:
+
+| Step | mf4-rs | asammdf |
+|---|---|---|
+| Open | 0.00 s | 31.8 s |
+| First read (CAN ID, DLC, DataLength — demultiplexes the file) | 6.3 s | 1.2 s |
+| Next read (ETH DataLength, EtherType) | 0.07 s | 1.2 s |
+| All 10.5M CAN FD payloads | 0.21 s | 3.2 s |
+| All 8.1 GB of Ethernet payloads, streamed in 1M-frame windows | 9.1 s (≤ 2.4 GB heap) | — (needs > RAM) |
+
+Notes:
+- Compressed and unsorted data groups are decoded once and cached on the open
+  `Mdf`, so repeat reads are as fast as for plain files. Unsorted groups are
+  demultiplexed in a single pass; large VLSD payload streams (e.g. Ethernet)
+  are not copied but read in place.
+- Decoded buffers of 1 GiB or more spill to an unlinked, memory-mapped temp
+  file (`MF4RS_SPILL_BYTES` sets the threshold, `MF4RS_TMPDIR` the location),
+  so multi-GB logs do not need matching RAM.
+- Set `MF4RS_THREADS=1` to force single-threaded decoding.
+- Writing: prefer `write_columns_f64` / `write_columns` (bulk) over
+  per-record `write_record`.
 
 ## Dependencies
 
 - `nom` - Binary parsing combinators
 - `byteorder` - Endianness handling  
 - `memmap2` - Memory-mapped file I/O
-- `meval` - Mathematical expression evaluation for formula conversions
+- `flate2` (pure-Rust `zlib-rs` backend) - `##DZ` block decompression
 - `thiserror` - Error handling derive macros
 - `serde` / `serde_json` - JSON serialization for the index system
 

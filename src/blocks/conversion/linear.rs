@@ -1,7 +1,6 @@
 use crate::blocks::conversion::base::ConversionBlock;
 use crate::error::MdfError;
 use crate::parsing::decoder::DecodedValue;
-use meval::{Context, eval_str_with_context};
 
 /// Attempts to extract a numeric value from a [`DecodedValue`].
 /// Returns `Some(f64)` if the input is numeric, or `None` otherwise.
@@ -58,13 +57,10 @@ pub fn apply_algebraic(block: &ConversionBlock, value: DecodedValue) -> Result<D
     if let (Some(raw), Some(expr_str)) = (extract_numeric(&value), block.formula.as_ref()) {
         // asammdf compatibility: files converted from MDF3 commonly use `X1`
         // as the variable name; normalize it to `X` before evaluating.
-        let expr = expr_str.replace("X1", "X");
-        let mut ctx = Context::new();
-        ctx.var("X", raw);
-        ctx.var("X1", raw); // bind both spellings so either form evaluates
-        match eval_str_with_context(&expr, ctx) {
-            Ok(res) => Ok(DecodedValue::Float(res)),
-            Err(_) => Ok(DecodedValue::Float(raw)),
+        // Compiled once per thread and cached (see conversion::expr).
+        match super::expr::eval_cached(expr_str, raw) {
+            Some(res) => Ok(DecodedValue::Float(res)),
+            None => Ok(DecodedValue::Float(raw)),
         }
     } else {
         Ok(value)

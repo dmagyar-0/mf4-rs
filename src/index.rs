@@ -1008,6 +1008,13 @@ impl MdfIndex {
             let block_header = crate::blocks::common::BlockHeader::from_bytes(&mmap[byte_offset..byte_offset + 24])?;
 
             match block_header.id.as_str() {
+                "##HL" => {
+                    // Header list: descend into hl_dl_first.
+                    let link = mmap.get(byte_offset + 24..byte_offset + 32).ok_or(MdfError::TooShortBuffer {
+                        actual: mmap.len(), expected: byte_offset + 32, file: file!(), line: line!(),
+                    })?;
+                    current_block_address = u64::from_le_bytes(link.try_into().unwrap());
+                }
                 "##DT" | "##DV" => {
                     // Single contiguous DataBlock
                     let data_block_info = DataBlockInfo {
@@ -1206,6 +1213,10 @@ impl MdfIndex {
                 crate::blocks::common::BlockHeader::from_bytes(&header_bytes)?;
 
             match block_header.id.as_str() {
+                "##HL" => {
+                    let hl = probe_read!(current_block_address, 32);
+                    current_block_address = u64::from_le_bytes(hl[24..32].try_into().unwrap());
+                }
                 "##DT" | "##DV" => {
                     data_blocks.push(DataBlockInfo {
                         file_offset: current_block_address,
@@ -1307,6 +1318,16 @@ impl MdfIndex {
             let header = crate::blocks::common::BlockHeader::from_bytes(&header_bytes)?;
 
             match header.id.as_str() {
+                "##HL" => {
+                    if !visited.insert(current) {
+                        return Err(MdfError::BlockLinkError(format!(
+                            "cycle detected in VLSD header list at address {:#x}",
+                            current
+                        )));
+                    }
+                    let hl = probe_read!(current, 32);
+                    current = u64::from_le_bytes(hl[24..32].try_into().unwrap());
+                }
                 "##SD" => {
                     data_blocks.push(DataBlockInfo {
                         file_offset: current,
@@ -1520,6 +1541,45 @@ impl MdfIndex {
         })
     }
 
+    /// Payload of one data block via a byte-range reader, inflating `##DZ`.
+    fn read_block_payload<R: ByteRangeReader<Error = MdfError>>(
+        reader: &mut R,
+        data_block: &DataBlockInfo,
+    ) -> Result<Vec<u8>, MdfError> {
+        if data_block.is_compressed {
+            let raw = reader.read_range(data_block.file_offset, data_block.size)?;
+            crate::parsing::compression::inflate_dz(&raw)
+        } else {
+            reader.read_range(data_block.file_offset + 24, Self::data_section_size(data_block)?)
+        }
+    }
+
+    /// Payload of one data block from an in-memory file, inflating `##DZ`
+    /// (borrowed when uncompressed).
+    fn block_payload_from_slice<'a>(
+        file_data: &'a [u8],
+        data_block: &DataBlockInfo,
+    ) -> Result<std::borrow::Cow<'a, [u8]>, MdfError> {
+        if data_block.is_compressed {
+            let start = usize::try_from(data_block.file_offset).ok();
+            let end = start.and_then(|s| s.checked_add(usize::try_from(data_block.size).ok()?));
+            let bytes = match (start, end) {
+                (Some(s), Some(e)) if e <= file_data.len() => &file_data[s..e],
+                _ => {
+                    return Err(MdfError::TooShortBuffer {
+                        actual: file_data.len(),
+                        expected: end.unwrap_or(usize::MAX),
+                        file: file!(),
+                        line: line!(),
+                    })
+                }
+            };
+            Ok(std::borrow::Cow::Owned(crate::parsing::compression::inflate_dz(bytes)?))
+        } else {
+            Ok(std::borrow::Cow::Borrowed(Self::slice_data_block(file_data, data_block)?))
+        }
+    }
+
     /// Number of whole records in a data block's data section.
     ///
     /// Errors if the block size underflows the header or if the data section
@@ -1665,9 +1725,8 @@ impl MdfIndex {
         let mut total_records: usize = 0;
         for data_block in &group.data_blocks {
             if data_block.is_compressed {
-                return Err(MdfError::BlockSerializationError(
-                    "Compressed blocks not yet supported in index reader".to_string()
-                ));
+                // Inflated size unknown until read; capacity hint only.
+                continue;
             }
             total_records += Self::records_in_block(data_block, record_size)? as usize;
         }
@@ -1678,8 +1737,7 @@ impl MdfIndex {
         let temp_cb = channel.to_channel_block();
 
         for data_block in &group.data_blocks {
-            let block_data = reader
-                .read_range(data_block.file_offset + 24, Self::data_section_size(data_block)?)?;
+            let block_data = Self::read_block_payload(reader, data_block)?;
             Self::decode_records_to_values(&block_data, record_size, group, conversion, &temp_cb, &mut values)?;
         }
 
@@ -1703,11 +1761,13 @@ impl MdfIndex {
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         // Compressed fragments (either the fixed records or the SD stream) are
         // not decodable yet.
-        if group.data_blocks.iter().any(|b| b.is_compressed)
-            || channel.vlsd_data_blocks.iter().any(|b| b.is_compressed)
-        {
+        // Fixed records may be compressed (inflated on read); offset-addressed
+        // reads into a compressed ##SD stream are not supported yet.
+        if channel.vlsd_data_blocks.iter().any(|b| b.is_compressed) {
             return Err(MdfError::BlockSerializationError(
-                "Compressed blocks not yet supported in index reader".to_string(),
+                "Compressed VLSD signal data (##DZ in the ##SD chain) is not yet supported \
+                 in the index reader; use Mdf for this channel"
+                    .to_string(),
             ));
         }
 
@@ -1779,8 +1839,7 @@ impl MdfIndex {
         let mut values = Vec::with_capacity(total_records.min(1 << 24));
 
         for data_block in &group.data_blocks {
-            let block_data = reader
-                .read_range(data_block.file_offset + 24, Self::data_section_size(data_block)?)?;
+            let block_data = Self::read_block_payload(reader, data_block)?;
             if block_data.len() % record_size != 0 {
                 return Err(MdfError::BlockSerializationError(format!(
                     "data block length {} is not a multiple of the {}-byte record — \
@@ -2561,9 +2620,8 @@ impl MdfIndex {
         let mut total_records: usize = 0;
         for data_block in &group.data_blocks {
             if data_block.is_compressed {
-                return Err(MdfError::BlockSerializationError(
-                    "Compressed blocks not yet supported in index reader".to_string()
-                ));
+                // Inflated size unknown until read; capacity hint only.
+                continue;
             }
             total_records += Self::records_in_block(data_block, record_size)? as usize;
         }
@@ -2577,8 +2635,7 @@ impl MdfIndex {
         let has_conversion = conversion.is_some();
 
         for data_block in &group.data_blocks {
-            let block_data = reader
-                .read_range(data_block.file_offset + 24, Self::data_section_size(data_block)?)?;
+            let block_data = Self::read_block_payload(reader, data_block)?;
             Self::decode_records_to_f64(&block_data, record_size, group, channel, conversion.as_ref(), &temp_cb, linear_coeffs, has_conversion, &mut values)?;
         }
 
@@ -2613,9 +2670,8 @@ impl MdfIndex {
         let mut total_records: usize = 0;
         for data_block in &group.data_blocks {
             if data_block.is_compressed {
-                return Err(MdfError::BlockSerializationError(
-                    "Compressed blocks not yet supported in index reader".to_string()
-                ));
+                // Inflated size unknown until read; capacity hint only.
+                continue;
             }
             total_records += Self::records_in_block(data_block, record_size)? as usize;
         }
@@ -2626,8 +2682,8 @@ impl MdfIndex {
         let temp_cb = channel.to_channel_block();
 
         for data_block in &group.data_blocks {
-            let block_data = Self::slice_data_block(file_data, data_block)?;
-            Self::decode_records_to_values(block_data, record_size, group, conversion.as_ref(), &temp_cb, &mut values)?;
+            let block_data = Self::block_payload_from_slice(file_data, data_block)?;
+            Self::decode_records_to_values(&block_data, record_size, group, conversion.as_ref(), &temp_cb, &mut values)?;
         }
 
         Ok(values)
@@ -2662,9 +2718,8 @@ impl MdfIndex {
         let mut total_records: usize = 0;
         for data_block in &group.data_blocks {
             if data_block.is_compressed {
-                return Err(MdfError::BlockSerializationError(
-                    "Compressed blocks not yet supported in index reader".to_string()
-                ));
+                // Inflated size unknown until read; capacity hint only.
+                continue;
             }
             total_records += Self::records_in_block(data_block, record_size)? as usize;
         }
@@ -2677,8 +2732,8 @@ impl MdfIndex {
         let has_conversion = conversion.is_some();
 
         for data_block in &group.data_blocks {
-            let block_data = Self::slice_data_block(file_data, data_block)?;
-            Self::decode_records_to_f64(block_data, record_size, group, channel, conversion.as_ref(), &temp_cb, linear_coeffs, has_conversion, &mut values)?;
+            let block_data = Self::block_payload_from_slice(file_data, data_block)?;
+            Self::decode_records_to_f64(&block_data, record_size, group, channel, conversion.as_ref(), &temp_cb, linear_coeffs, has_conversion, &mut values)?;
         }
 
         Ok(values)

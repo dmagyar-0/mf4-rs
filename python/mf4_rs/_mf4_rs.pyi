@@ -319,6 +319,78 @@ class Mdf:
         """
         ...
 
+    def values_many(self, names:typing.Sequence[builtins.str], group:typing.Optional[builtins.str]) -> typing.Any:
+        r"""
+        Read many numeric channels at once as ``{name: numpy.float64 array}``.
+        
+        All requested channels of the same group are decoded in a **single
+        sweep** over the record data (multi-threaded), so this is much faster
+        than calling :py:meth:`values` in a loop on wide files. Semantics per
+        channel match :py:meth:`values` (physical values, ``NaN`` for invalid
+        or non-numeric samples).
+        
+        Parameters
+        ----------
+        names : list[str]
+        group : Optional[str]
+            Restrict name resolution to one group.
+        """
+        ...
+
+    def values_bytes(self, name:builtins.str, group:typing.Optional[builtins.str], start:typing.Optional[builtins.int], stop:typing.Optional[builtins.int]) -> typing.Any:
+        r"""
+        Raw bytes of a byte-oriented channel — e.g. bus frame payloads
+        (``CAN_DataFrame.DataBytes``, ``ETH_Frame.DataBytes``), MAC
+        addresses or strings — as ``(data, offsets)``.
+        
+        ``data`` is a flat ``numpy.uint8`` array and ``offsets`` an
+        ``int64`` array of length ``n + 1``: sample ``i`` is
+        ``data[offsets[i]:offsets[i + 1]]`` (Apache Arrow layout). This avoids
+        one Python object per frame, which matters for logs with millions of
+        frames. For fixed-width channels every sample has the same width, so
+        ``data.reshape(n, width)`` gives a 2-D view.
+        
+        Works for fixed-width channels and VLSD channels (signal-data blocks
+        or VLSD channel groups in unsorted logger files). No conversion is
+        applied.
+        
+        Pass ``start`` / ``stop`` (sample indices, like a slice) to read a
+        window — e.g. to stream the payloads of a log larger than memory in
+        chunks. Seeking is O(1) for fixed-width channels and for payloads of
+        unsorted logger files.
+        
+        Parameters
+        ----------
+        name : str
+        group : Optional[str]
+        start : Optional[int]
+        stop : Optional[int]
+        """
+        ...
+
+    def to_dataframe(self, names:typing.Optional[typing.Sequence[builtins.str]], group:typing.Optional[builtins.str]) -> typing.Any:
+        r"""
+        Read channels of **one** channel group into a ``pandas.DataFrame``
+        indexed by that group's master/time channel.
+        
+        One sweep over the record data decodes every column (see
+        :py:meth:`values_many`). With ``names=None`` all non-master channels
+        of the group are read; then ``group`` is required when the file has
+        more than one channel group.
+        
+        Parameters
+        ----------
+        names : Optional[list[str]]
+        group : Optional[str]
+        
+        Raises
+        ------
+        MdfException
+            If the channels span several groups (different time bases), a
+            name is unknown, or pandas is not installed.
+        """
+        ...
+
     def __getitem__(self, key:typing.Any) -> typing.Any:
         r"""
         ``mdf["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).
