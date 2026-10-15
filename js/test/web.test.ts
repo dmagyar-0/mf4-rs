@@ -32,7 +32,7 @@ test(
   { skip: webBuilt ? false : "web build not present (run `npm run build:web`)" },
   async () => {
     const web = await dynamicImport(pathToFileURL(distWeb).href);
-    const { init, Mdf, MdfIndex, BytesRangeSource, FetchRangeSource } = web;
+    const { init, Mdf, MdfIndex, BytesRangeSource, FetchRangeSource, toColumnOriented } = web;
 
     // Feed the wasm bytes directly — Node's fetch cannot load a file:// URL.
     await init({ module_or_path: readFileSync(wasmPath) });
@@ -43,6 +43,13 @@ test(
     const mdf = Mdf.fromBytes(bytes);
     assert.deepEqual(Array.from(mdf.values("Value")), values);
     mdf.dispose();
+
+    // Column-oriented conversion through the web build.
+    const column = toColumnOriented(bytes);
+    assert.equal(column.report.signalGroups, 2);
+    const colMdf = Mdf.fromBytes(column.bytes);
+    assert.deepEqual(Array.from(colMdf.values("Value")), values);
+    colMdf.dispose();
 
     // Index built from bytes, read lazily via an in-memory RangeSource.
     const idx = MdfIndex.fromBytes(bytes);

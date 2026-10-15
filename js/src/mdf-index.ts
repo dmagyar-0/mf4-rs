@@ -384,11 +384,13 @@ export class MdfIndex {
   }
 
   /**
-   * Full data-section byte ranges for the group owning `name`, merged.
+   * Byte ranges of every data block of the group owning `name`, merged.
    *
-   * Returns one span per data-block fragment covering the entire data section
-   * (block bytes minus the 24-byte header); for a VLSD channel the spans of
-   * its `##SD` fragment chain are included too. This is exactly the range set
+   * Returns one span per data-block fragment covering the whole block
+   * (including its 24-byte header, which the decoder verifies); blocks stored
+   * back to back are merged into one span. For a VLSD channel the spans of its
+   * `##SD` fragment chain are included too, and for a column-oriented (MDF 4.2
+   * remote-master) group so are the shared time group's blocks. This is exactly the range set
    * the fragment readers need: `valuesFromFragments`/`readFromFragments`
    * decode whole data sections (all channels interleave per record), so fetch
    * these and pass the fetched fragments straight through — the requested

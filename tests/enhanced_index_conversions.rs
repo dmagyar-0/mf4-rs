@@ -275,6 +275,7 @@ fn test_index_serialization_with_resolved_data() -> Result<(), MdfError> {
         record_count: 1,
         channels: vec![indexed_channel],
         data_blocks: vec![],
+        master_group: None,
     };
     
     let index = MdfIndex {

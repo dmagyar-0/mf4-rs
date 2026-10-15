@@ -52,6 +52,14 @@ export function init(input?: InitInput): Promise<void> {
 export { Mdf } from "./mdf";
 export { MdfIndex, type IndexBuildOptions } from "./mdf-index";
 export { MdfWriter, type RecordValue } from "./mdf-writer";
+export {
+  toColumnOriented,
+  toColumnOrientedStream,
+  type ColumnOptions,
+  type ColumnReport,
+  type SyncByteSource,
+  type SyncByteSink,
+} from "./column";
 
 export {
   FetchRangeSource,

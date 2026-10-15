@@ -408,7 +408,7 @@ fn unsorted_data_group_data_access_errors() {
         let mut block = ChannelGroupBlock::default();
         block.record_id = record_id;
         block.samples_byte_nr = 4;
-        RawChannelGroup { block, raw_channels: Vec::new() }
+        RawChannelGroup { addr: 0, block, raw_channels: Vec::new() }
     };
     let raw_dg = RawDataGroup {
         block: dg,

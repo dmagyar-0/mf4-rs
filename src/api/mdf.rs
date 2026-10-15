@@ -41,10 +41,11 @@ impl MDF {
 
         for raw_data_group in &self.raw.data_groups {
             for raw_channel_group in &raw_data_group.channel_groups {
-                groups.push(ChannelGroup::new(
+                groups.push(ChannelGroup::with_file_groups(
                     raw_data_group,
                     raw_channel_group,
                     &self.raw.mmap,
+                    &self.raw.data_groups,
                 ));
             }
         }
@@ -81,6 +82,25 @@ impl MDF {
     pub fn signal(&self, name: &str) -> Result<Option<crate::signal::Signal>, MdfError> {
         for group in self.channel_groups() {
             if let Some(sig) = group.signal(name)? {
+                return Ok(Some(sig));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Read a channel addressed by group name + channel name as a [`Signal`].
+    ///
+    /// Searches **every** group carrying that name (a column-oriented file has
+    /// one channel group per signal, all sharing the source group's name), so
+    /// this is the reliable way to disambiguate a channel by group.
+    ///
+    /// [`Signal`]: crate::signal::Signal
+    pub fn signal_in(&self, group: &str, name: &str) -> Result<Option<crate::signal::Signal>, MdfError> {
+        for g in self.channel_groups() {
+            if g.name()?.as_deref() != Some(group) {
+                continue;
+            }
+            if let Some(sig) = g.signal(name)? {
                 return Ok(Some(sig));
             }
         }

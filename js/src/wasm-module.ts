@@ -139,6 +139,16 @@ export interface WasmModule {
   MdfIndex: WasmMdfIndexConstructor;
   MdfWriter: WasmMdfWriterConstructor;
   IndexBuilder: WasmIndexBuilderConstructor;
+  /** In-memory column-oriented conversion; returns `{ bytes, report }`. */
+  toColumnOriented(data: Uint8Array, options: unknown): { bytes: Uint8Array; report: unknown };
+  /** Streaming column-oriented conversion over synchronous callbacks;
+   * returns the report. */
+  toColumnOrientedStream(
+    size: number,
+    read: (offset: number, length: number) => Uint8Array,
+    write: (offset: number, bytes: Uint8Array) => void,
+    options: unknown,
+  ): unknown;
 }
 
 let cached: WasmModule | undefined;

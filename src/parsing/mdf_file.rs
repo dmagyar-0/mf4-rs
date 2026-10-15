@@ -120,6 +120,7 @@ impl MdfFile {
                         next_cg_addr
                     )));
                 }
+                let cg_addr = next_cg_addr;
                 let offset = next_cg_addr as usize;
                 let cg_bytes = data.get(offset..).ok_or(MdfError::TooShortBuffer {
                     actual:   data.len(),
@@ -137,6 +138,7 @@ impl MdfFile {
                     .collect();
 
                 raw_channel_groups.push(RawChannelGroup {
+                    addr: cg_addr,
                     block: channel_group_block,
                     raw_channels,
                 });

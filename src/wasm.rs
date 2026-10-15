@@ -172,7 +172,17 @@ fn ranges_to_js(ranges: Vec<(u64, u64)>) -> Result<JsValue, JsError> {
 }
 
 /// Sort and merge overlapping/adjacent byte ranges into a minimal cover.
-fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+fn merge_ranges(ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    merge_ranges_bridging(ranges, 0)
+}
+
+/// Gap between two blocks that is bridged into one span: up to 7 bytes of
+/// 8-byte alignment padding.
+const BLOCK_GAP_BRIDGE: u64 = 7;
+
+/// [`merge_ranges`], additionally joining ranges separated by at most
+/// `bridge` bytes (the gap is fetched along with them).
+fn merge_ranges_bridging(mut ranges: Vec<(u64, u64)>, bridge: u64) -> Vec<(u64, u64)> {
     if ranges.is_empty() {
         return ranges;
     }
@@ -182,7 +192,7 @@ fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
         let end = offset + length;
         if let Some(last) = out.last_mut() {
             let last_end = last.0 + last.1;
-            if offset <= last_end {
+            if offset <= last_end.saturating_add(bridge) {
                 if end > last_end {
                     last.1 = end - last.0;
                 }
@@ -680,12 +690,12 @@ impl WasmMdf {
     #[wasm_bindgen(js_name = read)]
     pub fn read(&self, name: &str, group: Option<String>) -> Result<JsValue, JsError> {
         let signal = match group.as_deref() {
-            Some(gn) => match self.mdf.group(gn) {
-                Some(g) => g.signal(name).map_err(err_to_js)?,
-                None => {
+            Some(gn) => {
+                if self.mdf.group(gn).is_none() {
                     return Err(JsError::new(&format!("Channel group '{}' not found", gn)));
                 }
-            },
+                self.mdf.signal_in(gn, name).map_err(err_to_js)?
+            }
             None => self.mdf.signal(name).map_err(err_to_js)?,
         };
         let signal = signal.ok_or_else(|| {
@@ -734,19 +744,16 @@ impl WasmMdfIndex {
         })
     }
 
-    /// Index of the group's master channel, if any, excluding `c` itself.
-    fn master_index(&self, g: usize, c: usize) -> Option<usize> {
-        let grp = self.index.channel_groups.get(g)?;
-        grp.channels
-            .iter()
-            .position(|ch| ch.is_master())
-            .filter(|&m| m != c)
-    }
 
-    /// Full data-section byte ranges for the group owning `name`.
+    /// Byte ranges covering every data block of the group owning `name`.
     ///
-    /// Returns one `(file_offset + 24, size - 24)` span per `##DT`/`##DV`
-    /// fragment of the owning group (the 24 skips the block header), merged.
+    /// Returns one `(file_offset, size)` span per `##DT`/`##DV` fragment of the
+    /// owning group — the whole block including its 24-byte header, which the
+    /// decoder verifies before decoding — merged, with fragments stored back to
+    /// back (up to 7 bytes of alignment padding apart) bridged into one span,
+    /// so a column-oriented signal comes back as a single span. When the
+    /// group's master lives in another group (MDF 4.2 remote master) that
+    /// group's fragments are included too, so the timestamps decode.
     /// For a VLSD channel the spans of its `##SD` fragment chain are included
     /// as well — the decoder resolves each record's inline offset into that
     /// stream, so its bytes must be fetched alongside the fixed records.
@@ -757,24 +764,33 @@ impl WasmMdfIndex {
         let (g, c) = self.locate(name, group)?;
         let grp = &self.index.channel_groups[g];
         let channel = &grp.channels[c];
+        let remote_master = match self.index.master_location(g, c) {
+            Some((mg, _)) if mg != g => self.index.channel_groups[mg].data_blocks.as_slice(),
+            _ => &[],
+        };
         let mut ranges =
             Vec::with_capacity(grp.data_blocks.len() + channel.vlsd_data_blocks.len());
-        for db in grp.data_blocks.iter().chain(channel.vlsd_data_blocks.iter()) {
+        for db in grp
+            .data_blocks
+            .iter()
+            .chain(channel.vlsd_data_blocks.iter())
+            .chain(remote_master.iter())
+        {
             if db.is_compressed {
                 return Err(JsError::new(
                     "compressed (##DZ) data blocks are not supported for fragment reads",
                 ));
             }
-            let data_len = db.size.checked_sub(24).ok_or_else(|| {
-                JsError::new(&format!(
+            if db.size < 24 {
+                return Err(JsError::new(&format!(
                     "invalid index: data block at offset {} has size {} (smaller than the \
                      24-byte block header)",
                     db.file_offset, db.size
-                ))
-            })?;
-            ranges.push((db.file_offset + 24, data_len));
+                )));
+            }
+            ranges.push((db.file_offset, db.size));
         }
-        Ok(merge_ranges(ranges))
+        Ok(merge_ranges_bridging(ranges, BLOCK_GAP_BRIDGE))
     }
 }
 
@@ -883,16 +899,16 @@ impl WasmMdfIndex {
         let parsed = build_fragment_reader(&ranges, &fragments)?;
         let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new() };
 
-        let mut targets = vec![c];
+        let mut targets = vec![(g, c)];
         if with_master {
-            if let Some(m) = self.master_index(g, c) {
+            if let Some(m) = self.index.master_location(g, c) {
                 targets.push(m);
             }
         }
 
-        for idx in targets {
+        for (tg, idx) in targets {
             let before = reader.misses.len();
-            if let Err(e) = self.index.resolve_channel_conversion(g, idx, &mut reader) {
+            if let Err(e) = self.index.resolve_channel_conversion(tg, idx, &mut reader) {
                 // If this target recorded no gap it is a genuine error, not a
                 // not-yet-fetched abort — surface it.
                 if reader.misses.len() == before {
@@ -939,7 +955,16 @@ impl WasmMdfIndex {
                 name: g.name.clone(),
                 record_count: g.record_count,
                 channel_names: g.channel_names().into_iter().map(String::from).collect(),
-                master_channel: g.master_channel().and_then(|c| c.name.clone()),
+                // A column-oriented (MDF 4.2) signal group reports the shared
+                // time channel it references.
+                master_channel: g
+                    .master_channel()
+                    .or_else(|| {
+                        g.master_group
+                            .and_then(|mg| self.index.channel_groups.get(mg))
+                            .and_then(|mg| mg.master_channel())
+                    })
+                    .and_then(|c| c.name.clone()),
             })
             .collect();
         serde_wasm_bindgen::to_value(&groups).map_err(|e| JsError::new(&e.to_string()))
@@ -1000,11 +1025,13 @@ impl WasmMdfIndex {
         ranges_to_js(ranges)
     }
 
-    /// Full data-section byte ranges for the group owning `name`, merged.
+    /// Byte ranges of every data block of the group owning `name`, merged.
     ///
-    /// Returns one span per data-block fragment covering the entire data
-    /// section (block bytes minus the 24-byte header); for a VLSD channel the
-    /// spans of its `##SD` fragment chain are included too. These are exactly
+    /// Returns one span per data-block fragment covering the whole block
+    /// (including its 24-byte header, which the decoder verifies); blocks
+    /// stored back to back are merged into one span. For a VLSD channel the
+    /// spans of its `##SD` fragment chain are included too, and for an MDF 4.2
+    /// remote-master group so are the shared time group's blocks. These are exactly
     /// the ranges the fragment readers need: `valuesFromFragments` /
     /// `readFromFragments` decode whole data sections (all channels are
     /// interleaved per record), so fetch these and pass the fetched fragments
@@ -1528,4 +1555,166 @@ impl Default for WasmMdfWriter {
     fn default() -> Self {
         WasmMdfWriter::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Column-oriented conversion
+// ---------------------------------------------------------------------------
+
+/// `ColumnOptions` as passed from JS (`{ blockSize, memoryBudget,
+/// readChunkSize, shareIdenticalTime }`, all optional).
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct ColumnOptionsJs {
+    block_size: Option<f64>,
+    memory_budget: Option<f64>,
+    read_chunk_size: Option<f64>,
+    share_identical_time: Option<bool>,
+}
+
+fn column_options(options: JsValue) -> Result<crate::column::ColumnOptions, JsError> {
+    let js: ColumnOptionsJs = if options.is_undefined() || options.is_null() {
+        ColumnOptionsJs::default()
+    } else {
+        serde_wasm_bindgen::from_value(options).map_err(|e| JsError::new(&e.to_string()))?
+    };
+    let d = crate::column::ColumnOptions::default();
+    let size = |v: Option<f64>, what: &str, default: u64| -> Result<u64, JsError> {
+        match v {
+            None => Ok(default),
+            Some(v) => f64_to_u64(Some(v), what),
+        }
+    };
+    Ok(crate::column::ColumnOptions {
+        block_size: size(js.block_size, "blockSize", d.block_size)?,
+        memory_budget: size(js.memory_budget, "memoryBudget", d.memory_budget)?,
+        read_chunk_size: size(js.read_chunk_size, "readChunkSize", d.read_chunk_size)?,
+        share_identical_time: js.share_identical_time.unwrap_or(d.share_identical_time),
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ColumnReportJs {
+    source_groups: usize,
+    time_groups: usize,
+    signal_groups: usize,
+    shared_time_groups: usize,
+    data_blocks: usize,
+    metadata_size: f64,
+    file_size: f64,
+    skipped_channels: Vec<String>,
+}
+
+fn column_report_to_js(r: crate::column::ColumnReport) -> Result<JsValue, JsError> {
+    let js = ColumnReportJs {
+        source_groups: r.source_groups,
+        time_groups: r.time_groups,
+        signal_groups: r.signal_groups,
+        shared_time_groups: r.shared_time_groups,
+        data_blocks: r.data_blocks,
+        metadata_size: r.metadata_size as f64,
+        file_size: r.file_size as f64,
+        skipped_channels: r.skipped_channels,
+    };
+    serde_wasm_bindgen::to_value(&js).map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Convert an in-memory MDF file to a column-oriented MDF 4.20 file
+/// (one signal per channel group, shared time channels, metadata first).
+///
+/// Returns `{ bytes: Uint8Array, report }`. Both the input and the output are
+/// held in memory; use `toColumnOrientedStream` to stream large files.
+#[wasm_bindgen(js_name = toColumnOriented)]
+pub fn to_column_oriented(data: &[u8], options: JsValue) -> Result<JsValue, JsError> {
+    let options = column_options(options)?;
+    let (bytes, report) = crate::column::to_column_oriented_bytes(data, &options).map_err(err_to_js)?;
+    let out = Object::new();
+    Reflect::set(&out, &"bytes".into(), &Uint8Array::from(bytes.as_slice()).into())
+        .map_err(|_| JsError::new("failed to build result object"))?;
+    Reflect::set(&out, &"report".into(), &column_report_to_js(report)?)
+        .map_err(|_| JsError::new("failed to build result object"))?;
+    Ok(out.into())
+}
+
+/// [`ByteRangeReader`] over a synchronous JS callback
+/// `read(offset: number, length: number) => Uint8Array`.
+struct JsCallbackReader<'a> {
+    read: &'a js_sys::Function,
+    size: u64,
+}
+
+impl ByteRangeReader for JsCallbackReader<'_> {
+    type Error = MdfError;
+
+    fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
+        if offset.checked_add(length).is_none_or(|end| end > self.size) {
+            return Err(MdfError::TooShortBuffer {
+                actual: self.size.min(usize::MAX as u64) as usize,
+                expected: offset.saturating_add(length).min(usize::MAX as u64) as usize,
+                file: file!(),
+                line: line!(),
+            });
+        }
+        let result = self
+            .read
+            .call2(&JsValue::NULL, &JsValue::from_f64(offset as f64), &JsValue::from_f64(length as f64))
+            .map_err(|e| MdfError::BlockSerializationError(format!("read callback threw: {:?}", e)))?;
+        let array: Uint8Array = result
+            .dyn_into()
+            .map_err(|_| MdfError::BlockSerializationError("read callback must return a Uint8Array".into()))?;
+        if array.length() as u64 != length {
+            return Err(MdfError::BlockSerializationError(format!(
+                "read callback returned {} bytes for a {}-byte request at offset {}",
+                array.length(),
+                length,
+                offset
+            )));
+        }
+        Ok(array.to_vec())
+    }
+}
+
+/// [`crate::column::ColumnSink`] over a synchronous JS callback
+/// `write(offset: number, bytes: Uint8Array) => void`.
+struct JsCallbackSink<'a> {
+    write: &'a js_sys::Function,
+}
+
+impl crate::column::ColumnSink for JsCallbackSink<'_> {
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), MdfError> {
+        if offset + bytes.len() as u64 > MAX_SAFE_INTEGER {
+            return Err(MdfError::BlockSerializationError("output exceeds Number.MAX_SAFE_INTEGER".into()));
+        }
+        self.write
+            .call2(&JsValue::NULL, &JsValue::from_f64(offset as f64), &Uint8Array::from(bytes).into())
+            .map_err(|e| MdfError::BlockSerializationError(format!("write callback threw: {:?}", e)))?;
+        Ok(())
+    }
+}
+
+/// Streaming column-oriented conversion driven by synchronous callbacks.
+///
+/// `read(offset, length)` must return a `Uint8Array` of exactly `length`
+/// bytes from the source (of `size` bytes); `write(offset, bytes)` must store
+/// `bytes` at absolute position `offset` of the output (positions never
+/// written must read as zero, as in a fresh file). The source is read
+/// sequentially in `readChunkSize` pieces and memory stays bounded by
+/// `memoryBudget`, so arbitrarily large files can be converted, e.g. with
+/// Node's `fs.readSync`/`fs.writeSync` or an OPFS `FileSystemSyncAccessHandle`.
+/// Returns the conversion report.
+#[wasm_bindgen(js_name = toColumnOrientedStream)]
+pub fn to_column_oriented_stream(
+    size: f64,
+    read: &js_sys::Function,
+    write: &js_sys::Function,
+    options: JsValue,
+) -> Result<JsValue, JsError> {
+    let size = f64_to_u64(Some(size), "size")?;
+    let options = column_options(options)?;
+    let mut reader = JsCallbackReader { read, size };
+    let mut sink = JsCallbackSink { write };
+    let report =
+        crate::column::to_column_oriented_with(&mut reader, &mut sink, &options).map_err(err_to_js)?;
+    column_report_to_js(report)
 }

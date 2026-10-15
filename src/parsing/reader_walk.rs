@@ -49,6 +49,8 @@ pub(crate) struct WalkedChannel {
 }
 
 pub(crate) struct WalkedGroup {
+    /// File offset of the `##CG` block (target of MDF 4.2 remote-master links).
+    pub cg_addr: u64,
     pub record_id_len: u8,
     pub data_block_addr: u64,
     pub cg: ChannelGroupBlock,
@@ -122,6 +124,14 @@ where
                     return Err(e);
                 }
             };
+            // An MDF 4.2 `##CG` carrying `cg_cg_master` has a 7th link and is
+            // 112 bytes long; fetch the rest of it when the header says so.
+            let header = ChannelGroupBlock::parse_header(&cg_bytes)?;
+            let cg_bytes = if header.block_len > CG_BLOCK_LEN && header.links_nr > 6 {
+                reader.read_range(cg_addr, header.block_len.min(CG_BLOCK_LEN + 8))?
+            } else {
+                cg_bytes
+            };
             let cg = ChannelGroupBlock::from_bytes(&cg_bytes)?;
             let next_cg_addr = cg.next_cg_addr;
 
@@ -166,6 +176,7 @@ where
             }
 
             groups.push(WalkedGroup {
+                cg_addr,
                 record_id_len: dg.record_id_len,
                 data_block_addr: dg.data_block_addr,
                 cg,

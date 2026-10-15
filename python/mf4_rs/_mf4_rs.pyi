@@ -68,6 +68,45 @@ class ChannelInfo:
         ...
 
 
+class ColumnReport:
+    r"""
+    Summary of a :func:`to_column_oriented` conversion.
+    
+    Attributes
+    ----------
+    source_groups : int
+        Channel groups found in the source file.
+    time_groups : int
+        Time (master) channel groups written. Each is shared by every signal of
+        its source group(s).
+    signal_groups : int
+        Signal channel groups written (one per signal).
+    shared_time_groups : int
+        Source groups whose time axis was byte-identical to an earlier group's
+        and therefore reuse that group's time channel.
+    data_blocks : int
+        Data blocks (``##DV`` / ``##DT`` / ``##SD``) written.
+    metadata_size : int
+        Byte offset where sample data starts. Everything before it is metadata,
+        so fetching this prefix is enough to build an index of the file.
+    file_size : int
+        Size of the output file in bytes.
+    skipped_channels : list[str]
+        Channels that could not be represented as a column, as
+        ``"group/channel: reason"``.
+    """
+    source_groups: builtins.int
+    time_groups: builtins.int
+    signal_groups: builtins.int
+    shared_time_groups: builtins.int
+    data_blocks: builtins.int
+    metadata_size: builtins.int
+    file_size: builtins.int
+    skipped_channels: builtins.list[builtins.str]
+    def __repr__(self) -> builtins.str:
+        ...
+
+
 class DataType:
     r"""
     MDF channel data type descriptor.
@@ -998,6 +1037,56 @@ def merge_files(output:builtins.str, first:builtins.str, second:builtins.str) ->
         Destination path for the merged file.
     first, second : str
         Source file paths. Must be uncompressed MDF 4.10+ files.
+    """
+    ...
+
+def to_column_oriented(input_path:builtins.str, output_path:builtins.str, block_size:typing.Optional[builtins.int], memory_budget:typing.Optional[builtins.int], share_identical_time:typing.Optional[builtins.bool]) -> ColumnReport:
+    r"""
+    Rewrite an MDF 4 file as a column-oriented MDF 4.20 file optimised for
+    reading single signals from cloud storage.
+    
+    Each signal gets its own channel group whose data blocks are written back
+    to back, so one HTTP range request fetches the whole signal. Timestamps are
+    stored once per source group and shared by all its signals through the MDF
+    4.2 *remote master* link (and, with ``share_identical_time``, shared across
+    source groups that have identical time axes). All metadata blocks sit at
+    the front of the file, so building an :class:`MdfIndex` over HTTP needs a
+    single prefix fetch. Raw bytes are copied, never decoded: conversions,
+    units, comments, sources, invalidation bits and VLSD channels carry over.
+    
+    The source is streamed once and memory stays bounded by ``memory_budget``
+    regardless of file size. The GIL is released during the conversion.
+    
+    Parameters
+    ----------
+    input_path : str
+        Path to the source MF4 file (sorted or unsorted, uncompressed).
+    output_path : str
+        Destination path (overwritten); must differ from ``input_path``.
+    block_size : int, optional
+        Target payload size of each data block. Larger signals are split into
+        several equally sized blocks (whole records each), listed by a ``##DL``.
+        Default 4 MiB.
+    memory_budget : int, optional
+        Upper bound for the per-channel write buffers. Default 64 MiB.
+    share_identical_time : bool, optional
+        Default ``True``. Merge byte-identical time axes of different source groups into one
+        time channel group.
+    
+    Returns
+    -------
+    ColumnReport
+    
+    Raises
+    ------
+    MdfException
+        On I/O errors or unsupported input (e.g. compressed ``##DZ`` blocks).
+    
+    Example
+    -------
+    >>> report = mf4_rs.to_column_oriented("recording.mf4", "recording.col.mf4")
+    >>> idx = mf4_rs.MdfIndex.from_url("https://host/recording.col.mf4")
+    >>> speed = idx.read("Speed")   # two range requests: values + time
     """
     ...
 
