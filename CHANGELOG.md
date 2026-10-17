@@ -1,3 +1,8 @@
+## v3.7.0 — 2026-10-17
+
+### Features
+- add streaming column-oriented MDF 4.20 conversion for cloud reads (#94)
+
 ## v3.6.0 — 2026-07-25
 
 ### Features
