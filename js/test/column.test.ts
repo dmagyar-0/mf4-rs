@@ -177,10 +177,12 @@ test("a column file indexes in one range request and reads a signal in at most t
     const n = expected.values.length;
     assert.ok(transferred < 2 * 8 * n + 4096, `${g}/${c}: ${transferred} bytes for ${n} samples`);
   }
-  // values(): the signal's own span only.
+  // values(): the signal's own span only (no shared time channel).
   const before = counter.reads;
+  const beforeBytes = counter.bytes;
   await index.values("Speed", counter, "Engine");
   assert.equal(counter.reads - before, 1);
+  assert.ok(counter.bytes - beforeBytes < 8 * FAST + 4096, `${counter.bytes - beforeBytes} bytes`);
   ref.dispose();
   index.dispose();
 });

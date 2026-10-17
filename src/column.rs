@@ -54,7 +54,13 @@
 //! blocks (rejected with an error). Channels that cannot be represented as a
 //! single column — array (`##CA`) compositions and VLSD channels stored in a
 //! VLSD channel group — are skipped and listed in
-//! [`ColumnReport::skipped_channels`].
+//! [`ColumnReport::skipped_channels`], as are structure (`##CN` composition)
+//! and synchronization channels.
+//!
+//! Not carried over: events (`##EV`), the channel hierarchy (`##CH`),
+//! channel attachment references and bus-event group flags. A group whose
+//! remote master has a different record count is written without a time
+//! axis (noted in [`ColumnReport::skipped_channels`]).
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
@@ -74,6 +80,9 @@ pub const DEFAULT_READ_CHUNK: u64 = 4 * 1024 * 1024;
 
 /// Channel-group flag: the group stores VLSD data for another group's channel.
 const CG_FLAG_VLSD: u16 = 1;
+/// Channel-group flags: bus event / plain bus event group (a property of the
+/// source group's channel set, which a single-column group no longer has).
+const CG_FLAG_BUS_EVENTS: u16 = (1 << 1) | (1 << 2);
 pub use crate::blocks::channel_group_block::CG_FLAG_REMOTE_MASTER;
 const CN_FLAG_ALL_INVALID: u32 = 1;
 const CN_FLAG_INVAL_BIT_VALID: u32 = 1 << 1;
@@ -96,6 +105,10 @@ pub struct ColumnOptions {
     /// Upper bound for the per-channel write buffers in bytes (each channel
     /// gets `memory_budget / channels_in_group`, at least 4 KiB and at most
     /// one block). Default [`DEFAULT_MEMORY_BUDGET`] (64 MiB).
+    ///
+    /// Because of the 4 KiB floor, a data group with more than
+    /// `memory_budget / 4096` channels uses more than `memory_budget`
+    /// (4 KiB per channel).
     pub memory_budget: u64,
     /// Size of each sequential read from the source. Default 4 MiB.
     pub read_chunk_size: u64,
@@ -137,7 +150,8 @@ pub struct ColumnReport {
     /// Total size of the output file in bytes.
     pub file_size: u64,
     /// Channels that could not be represented as a column, as
-    /// `"group/channel: reason"`.
+    /// `"group/channel: reason"` (or `"group: reason"` for a group whose
+    /// remote master had to be dropped).
     pub skipped_channels: Vec<String>,
 }
 
@@ -206,6 +220,15 @@ impl<W: std::io::Write + std::io::Seek> ColumnSink for SeekSink<W> {
         self.pos = Some(offset + bytes.len() as u64);
         Ok(())
     }
+
+    /// Extends the output to `size` up front (by writing its last byte), so
+    /// trailing alignment padding that no block covers is still present.
+    fn set_size(&mut self, size: u64) -> Result<(), MdfError> {
+        if size > 0 {
+            self.write_at(size - 1, &[0])?;
+        }
+        Ok(())
+    }
 }
 
 /// Convert the MDF file at `input` into a column-oriented MDF 4.20 file at
@@ -233,9 +256,13 @@ pub fn to_column_oriented(
     let mut reader = crate::index::FileRangeReader::new(path)?;
     let file = std::fs::File::create(output)?;
     let mut sink = SeekSink::new(std::io::BufWriter::with_capacity(1 << 20, file));
-    let report = to_column_oriented_with(&mut reader, &mut sink, options)?;
-    sink.into_inner()?;
-    Ok(report)
+    let result = to_column_oriented_with(&mut reader, &mut sink, options)
+        .and_then(|report| sink.into_inner().map(|_| report));
+    if result.is_err() {
+        // Best effort: do not leave a partial output file behind.
+        let _ = std::fs::remove_file(output);
+    }
+    result
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -294,6 +321,9 @@ where
         sink.write_at(*addr, bytes)?;
     }
     stream_data(reader, &src, &layout, options, chunk, sink)?;
+    for c in &layout.copies {
+        copy_range(reader, sink, c.from, c.to, c.len, chunk)?;
+    }
 
     report.data_blocks = layout.groups.iter().map(|g| g.n_blocks as usize + usize::from(g.sd_len.is_some())).sum();
     report.metadata_size = layout.metadata_end;
@@ -456,13 +486,19 @@ impl SrcChannel {
         self.channel_type == 3 || self.channel_type == 6
     }
 
-    /// Bytes this channel occupies in a record.
-    fn byte_len(&self) -> u32 {
+    /// Bytes this channel occupies in a record (in `u64`, so corrupt bit
+    /// counts cannot overflow).
+    fn byte_len(&self) -> u64 {
         if self.is_virtual() {
             0
         } else {
-            (self.bit_offset as u32 + self.bit_count).div_ceil(8)
+            (self.bit_offset as u64 + self.bit_count as u64).div_ceil(8)
         }
+    }
+
+    /// Whether the channel's bytes lie inside a record of `samples` data bytes.
+    fn fits(&self, samples: u32) -> bool {
+        self.bit_offset <= 7 && self.byte_offset as u64 + self.byte_len() <= samples as u64
     }
 }
 
@@ -722,17 +758,34 @@ impl Framing {
     }
 
     /// Length of the record at the start of `buf` and its group position, or
-    /// `None` if `buf` does not hold a complete record yet.
-    fn next(&self, buf: &[u8], kind: BlockKind, dv_size: usize) -> Result<Option<(usize, usize, usize, bool)>, MdfError> {
+    /// `None` if `buf` does not hold a complete record yet. `avail` is the
+    /// number of bytes left in the data group counting from the start of
+    /// `buf`; a record that cannot fit in them is an error (a truncated record
+    /// or a corrupt VLSD length), so nothing is ever buffered beyond the data.
+    fn next(
+        &self,
+        buf: &[u8],
+        avail: u64,
+        kind: BlockKind,
+        dv_size: usize,
+    ) -> Result<Option<(usize, usize, usize, bool)>, MdfError> {
+        let need = |len: usize| -> Result<bool, MdfError> {
+            if len as u64 > avail {
+                return Err(err(format!(
+                    "data ends inside a record ({len}-byte record, {avail} bytes left; truncated data or corrupt record length)"
+                )));
+            }
+            Ok(buf.len() >= len)
+        };
         if kind == BlockKind::Dv {
-            return Ok((buf.len() >= dv_size).then_some((dv_size, 0, 0, false)));
+            return Ok(need(dv_size)?.then_some((dv_size, 0, 0, false)));
         }
         if self.sorted {
             let (pos, size, _) = self.by_id[&0];
             let len = self.id_len + size;
-            return Ok((buf.len() >= len).then_some((len, pos, self.id_len, false)));
+            return Ok(need(len)?.then_some((len, pos, self.id_len, false)));
         }
-        if buf.len() < self.id_len {
+        if !need(self.id_len)? {
             return Ok(None);
         }
         let id = match self.id_len {
@@ -746,14 +799,14 @@ impl Framing {
             .get(&id)
             .ok_or_else(|| err(format!("unknown record id {id} in unsorted data group")))?;
         if vlsd {
-            if buf.len() < self.id_len + 4 {
+            if !need(self.id_len + 4)? {
                 return Ok(None);
             }
             let len = self.id_len + 4 + u32_at(buf, self.id_len) as usize;
-            return Ok((buf.len() >= len).then_some((len, pos, self.id_len, true)));
+            return Ok(need(len)?.then_some((len, pos, self.id_len, true)));
         }
         let len = self.id_len + size;
-        Ok((buf.len() >= len).then_some((len, pos, self.id_len, false)))
+        Ok(need(len)?.then_some((len, pos, self.id_len, false)))
     }
 }
 
@@ -805,6 +858,8 @@ where
     };
     let mut pending: Vec<u8> = Vec::new();
     let mut kind = BlockKind::Dt;
+    // Data-group bytes not read yet.
+    let mut unread: u64 = d.blocks.iter().map(|b| b.len).sum();
     for blk in &d.blocks {
         if blk.kind != kind && !pending.is_empty() {
             return Err(err("a record straddles a ##DT/##DV block boundary"));
@@ -815,6 +870,7 @@ where
             let n = (blk.len - off).min(chunk as u64);
             let bytes = reader.read_range(blk.data_offset + off, n)?;
             off += n;
+            unread -= n;
             let buf: &[u8] = if pending.is_empty() {
                 &bytes
             } else {
@@ -822,7 +878,11 @@ where
                 &pending
             };
             let mut pos = 0usize;
-            while let Some((len, gpos, id_len, vlsd)) = framing.next(&buf[pos..], kind, dv_size)? {
+            while pos < buf.len() {
+                let avail = (buf.len() - pos) as u64 + unread;
+                let Some((len, gpos, id_len, vlsd)) = framing.next(&buf[pos..], avail, kind, dv_size)? else {
+                    break;
+                };
                 if !vlsd {
                     f(gpos, &buf[pos + id_len..pos + len])?;
                 }
@@ -913,7 +973,7 @@ where
             if g.is_vlsd_storage() {
                 return None;
             }
-            g.channels.iter().position(|c| c.is_master() && c.byte_offset + c.byte_len() <= g.samples)
+            g.channels.iter().position(|c| c.is_master() && c.fits(g.samples))
         })
         .collect();
 
@@ -934,13 +994,26 @@ where
         if g.is_vlsd_storage() {
             continue;
         }
-        // Which source group provides this group's time axis?
+        // Which source group provides this group's time axis? A remote master
+        // is only usable when it has one sample per record of this group.
         let time_src = match master_of[gi] {
             Some(_) => Some(rep[gi]),
-            None => addr_to_group
-                .get(&g.remote_master_link())
-                .filter(|&&m| master_of[m].is_some())
-                .map(|&m| rep[m]),
+            None => {
+                let remote = addr_to_group.get(&g.remote_master_link()).copied().filter(|&m| master_of[m].is_some());
+                match remote {
+                    Some(m) if src.groups[m].records == g.records => Some(rep[m]),
+                    Some(m) => {
+                        report.skipped_channels.push(format!(
+                            "{}: remote master dropped ({} records, master group has {})",
+                            g.label(),
+                            g.records,
+                            src.groups[m].records
+                        ));
+                        None
+                    }
+                    None => None,
+                }
+            }
         };
         // The time group is written the first time any group needs it.
         let master = time_src.map(|t| {
@@ -952,7 +1025,7 @@ where
                     channel: master_of[t].unwrap(),
                     is_time: true,
                     master: None,
-                    data_bytes: ch.byte_len(),
+                    data_bytes: ch.byte_len() as u32, // fits in the u32 record
                     inval: has_inval(tg, ch),
                     records: tg.records,
                     sd_blocks: Vec::new(),
@@ -967,17 +1040,26 @@ where
                 continue;
             }
             let label = || format!("{}/{}", g.label(), ch.name.as_deref().unwrap_or("<unnamed>"));
+            if !ch.fits(g.samples) {
+                report.skipped_channels.push(format!("{}: lies outside the record", label()));
+                continue;
+            }
             if ch.is_master() {
                 report.skipped_channels.push(format!("{}: additional master channel", label()));
                 continue;
             }
-            if ch.byte_offset as u64 + ch.byte_len() as u64 > g.samples as u64 || ch.bit_offset > 7 {
-                report.skipped_channels.push(format!("{}: lies outside the record", label()));
+            if ch.channel_type == 4 {
+                // Its cn_data link (attachment/stream reference) is not carried over.
+                report.skipped_channels.push(format!("{}: synchronization channels are not supported", label()));
                 continue;
             }
-            if ch.links[1] != 0 && read_header(reader, ch.links[1])?.id == "##CA" {
-                report.skipped_channels.push(format!("{}: array (##CA) channels are not supported", label()));
-                continue;
+            if ch.links[1] != 0 {
+                let id = read_header(reader, ch.links[1])?.id;
+                if id == "##CA" || id == "##CN" {
+                    let kind = if id == "##CA" { "array (##CA)" } else { "structure (##CN composition)" };
+                    report.skipped_channels.push(format!("{}: {kind} channels are not supported", label()));
+                    continue;
+                }
             }
             let mut sd_blocks = Vec::new();
             let mut vlsd = false;
@@ -998,7 +1080,7 @@ where
                 channel: ci,
                 is_time: false,
                 master,
-                data_bytes: ch.byte_len(),
+                data_bytes: ch.byte_len() as u32,
                 inval: has_inval(g, ch),
                 records: g.records,
                 sd_blocks,
@@ -1017,6 +1099,15 @@ fn has_inval(g: &SrcGroup, ch: &SrcChannel) -> bool {
         && (ch.inval_pos / 8) < g.inval_bytes
 }
 
+/// `(byte index in the record after the id, bit mask)` of the channel's
+/// invalidation bit, when it uses one.
+fn inval_bit(g: &SrcGroup, ch: &SrcChannel) -> Option<(usize, u8)> {
+    has_inval(g, ch).then(|| {
+        let bit = ch.inval_pos as usize;
+        (g.samples as usize + bit / 8, 1u8 << (bit % 8))
+    })
+}
+
 /// Point `rep[g]` at the first group whose time axis is byte-identical to
 /// `g`'s. Only groups with the same record count and master layout are
 /// compared, so files without shareable axes pay nothing.
@@ -1030,7 +1121,7 @@ fn merge_identical_time<R>(
 where
     R: ByteRangeReader<Error = MdfError>,
 {
-    type Key = (u64, u8, u8, u8, u32, u32, u32, u64, Vec<u8>);
+    type Key = (u64, u8, u8, u8, u32, u64, u32, u64, Option<String>, bool, Vec<u8>);
     let mut by_key: HashMap<Key, Vec<usize>> = HashMap::new();
     for (g, m) in master_of.iter().enumerate() {
         let Some(m) = *m else { continue };
@@ -1045,6 +1136,8 @@ where
             ch.byte_len(),
             ch.flags,
             ch.links[4], // same conversion block
+            read_string_block_via_reader(reader, ch.links[6])?, // same unit
+            has_inval(grp, ch),
             ch.data[..2].to_vec(),
         );
         by_key.entry(key).or_default().push(g);
@@ -1070,16 +1163,22 @@ where
         }
         let mut hashers: HashMap<usize, ChunkedHasher> =
             targets.iter().map(|&(pos, _)| (pos, ChunkedHasher::default())).collect();
-        let spans: HashMap<usize, (usize, usize)> = targets
+        // (byte offset, byte length, invalidation bit) of each master.
+        type Span = (usize, usize, Option<(usize, u8)>);
+        let spans: HashMap<usize, Span> = targets
             .iter()
             .map(|&(pos, g)| {
-                let ch = &src.groups[g].channels[master_of[g].unwrap()];
-                (pos, (ch.byte_offset as usize, ch.byte_len() as usize))
+                let grp = &src.groups[g];
+                let ch = &grp.channels[master_of[g].unwrap()];
+                (pos, (ch.byte_offset as usize, ch.byte_len() as usize, inval_bit(grp, ch)))
             })
             .collect();
         stream_records(reader, src, dgi, chunk, |pos, rec| {
-            if let (Some(h), Some(&(o, l))) = (hashers.get_mut(&pos), spans.get(&pos)) {
+            if let (Some(h), Some(&(o, l, inval))) = (hashers.get_mut(&pos), spans.get(&pos)) {
                 h.write(&rec[o..o + l]);
+                if let Some((byte, mask)) = inval {
+                    h.write(&[u8::from(rec[byte] & mask != 0)]);
+                }
             }
             Ok(())
         })?;
@@ -1171,8 +1270,8 @@ impl MetaBuf {
     }
 }
 
-/// Deep-copies metadata blocks (`##TX`, `##MD`, `##CC`, `##SI`, `##FH`,
-/// `##AT`), remapping their links; each source block is copied once.
+/// Deep-copies metadata blocks (`##TX`, `##MD`, `##CC`, `##SI`, `##FH`),
+/// remapping their links; each source block is copied once.
 #[derive(Default)]
 struct Copier {
     memo: HashMap<u64, u64>,
@@ -1204,7 +1303,8 @@ impl Copier {
         match &blk.id {
             b"##TX" | b"##MD" | b"##CC" | b"##SI" => {}
             // Chains (`next` links) are walked iteratively by the caller.
-            b"##FH" | b"##AT" => {
+            // (`##AT` blocks are streamed by `copy_attachments` instead.)
+            b"##FH" => {
                 if let Some(next) = blk.links.first_mut() {
                     *next = 0;
                 }
@@ -1221,7 +1321,7 @@ impl Copier {
         Ok(out)
     }
 
-    /// Copy a `next`-linked chain (`##FH`, `##AT`); returns the first and last
+    /// Copy a `next`-linked `##FH` chain; returns the first and last
     /// copied addresses.
     fn copy_chain<R>(&mut self, reader: &mut R, buf: &mut MetaBuf, mut addr: u64) -> Result<(u64, u64), MdfError>
     where
@@ -1274,10 +1374,19 @@ impl PlacedGroup {
     }
 }
 
+/// Source bytes copied verbatim to the output in chunks.
+struct StreamCopy {
+    from: u64,
+    to: u64,
+    len: u64,
+}
+
 struct Layout {
     groups: Vec<PlacedGroup>,
     /// Pre-built metadata to write verbatim: `(address, bytes)`.
     fixed_writes: Vec<(u64, Vec<u8>)>,
+    /// Large payloads (embedded attachments) streamed from the source.
+    copies: Vec<StreamCopy>,
     metadata_end: u64,
     file_size: u64,
 }
@@ -1407,9 +1516,9 @@ where
     }
 
     // Attachments go after the data so they never bloat the metadata prefix.
-    let mut tail = MetaBuf::new(cursor);
-    let (at_first, _) = copier.copy_chain(reader, &mut tail, src.hd.links[3])?;
-    let file_size = align8(tail.end());
+    let mut tail = Vec::new();
+    let mut copies = Vec::new();
+    let (at_first, file_size) = copy_attachments(reader, &mut copier, src.hd.links[3], cursor, &mut tail, &mut copies)?;
 
     // Fill in the structural blocks.
     for (i, (p, a)) in placed.iter().zip(&addrs).enumerate() {
@@ -1424,7 +1533,7 @@ where
         meta.put(a.dg, &assemble(b"##DG", &[next_dg, a.cg, data_link, m.dg_comment], &dg_data));
 
         let mut cg_links = vec![0, a.cn, m.cg_links[0], m.cg_links[1], 0, m.cg_links[2]];
-        let mut flags = g.flags & !(CG_FLAG_VLSD | CG_FLAG_REMOTE_MASTER);
+        let mut flags = g.flags & !(CG_FLAG_VLSD | CG_FLAG_REMOTE_MASTER | CG_FLAG_BUS_EVENTS);
         if let Some(t) = p.out.master {
             cg_links.push(addrs[t].cg);
             flags |= CG_FLAG_REMOTE_MASTER;
@@ -1471,15 +1580,87 @@ where
         ..Default::default()
     };
     let first_dg = addrs.first().map_or(0, |a| a.dg);
-    let hd = assemble(b"##HD", &[first_dg, fh_first, 0, at_first, 0, hd_comment], &src.hd.data);
+    // Always the 104-byte MDF 4 ##HD (32-byte data section): the metadata
+    // region is placed right after it.
+    let mut hd_data = src.hd.data[..src.hd.data.len().min(32)].to_vec();
+    hd_data.resize(32, 0);
+    let hd = assemble(b"##HD", &[first_dg, fh_first, 0, at_first, 0, hd_comment], &hd_data);
 
     let mut fixed_writes = vec![(0, id.to_bytes()?), (64, hd)];
     let MetaBuf { base, buf } = meta;
     fixed_writes.push((base, buf));
-    if !tail.buf.is_empty() {
-        fixed_writes.push((tail.base, tail.buf));
+    fixed_writes.extend(tail);
+    Ok(Layout { groups: placed, fixed_writes, copies, metadata_end, file_size })
+}
+
+/// Size of the fixed part of an `##AT` data section (flags, creator index,
+/// reserved, MD5, original and embedded size) before the embedded payload.
+const AT_FIXED_DATA: u64 = 40;
+
+/// Lay out the `##AT` chain starting at `addr` from output offset `cursor`.
+///
+/// Each attachment's header, links and fixed fields (plus the `##TX`/`##MD`
+/// blocks it references) go to `writes`; its embedded payload, which can be
+/// arbitrarily large, is recorded in `copies` and streamed later. Returns the
+/// first copied attachment's address and the end of the laid-out region.
+fn copy_attachments<R>(
+    reader: &mut R,
+    copier: &mut Copier,
+    mut addr: u64,
+    mut cursor: u64,
+    writes: &mut Vec<(u64, Vec<u8>)>,
+    copies: &mut Vec<StreamCopy>,
+) -> Result<(u64, u64), MdfError>
+where
+    R: ByteRangeReader<Error = MdfError>,
+{
+    let mut first = 0u64;
+    // Index into `writes` of the previous attachment (to patch its `next`).
+    let mut prev: Option<usize> = None;
+    let mut seen = HashSet::new();
+    while addr != 0 && seen.insert(addr) {
+        let header = read_header(reader, addr)?;
+        if header.id != "##AT" {
+            break;
+        }
+        let links_len = header
+            .links_nr
+            .checked_mul(8)
+            .and_then(|l| l.checked_add(HDR))
+            .filter(|&l| header.links_nr >= 4 && l <= header.block_len && l <= MAX_METADATA_BLOCK)
+            .ok_or_else(|| err(format!("##AT block at {addr:#x} has an inconsistent link count")))?;
+        let fixed_len = header.block_len.min(links_len + AT_FIXED_DATA);
+        let mut fixed = reader.read_range(addr, fixed_len)?;
+        let next = u64_at(&fixed, HDR as usize);
+
+        // Referenced metadata (file name, MIME type, comment) first.
+        let mut refs = MetaBuf::new(cursor);
+        fixed[HDR as usize..HDR as usize + 8].copy_from_slice(&0u64.to_le_bytes());
+        for i in 1..header.links_nr as usize {
+            let at = HDR as usize + i * 8;
+            let out = copier.copy(reader, &mut refs, u64_at(&fixed, at))?;
+            fixed[at..at + 8].copy_from_slice(&out.to_le_bytes());
+        }
+        cursor = align8(refs.end());
+        if !refs.buf.is_empty() {
+            writes.push((refs.base, refs.buf));
+        }
+
+        let out = cursor;
+        if let Some(p) = prev {
+            writes[p].1[HDR as usize..HDR as usize + 8].copy_from_slice(&out.to_le_bytes());
+        } else {
+            first = out;
+        }
+        prev = Some(writes.len());
+        writes.push((out, fixed));
+        if header.block_len > fixed_len {
+            copies.push(StreamCopy { from: addr + fixed_len, to: out + fixed_len, len: header.block_len - fixed_len });
+        }
+        cursor = align8(out + header.block_len);
+        addr = next;
     }
-    Ok(Layout { groups: placed, fixed_writes, metadata_end, file_size })
+    Ok((first, cursor))
 }
 
 fn gcd(a: u64, b: u64) -> u64 {
@@ -1573,22 +1754,22 @@ where
     R: ByteRangeReader<Error = MdfError>,
     S: ColumnSink + ?Sized,
 {
+    // Output groups fed by each source group (time groups once, by their
+    // representative source group).
+    let mut by_src: Vec<Vec<&PlacedGroup>> = (0..src.groups.len()).map(|_| Vec::new()).collect();
+    for p in &layout.groups {
+        by_src[p.out.src_group].push(p);
+    }
     for (dgi, d) in src.dgs.iter().enumerate() {
-        // Output groups fed by this data group (time groups once, by their
-        // representative source group).
         let mut streams: Vec<ColumnStream> = Vec::new();
         let mut extracts: Vec<Vec<Extract>> = (0..d.groups.len()).map(|_| Vec::new()).collect();
-        for p in &layout.groups {
-            let Some(pos) = d.groups.iter().position(|&g| g == p.out.src_group) else { continue };
+        for (pos, &p) in d.groups.iter().enumerate().flat_map(|(pos, &g)| by_src[g].iter().map(move |p| (pos, p))) {
             if p.total_bytes == 0 {
                 continue;
             }
             let g = &src.groups[p.out.src_group];
             let ch = &g.channels[p.out.channel];
-            let inval = p.out.inval.then(|| {
-                let bit = ch.inval_pos as usize;
-                (g.samples as usize + bit / 8, 1u8 << (bit % 8))
-            });
+            let inval = if p.out.inval { inval_bit(g, ch) } else { None };
             extracts[pos].push(Extract {
                 stream: streams.len(),
                 offset: ch.byte_offset as usize,
@@ -1629,21 +1810,30 @@ where
 
         // VLSD signal data: copy each channel's ##SD stream verbatim right
         // after its records, so the inline offsets stay valid.
-        for p in &layout.groups {
-            let (Some(sd_len), true) = (p.sd_len, d.groups.contains(&p.out.src_group)) else { continue };
+        for p in d.groups.iter().flat_map(|&g| &by_src[g]) {
+            let Some(sd_len) = p.sd_len else { continue };
             sink.write_at(p.sd_addr, &block_header_bytes(b"##SD", HDR + sd_len, 0))?;
             let mut at = p.sd_addr + HDR;
             for b in &p.out.sd_blocks {
-                let mut off = 0;
-                while off < b.len {
-                    let n = (b.len - off).min(chunk as u64);
-                    let bytes = reader.read_range(b.data_offset + off, n)?;
-                    sink.write_at(at, &bytes)?;
-                    at += n;
-                    off += n;
-                }
+                copy_range(reader, sink, b.data_offset, at, b.len, chunk)?;
+                at += b.len;
             }
         }
+    }
+    Ok(())
+}
+
+/// Copy `len` source bytes at `from` to output offset `to`, `chunk` at a time.
+fn copy_range<R, S>(reader: &mut R, sink: &mut S, from: u64, to: u64, len: u64, chunk: usize) -> Result<(), MdfError>
+where
+    R: ByteRangeReader<Error = MdfError>,
+    S: ColumnSink + ?Sized,
+{
+    let mut off = 0;
+    while off < len {
+        let n = (len - off).min(chunk as u64);
+        sink.write_at(to + off, &reader.read_range(from + off, n)?)?;
+        off += n;
     }
     Ok(())
 }

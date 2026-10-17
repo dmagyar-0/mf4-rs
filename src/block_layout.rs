@@ -502,7 +502,7 @@ impl<'a> Walker<'a> {
             + cg.samples_byte_nr as usize
             + cg.invalidation_bytes_nr as usize;
 
-        let links = vec![
+        let mut links = vec![
             self.make_link("next_cg_addr", cg.next_cg_addr),
             self.make_link("first_ch_addr", cg.first_ch_addr),
             self.make_link("acq_name_addr", cg.acq_name_addr),
@@ -510,6 +510,9 @@ impl<'a> Walker<'a> {
             self.make_link("first_sample_reduction_addr", cg.first_sample_reduction_addr),
             self.make_link("comment_addr", cg.comment_addr),
         ];
+        if cg.header.links_nr >= 7 {
+            links.push(self.make_link("master_cg_addr", cg.master_cg_addr));
+        }
 
         let index = self.cg_counter;
         self.cg_counter += 1;

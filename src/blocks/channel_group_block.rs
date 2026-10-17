@@ -41,8 +41,19 @@ impl BlockParse<'_> for ChannelGroupBlock {
 
         // The data section follows the links; MDF 4.2 appends `cg_cg_master`
         // as a 7th link, shifting it by 8 bytes.
-        let links = header.links_nr.clamp(6, 7) as usize;
-        let d = 24 + links * 8;
+        let d = header
+            .links_nr
+            .checked_mul(8)
+            .and_then(|l| l.checked_add(24))
+            .filter(|&d| header.links_nr >= 6 && d.checked_add(32).is_some_and(|end| end <= header.block_len))
+            .and_then(|d| usize::try_from(d).ok())
+            .ok_or_else(|| {
+                MdfError::BlockSerializationError(format!(
+                    "##CG block has {} links but is {} bytes long",
+                    header.links_nr, header.block_len
+                ))
+            })?;
+        let links = header.links_nr as usize;
         let expected_bytes = d + 32;
         if bytes.len() < expected_bytes {
             return Err(MdfError::TooShortBuffer {
@@ -78,7 +89,10 @@ impl BlockParse<'_> for ChannelGroupBlock {
 }
 impl ChannelGroupBlock {
     
-    /// Serializes the ChannelGroupBlock to bytes according to MDF 4.1 specification.
+    /// Serializes the ChannelGroupBlock to bytes according to MDF 4.1 specification
+    /// (112 bytes with the MDF 4.2 `cg_cg_master` 7th link when
+    /// `master_cg_addr` is set or the block was parsed with 7 links; the
+    /// header's length and link count are derived, not taken from `header`).
     /// 
     /// # Structure (104 bytes total):
     /// - BlockHeader (24 bytes): Standard block header with id="##CG"
@@ -109,19 +123,25 @@ impl ChannelGroupBlock {
             ));
         }
         
+        // The link count follows from `master_cg_addr`: a remote master needs
+        // the MDF 4.2 7th link (112 bytes). A block parsed with 7 links keeps
+        // them (writing a null master link); otherwise it is the 4.1 104 bytes.
         let remote = self.master_cg_addr != 0;
-        let expected_len = if remote { 112 } else { 104 };
-        if self.header.block_len != expected_len {
-            return Err(MdfError::BlockSerializationError(
-                format!("ChannelGroupBlock must have block_len={}, found {}", expected_len, self.header.block_len)
-            ));
-        }
+        let seven = remote || self.header.links_nr >= 7;
+        let expected_len: u64 = if seven { 112 } else { 104 };
+        let header = BlockHeader {
+            id: self.header.id.clone(),
+            reserved0: self.header.reserved0,
+            block_len: expected_len,
+            links_nr: if seven { 7 } else { 6 },
+        };
+        let flags = if remote { self.flags | CG_FLAG_REMOTE_MASTER } else { self.flags & !CG_FLAG_REMOTE_MASTER };
         
         // Create a buffer with exact capacity for efficiency
         let mut buffer = Vec::with_capacity(expected_len as usize);
         
         // 1. Write the block header (24 bytes)
-        buffer.extend_from_slice(&self.header.to_bytes()?);
+        buffer.extend_from_slice(&header.to_bytes()?);
         
         // 2. Write the link addresses (48 bytes total, 6 links at 8 bytes each)
         buffer.extend_from_slice(&self.next_cg_addr.to_le_bytes());           // Next channel group
@@ -130,14 +150,14 @@ impl ChannelGroupBlock {
         buffer.extend_from_slice(&self.acq_source_addr.to_le_bytes());        // Acquisition source
         buffer.extend_from_slice(&self.first_sample_reduction_addr.to_le_bytes()); // Sample reduction
         buffer.extend_from_slice(&self.comment_addr.to_le_bytes());           // Comment
-        if remote {
+        if seven {
             buffer.extend_from_slice(&self.master_cg_addr.to_le_bytes());     // Remote master (4.2)
         }
         
         // 3. Write the data section (32 bytes)
         buffer.extend_from_slice(&self.record_id.to_le_bytes());              // Record ID (8 bytes)
         buffer.extend_from_slice(&self.cycles_nr.to_le_bytes());              // Cycles count (8 bytes)
-        buffer.extend_from_slice(&self.flags.to_le_bytes());                  // Flags (2 bytes)
+        buffer.extend_from_slice(&flags.to_le_bytes());                       // Flags (2 bytes)
         buffer.extend_from_slice(&self.path_separator.to_le_bytes());         // Path separator (2 bytes)
         buffer.extend_from_slice(&self.reserved1.to_le_bytes());              // Reserved (4 bytes)
         buffer.extend_from_slice(&self.samples_byte_nr.to_le_bytes());        // Sample bytes (4 bytes)

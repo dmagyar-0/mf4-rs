@@ -125,10 +125,17 @@ where
                 }
             };
             // An MDF 4.2 `##CG` carrying `cg_cg_master` has a 7th link and is
-            // 112 bytes long; fetch the rest of it when the header says so.
+            // 112 bytes long; fetch the rest of it when the header says so
+            // (links + 32-byte data section, bounded against corrupt counts).
             let header = ChannelGroupBlock::parse_header(&cg_bytes)?;
             let cg_bytes = if header.block_len > CG_BLOCK_LEN && header.links_nr > 6 {
-                reader.read_range(cg_addr, header.block_len.min(CG_BLOCK_LEN + 8))?
+                let len = header.links_nr.min(64) * 8 + 24 + 32;
+                match reader.read_range(cg_addr, header.block_len.min(len)) {
+                    Ok(b) => b,
+                    // A probing miss, handled like the first ##CG read.
+                    Err(_) if reader.is_probing() => break,
+                    Err(e) => return Err(e),
+                }
             } else {
                 cg_bytes
             };

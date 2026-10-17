@@ -619,6 +619,11 @@ impl PyMDF {
     }
 
     /// Find a channel group by name (first match), or ``None``.
+    ///
+    /// In a column-oriented file every signal is its own group named after
+    /// its source group, so this returns only the first of them; use
+    /// ``read(name, group=...)`` / ``values(name, group=...)``, which search
+    /// every group with that name.
     fn group(&self, name: &str) -> PyResult<Option<PyChannelGroupInfo>> {
         for g in self.mdf.channel_groups() {
             if g.name()?.as_deref() == Some(name) {
@@ -1325,6 +1330,11 @@ impl PyMdfIndex {
     }
 
     /// Find a channel group by name (first match), or ``None``.
+    ///
+    /// In a column-oriented file every signal is its own group named after
+    /// its source group, so this returns only the first of them; use
+    /// ``read(name, group=...)`` / ``values(name, group=...)``, which search
+    /// every group with that name.
     fn group(&self, name: &str) -> Option<PyChannelGroupInfo> {
         self.index.group(name).map(PyChannelGroupInfo::from_indexed)
     }

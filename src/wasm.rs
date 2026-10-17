@@ -753,19 +753,20 @@ impl WasmMdfIndex {
     /// back (up to 7 bytes of alignment padding apart) bridged into one span,
     /// so a column-oriented signal comes back as a single span. When the
     /// group's master lives in another group (MDF 4.2 remote master) that
-    /// group's fragments are included too, so the timestamps decode.
+    /// group's fragments are included too when `with_master` is set, so the
+    /// timestamps decode.
     /// For a VLSD channel the spans of its `##SD` fragment chain are included
     /// as well — the decoder resolves each record's inline offset into that
     /// stream, so its bytes must be fetched alongside the fixed records.
     /// This is exactly what the fragment readers need: `valuesFromFragments` /
     /// `readFromFragments` decode whole data sections, not just the requested
     /// channel's columns, so the fragments must cover each full section.
-    fn signal_ranges(&self, name: &str, group: Option<&str>) -> Result<Vec<(u64, u64)>, JsError> {
+    fn signal_ranges(&self, name: &str, group: Option<&str>, with_master: bool) -> Result<Vec<(u64, u64)>, JsError> {
         let (g, c) = self.locate(name, group)?;
         let grp = &self.index.channel_groups[g];
         let channel = &grp.channels[c];
         let remote_master = match self.index.master_location(g, c) {
-            Some((mg, _)) if mg != g => self.index.channel_groups[mg].data_blocks.as_slice(),
+            Some((mg, _)) if with_master && mg != g => self.index.channel_groups[mg].data_blocks.as_slice(),
             _ => &[],
         };
         let mut ranges =
@@ -1031,7 +1032,9 @@ impl WasmMdfIndex {
     /// (including its 24-byte header, which the decoder verifies); blocks
     /// stored back to back are merged into one span. For a VLSD channel the
     /// spans of its `##SD` fragment chain are included too, and for an MDF 4.2
-    /// remote-master group so are the shared time group's blocks. These are exactly
+    /// remote-master group so are the shared time group's blocks — unless
+    /// `withMaster` is `false` (default `true`), which a values-only read
+    /// (`valuesFromFragments`) can pass to skip the time channel. These are exactly
     /// the ranges the fragment readers need: `valuesFromFragments` /
     /// `readFromFragments` decode whole data sections (all channels are
     /// interleaved per record), so fetch these and pass the fetched fragments
@@ -1042,8 +1045,9 @@ impl WasmMdfIndex {
         &self,
         name: &str,
         group: Option<String>,
+        with_master: Option<bool>,
     ) -> Result<JsValue, JsError> {
-        let ranges = self.signal_ranges(name, group.as_deref())?;
+        let ranges = self.signal_ranges(name, group.as_deref(), with_master.unwrap_or(true))?;
         ranges_to_js(ranges)
     }
 
@@ -1051,10 +1055,11 @@ impl WasmMdfIndex {
     /// fragments (invalid / non-numeric samples become `NaN`).
     ///
     /// `ranges` is the `[[offset, length], ...]` array previously returned by
-    /// `byteRanges` / `signalByteRanges`, and `fragments` is the parallel array
-    /// of `Uint8Array` byte blobs fetched for those ranges. The decoder reads
-    /// whole data sections, so the fragments must cover them — pass
-    /// `signalByteRanges` output when in doubt.
+    /// `signalByteRanges`, and `fragments` is the parallel array of
+    /// `Uint8Array` byte blobs fetched for those ranges. The decoder reads
+    /// whole data blocks and verifies each 24-byte block header, so the
+    /// fragments must cover the blocks including their headers (`byteRanges`
+    /// spans do not).
     #[wasm_bindgen(js_name = valuesFromFragments)]
     pub fn values_from_fragments(
         &self,

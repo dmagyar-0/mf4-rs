@@ -309,6 +309,11 @@ class Mdf:
     def group(self, name:builtins.str) -> typing.Optional[GroupInfo]:
         r"""
         Find a channel group by name (first match), or ``None``.
+        
+        In a column-oriented file every signal is its own group named after
+        its source group, so this returns only the first of them; use
+        ``read(name, group=...)`` / ``values(name, group=...)``, which search
+        every group with that name.
         """
         ...
 
@@ -457,6 +462,11 @@ class MdfIndex:
     def group(self, name:builtins.str) -> typing.Optional[GroupInfo]:
         r"""
         Find a channel group by name (first match), or ``None``.
+        
+        In a column-oriented file every signal is its own group named after
+        its source group, so this returns only the first of them; use
+        ``read(name, group=...)`` / ``values(name, group=...)``, which search
+        every group with that name.
         """
         ...
 

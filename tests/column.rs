@@ -322,6 +322,11 @@ fn column_file_structure_and_sharing() -> Result<(), MdfError> {
     // Layout: every non-data block in the metadata prefix; each signal's data
     // blocks back to back.
     let layout = FileLayout::from_file(f.column.to_str().unwrap())?;
+    // Remote-master groups show their 7th link.
+    assert_eq!(
+        layout.blocks.iter().filter(|b| b.links.iter().any(|l| l.name == "master_cg_addr" && l.target != 0)).count(),
+        r.signal_groups - 1, // all but Untimed/Counter
+    );
     let data_ids = ["##DV", "##DT", "##SD"];
     for b in &layout.blocks {
         if data_ids.contains(&b.block_type.as_str()) {
@@ -406,27 +411,40 @@ fn rejects_same_input_and_output() -> Result<(), MdfError> {
 }
 
 #[test]
-fn inconsistent_block_sizes_error_instead_of_decoding_garbage() -> Result<(), MdfError> {
+fn wrong_block_sizes_use_the_header_and_wrong_offsets_error() -> Result<(), MdfError> {
     let f = fixture(&small_blocks())?;
     let path = f.column.to_str().unwrap();
-    let mut index = MdfIndex::from_file(path)?;
+    let index = MdfIndex::from_file(path)?;
+    let expected = index.read_in("Engine", "Speed")?;
     let (g, _) = index
         .channel_groups
         .iter()
         .enumerate()
         .find(|(_, g)| g.data_blocks.len() > 1 && g.channels[0].name.as_deref() == Some("Speed"))
         .unwrap();
-    // Pretend the index derived a wrong size for one fragment.
-    index.channel_groups[g].data_blocks[1].size += 8;
-    for reloaded in [index.clone(), MdfIndex::from_json(&index.to_json()?)?] {
-        let mut reloaded = reloaded;
-        reloaded.set_file(path);
-        let err = reloaded.read_in("Engine", "Speed").unwrap_err();
-        assert!(err.to_string().contains("rebuild the index"), "{err}");
-        // Same through a range reader (the cloud path).
-        let mut bound = reloaded.open(mf4_rs::index::FileRangeReader::new(path)?);
-        assert!(bound.values_in("Engine", "Speed").is_err());
+
+    // A wrong fragment size (e.g. derived from a stale cycle count): the
+    // block header's real length is used, so values are still correct.
+    for delta in [8i64, -8] {
+        let mut wrong = index.clone();
+        let b = &mut wrong.channel_groups[g].data_blocks[1];
+        b.size = (b.size as i64 + delta) as u64;
+        for mut reloaded in [wrong.clone(), MdfIndex::from_json(&wrong.to_json()?)?] {
+            reloaded.set_file(path);
+            assert_eq!(reloaded.read_in("Engine", "Speed")?.values, expected.values, "size {delta:+}");
+            let mut bound = reloaded.open(mf4_rs::index::FileRangeReader::new(path)?);
+            assert_eq!(bound.values_in("Engine", "Speed")?, expected.values, "size {delta:+} (range reader)");
+        }
     }
+
+    // A wrong offset lands on something that is not a data block: error.
+    let mut wrong = index.clone();
+    wrong.channel_groups[g].data_blocks[1].file_offset += 8;
+    wrong.set_file(path);
+    let err = wrong.read_in("Engine", "Speed").unwrap_err();
+    assert!(err.to_string().contains("rebuild the index"), "{err}");
+    let mut bound = wrong.open(mf4_rs::index::FileRangeReader::new(path)?);
+    assert!(bound.values_in("Engine", "Speed").is_err());
     Ok(())
 }
 
@@ -583,9 +601,35 @@ fn cg_data(record_id: u64, cycles: u64, samples: u32) -> Vec<u8> {
     d
 }
 
+/// Variations of [`build_unsorted`] for malformed-input tests.
+struct Unsorted {
+    /// Byte offset of `Fast/Time`.
+    fast_time_offset: u32,
+    /// Bit count of `Fast/A`.
+    a_bits: u32,
+    /// Extra bytes appended to the record stream.
+    trailing: Vec<u8>,
+    /// Add a VLSD storage channel group (record id 3).
+    vlsd_group: bool,
+    /// Embedded attachment payload (`##AT` linked from the header).
+    attachment: Option<Vec<u8>>,
+    /// Add a `##FH` file-history entry.
+    history: bool,
+}
+
+impl Default for Unsorted {
+    fn default() -> Self {
+        Self { fast_time_offset: 0, a_bits: 8, trailing: Vec::new(), vlsd_group: false, attachment: None, history: false }
+    }
+}
+
 /// Unsorted data group (1-byte record ids) holding two channel groups:
 /// `Fast` (id 1: Time f64 + A u8) and `Rare` (id 2: Time f64 + B u32).
 fn build_unsorted() -> Vec<u8> {
+    build_unsorted_with(&Unsorted::default())
+}
+
+fn build_unsorted_with(opts: &Unsorted) -> Vec<u8> {
     let mut f = vec![0u8; 64 + 104];
     f[0..8].copy_from_slice(b"MDF     ");
     f[8..16].copy_from_slice(b"4.10    ");
@@ -602,8 +646,11 @@ fn build_unsorted() -> Vec<u8> {
         raw_block(b"##TX", &[], &d)
     };
     let names: Vec<u64> = ["Fast", "Rare", "Time", "A", "B"].iter().map(|s| push(&mut f, txt(s))).collect();
-    let fast_a = push(&mut f, raw_block(b"##CN", &[0, 0, names[3], 0, 0, 0, 0, 0], &cn_data(0, 0, 0, 8, 8)));
-    let fast_t = push(&mut f, raw_block(b"##CN", &[fast_a, 0, names[2], 0, 0, 0, 0, 0], &cn_data(2, 1, 4, 0, 64)));
+    let fast_a = push(&mut f, raw_block(b"##CN", &[0, 0, names[3], 0, 0, 0, 0, 0], &cn_data(0, 0, 0, 8, opts.a_bits)));
+    let fast_t = push(
+        &mut f,
+        raw_block(b"##CN", &[fast_a, 0, names[2], 0, 0, 0, 0, 0], &cn_data(2, 1, 4, opts.fast_time_offset, 64)),
+    );
     let rare_b = push(&mut f, raw_block(b"##CN", &[0, 0, names[4], 0, 0, 0, 0, 0], &cn_data(0, 0, 0, 8, 32)));
     let rare_t = push(&mut f, raw_block(b"##CN", &[rare_b, 0, names[2], 0, 0, 0, 0, 0], &cn_data(2, 1, 4, 0, 64)));
 
@@ -623,15 +670,41 @@ fn build_unsorted() -> Vec<u8> {
             fast += 1;
         }
     }
-    let rare_cg = push(&mut f, raw_block(b"##CG", &[0, rare_t, names[1], 0, 0, 0], &cg_data(2, rare, 12)));
+    records.extend_from_slice(&opts.trailing);
+    let vlsd_cg = if opts.vlsd_group {
+        let mut d = cg_data(3, 0, 0);
+        d[16] = 1; // VLSD channel group
+        push(&mut f, raw_block(b"##CG", &[0, 0, 0, 0, 0, 0], &d))
+    } else {
+        0
+    };
+    let rare_cg = push(&mut f, raw_block(b"##CG", &[vlsd_cg, rare_t, names[1], 0, 0, 0], &cg_data(2, rare, 12)));
     let fast_cg = push(&mut f, raw_block(b"##CG", &[rare_cg, fast_t, names[0], 0, 0, 0], &cg_data(1, fast, 9)));
     let dt = push(&mut f, raw_block(b"##DT", &[], &records));
     let mut dg_data = vec![1u8];
     dg_data.extend_from_slice(&[0; 7]);
     let dg = push(&mut f, raw_block(b"##DG", &[0, fast_cg, dt, 0], &dg_data));
+    let fh = if opts.history {
+        let md = push(&mut f, txt("<FHcomment><TX>source history</TX></FHcomment>"));
+        push(&mut f, raw_block(b"##FH", &[0, md], &[0; 16]))
+    } else {
+        0
+    };
+    let at = match &opts.attachment {
+        Some(payload) => {
+            let name = push(&mut f, txt("data.bin"));
+            let mut d = vec![0u8; 40];
+            d[0] = 1; // embedded
+            d[24..32].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+            d[32..40].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+            d.extend_from_slice(payload);
+            push(&mut f, raw_block(b"##AT", &[0, name, 0, 0], &d))
+        }
+        None => 0,
+    };
     let mut hd_data = vec![0u8; 32];
     hd_data[0..8].copy_from_slice(&1_700_000_000_000_000_000u64.to_le_bytes());
-    let hd = raw_block(b"##HD", &[dg, 0, 0, 0, 0, 0], &hd_data);
+    let hd = raw_block(b"##HD", &[dg, fh, 0, at, 0, 0], &hd_data);
     f[64..64 + 104].copy_from_slice(&hd);
     f
 }
@@ -663,6 +736,247 @@ fn compressed_input_is_rejected_cleanly() {
     bytes[pos + 3] = b'Z';
     let err = to_column_oriented_bytes(&bytes, &ColumnOptions::default()).unwrap_err();
     assert!(err.to_string().contains("compressed"), "{err}");
+}
+
+#[test]
+fn malformed_channel_offsets_are_skipped_not_panicking() -> Result<(), MdfError> {
+    // Byte offset / bit count near u32::MAX used to overflow the range check.
+    let bytes = build_unsorted_with(&Unsorted { fast_time_offset: 0xFFFF_FFF8, a_bits: u32::MAX, ..Default::default() });
+    let (out, report) = to_column_oriented_bytes(&bytes, &ColumnOptions::default())?;
+    let skipped = report.skipped_channels.join("\n");
+    assert!(skipped.contains("Fast/Time: lies outside the record"), "{skipped}");
+    assert!(skipped.contains("Fast/A: lies outside the record"), "{skipped}");
+    let mdf = MDF::from_bytes(out)?;
+    assert_eq!(mdf.signal_in("Rare", "B")?.unwrap().values.len(), 10);
+    Ok(())
+}
+
+#[test]
+fn truncated_records_and_corrupt_vlsd_lengths_error() {
+    // A partial record at the end of the data.
+    let bytes = build_unsorted_with(&Unsorted { trailing: vec![1, 0, 0], ..Default::default() });
+    let err = to_column_oriented_bytes(&bytes, &ColumnOptions::default()).unwrap_err();
+    assert!(err.to_string().contains("inside a record"), "{err}");
+    // A VLSD record claiming ~4 GiB: an error, not an attempt to buffer it.
+    let bytes = build_unsorted_with(&Unsorted {
+        trailing: vec![3, 0xff, 0xff, 0xff, 0xff, 1, 2, 3],
+        vlsd_group: true,
+        ..Default::default()
+    });
+    let err = to_column_oriented_bytes(&bytes, &ColumnOptions::default()).unwrap_err();
+    assert!(err.to_string().contains("inside a record"), "{err}");
+}
+
+#[test]
+fn attachments_and_history_are_copied_and_file_size_is_exact() -> Result<(), MdfError> {
+    // Odd-sized payload larger than one read chunk, so the file ends unaligned
+    // and the payload is streamed in several pieces.
+    let payload: Vec<u8> = (0..200_003u32).map(|i| (i % 251) as u8).collect();
+    let source = build_unsorted_with(&Unsorted { attachment: Some(payload.clone()), history: true, ..Default::default() });
+    let dir = tempfile::tempdir()?;
+    let (input, output) = (dir.path().join("in.mf4"), dir.path().join("out.mf4"));
+    std::fs::write(&input, &source)?;
+    let options = ColumnOptions { read_chunk_size: 64 * 1024, ..Default::default() };
+    let report = to_column_oriented(&input, &output, &options)?;
+    let out = std::fs::read(&output)?;
+    assert_eq!(out.len() as u64, report.file_size, "on-disk size matches the report");
+    let (mem, mem_report) = to_column_oriented_bytes(&source, &options)?;
+    assert_eq!(mem.len() as u64, mem_report.file_size);
+    assert_eq!(mem.len(), out.len());
+
+    let u64_at = |o: u64| u64::from_le_bytes(out[o as usize..o as usize + 8].try_into().unwrap());
+    // ##HD is always 104 bytes.
+    assert_eq!(&out[64..68], b"##HD");
+    assert_eq!(u64_at(72), 104);
+    // History: the source entry, then ours.
+    let fh = u64_at(64 + 24 + 8);
+    assert_eq!(&out[fh as usize..fh as usize + 4], b"##FH");
+    let ours = u64_at(fh + 24);
+    assert_eq!(&out[ours as usize..ours as usize + 4], b"##FH");
+    assert_eq!(u64_at(ours + 24), 0);
+    // Attachment: header, links and payload intact.
+    let at = u64_at(64 + 24 + 24);
+    assert_eq!(&out[at as usize..at as usize + 4], b"##AT");
+    assert!(at >= report.metadata_size, "attachments go after the data");
+    let name = u64_at(at + 24 + 8);
+    assert_eq!(&out[name as usize + 24..name as usize + 32], b"data.bin");
+    let data = (at + 24 + 4 * 8 + 40) as usize;
+    assert_eq!(&out[data..data + payload.len()], &payload[..]);
+    assert_eq!(u64_at(at + 8), (24 + 4 * 8 + 40 + payload.len()) as u64);
+    // Still a valid file.
+    MDF::from_bytes(out)?.signal_in("Fast", "A")?.unwrap();
+    Ok(())
+}
+
+#[test]
+fn failed_conversion_removes_the_partial_output() -> Result<(), MdfError> {
+    let dir = tempfile::tempdir()?;
+    let (input, output) = (dir.path().join("in.mf4"), dir.path().join("out.mf4"));
+    std::fs::write(&input, build_unsorted_with(&Unsorted { trailing: vec![1], ..Default::default() }))?;
+    assert!(to_column_oriented(&input, &output, &ColumnOptions::default()).is_err());
+    assert!(!output.exists());
+    Ok(())
+}
+
+/// Sorted 4.20 source with three data groups:
+/// * `T` — Time (f64, unit "s"), bus-event flag set
+/// * `U` — Time (f64, unit `u_unit`, same timestamps as T), V (u8)
+/// * `S` — no local master, remote master → T's group; X (u8), Y (sync
+///   channel), Z (u16 structure with a ##CN child); `s_records` records
+///
+/// The header carries a 40-byte data section (longer than MDF 4's 32).
+fn build_remote(u_unit: &str, s_records: u64) -> Vec<u8> {
+    const N: u64 = 10;
+    let mut f = vec![0u8; 64 + 24 + 48 + 40];
+    f[0..8].copy_from_slice(b"MDF     ");
+    f[8..16].copy_from_slice(b"4.20    ");
+    f[16..24].copy_from_slice(b"handmade");
+    f[28..30].copy_from_slice(&420u16.to_le_bytes());
+    let push = |f: &mut Vec<u8>, b: Vec<u8>| -> u64 {
+        let at = f.len() as u64;
+        f.extend_from_slice(&b);
+        at
+    };
+    let txt = |s: &str| {
+        let mut d = s.as_bytes().to_vec();
+        d.push(0);
+        raw_block(b"##TX", &[], &d)
+    };
+    let tx: Vec<u64> = ["T", "U", "S", "Time", "s", u_unit, "V", "X", "Y", "Z", "Zc"]
+        .iter()
+        .map(|s| push(&mut f, txt(s)))
+        .collect();
+    let cn = |links: [u64; 8], d: Vec<u8>| raw_block(b"##CN", &links, &d);
+
+    let t_time = push(&mut f, cn([0, 0, tx[3], 0, 0, 0, tx[4], 0], cn_data(2, 1, 4, 0, 64)));
+    let mut d = cg_data(0, N, 8);
+    d[16] = 0b10; // bus event group
+    let cg_t = push(&mut f, raw_block(b"##CG", &[0, t_time, tx[0], 0, 0, 0], &d));
+    let times: Vec<u8> = (0..N).flat_map(|i| (i as f64 * 0.1).to_le_bytes()).collect();
+    let dt_t = push(&mut f, raw_block(b"##DT", &[], &times));
+
+    let u_v = push(&mut f, cn([0, 0, tx[6], 0, 0, 0, 0, 0], cn_data(0, 0, 0, 8, 8)));
+    let u_time = push(&mut f, cn([u_v, 0, tx[3], 0, 0, 0, tx[5], 0], cn_data(2, 1, 4, 0, 64)));
+    let cg_u = push(&mut f, raw_block(b"##CG", &[0, u_time, tx[1], 0, 0, 0], &cg_data(0, N, 9)));
+    let recs: Vec<u8> = (0..N).flat_map(|i| [(i as f64 * 0.1).to_le_bytes().to_vec(), vec![i as u8]].concat()).collect();
+    let dt_u = push(&mut f, raw_block(b"##DT", &[], &recs));
+
+    let zc = push(&mut f, cn([0, 0, tx[10], 0, 0, 0, 0, 0], cn_data(0, 0, 0, 2, 8)));
+    let s_z = push(&mut f, cn([0, zc, tx[9], 0, 0, 0, 0, 0], cn_data(0, 0, 0, 2, 16)));
+    let s_y = push(&mut f, cn([s_z, 0, tx[8], 0, 0, 0, 0, 0], cn_data(4, 1, 0, 1, 8)));
+    let s_x = push(&mut f, cn([s_y, 0, tx[7], 0, 0, 0, 0, 0], cn_data(0, 0, 0, 0, 8)));
+    let mut d = cg_data(0, s_records, 4);
+    d[16] = 0b1000; // remote master
+    let cg_s = push(&mut f, raw_block(b"##CG", &[0, s_x, tx[2], 0, 0, 0, cg_t], &d));
+    let recs: Vec<u8> = (0..s_records).flat_map(|i| [i as u8 + 100, 0, 0, 0]).collect();
+    let dt_s = push(&mut f, raw_block(b"##DT", &[], &recs));
+
+    let dg_s = push(&mut f, raw_block(b"##DG", &[0, cg_s, dt_s, 0], &[0; 8]));
+    let dg_u = push(&mut f, raw_block(b"##DG", &[dg_s, cg_u, dt_u, 0], &[0; 8]));
+    let dg_t = push(&mut f, raw_block(b"##DG", &[dg_u, cg_t, dt_t, 0], &[0; 8]));
+    let mut hd_data = vec![0u8; 40];
+    hd_data[0..8].copy_from_slice(&1_700_000_000_000_000_000u64.to_le_bytes());
+    let hd = raw_block(b"##HD", &[dg_t, 0, 0, 0, 0, 0], &hd_data);
+    f[64..64 + hd.len()].copy_from_slice(&hd);
+    f
+}
+
+#[test]
+fn remote_master_structure_and_sync_channels() -> Result<(), MdfError> {
+    let (out, report) = to_column_oriented_bytes(&build_remote("s", 10), &ColumnOptions::default())?;
+    // T and U share a time axis; S reuses T's through its remote master.
+    assert_eq!(report.time_groups, 1, "{report:?}");
+    assert_eq!(report.shared_time_groups, 1, "{report:?}");
+    assert_eq!(report.signal_groups, 2, "{report:?}");
+    let skipped = report.skipped_channels.join("\n");
+    assert!(skipped.contains("S/Y: synchronization"), "{skipped}");
+    assert!(skipped.contains("S/Z: structure"), "{skipped}");
+    assert_eq!(report.skipped_channels.len(), 2, "{skipped}");
+    // ##HD written as the 104-byte MDF 4 block.
+    assert_eq!(u64::from_le_bytes(out[72..80].try_into().unwrap()), 104);
+
+    let mdf = MDF::from_bytes(out)?;
+    assert_eq!(mdf.start_time_ns(), Some(1_700_000_000_000_000_000));
+    let x = mdf.signal_in("S", "X")?.unwrap();
+    assert_eq!(x.values, (0..10u64).map(|i| Some(DecodedValue::UnsignedInteger(100 + i))).collect::<Vec<_>>());
+    assert_eq!(x.timestamps, (0..10).map(|i| i as f64 * 0.1).collect::<Vec<_>>());
+    for g in mdf.channel_groups() {
+        assert_eq!(g.raw_channel_group().block.flags & 0b110, 0, "bus-event flags masked");
+    }
+
+    // Different master units: no sharing.
+    let (_, report) = to_column_oriented_bytes(&build_remote("ms", 10), &ColumnOptions::default())?;
+    assert_eq!(report.time_groups, 2, "{report:?}");
+    assert_eq!(report.shared_time_groups, 0, "{report:?}");
+
+    // Remote master with a different record count: written without a master.
+    let (out, report) = to_column_oriented_bytes(&build_remote("s", 5), &ColumnOptions::default())?;
+    assert!(report.skipped_channels.iter().any(|s| s.contains("S: remote master dropped")), "{report:?}");
+    let mdf = MDF::from_bytes(out)?;
+    let x = mdf.signal_in("S", "X")?.unwrap();
+    assert_eq!(x.values.len(), 5);
+    assert!(x.timestamps.is_empty());
+    Ok(())
+}
+
+#[test]
+fn stale_cycle_count_still_reads_correctly_via_range_reader() -> Result<(), MdfError> {
+    let f = fixture(&small_blocks())?;
+    let expected = MdfIndex::from_file(f.column.to_str().unwrap())?.read_in("Engine", "Speed")?;
+    let cg_addr = {
+        let mdf = MDF::from_file(f.column.to_str().unwrap())?;
+        let groups = mdf.channel_groups();
+        let g = groups
+            .iter()
+            .find(|g| g.channels()[0].name().ok().flatten().as_deref() == Some("Speed"))
+            .unwrap();
+        assert!(g.raw_channel_group().block.header.links_nr == 7);
+        g.raw_channel_group().addr as usize
+    };
+    // A small and a large under-count: within the last fragment, and beyond it.
+    for lower in [3u64, FAST as u64 / 2] {
+        let mut bytes = std::fs::read(&f.column)?;
+        let at = cg_addr + 24 + 7 * 8 + 8; // cg_cycle_count
+        let cycles = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        bytes[at..at + 8].copy_from_slice(&(cycles - lower).to_le_bytes());
+        let path = f.column.with_file_name(format!("stale_{lower}.mf4"));
+        std::fs::write(&path, &bytes)?;
+        let path = path.to_str().unwrap();
+        let mut reader = mf4_rs::index::FileRangeReader::new(path)?;
+        let mut index = MdfIndex::from_range_reader(&mut reader, bytes.len() as u64)?;
+        index.set_file(path);
+        let sig = index.read_in("Engine", "Speed")?;
+        assert_eq!(sig.values, expected.values, "lowered by {lower}");
+        assert_eq!(sig.timestamps, expected.timestamps, "lowered by {lower}");
+    }
+    Ok(())
+}
+
+#[test]
+fn channel_in_searches_every_same_named_group() -> Result<(), MdfError> {
+    let f = fixture(&small_blocks())?;
+    let index = MdfIndex::from_file(f.column.to_str().unwrap())?;
+    // The first "Engine" group is the time group; Speed lives in a later one.
+    assert_eq!(index.channel_in("Engine", "Speed").and_then(|c| c.name.as_deref()), Some("Speed"));
+    assert!(index.channel_in("Engine", "Pressure").is_none());
+    Ok(())
+}
+
+#[test]
+fn cut_and_merge_reject_remote_master_files() -> Result<(), MdfError> {
+    let f = fixture(&small_blocks())?;
+    let (col, src) = (f.column.to_str().unwrap(), f.source.to_str().unwrap());
+    let out = f.column.with_file_name("out.mf4");
+    let out = out.to_str().unwrap();
+    let err = mf4_rs::cut::cut_mdf_by_time(col, out, 0.0, 1.0).unwrap_err();
+    assert!(err.to_string().contains("remote master"), "{err}");
+    let err = mf4_rs::merge::merge_files(out, src, col).unwrap_err();
+    assert!(err.to_string().contains("remote master"), "{err}");
+    let err = mf4_rs::merge::merge_files(out, col, src).unwrap_err();
+    assert!(err.to_string().contains("remote master"), "{err}");
+    // Row-oriented files are unaffected.
+    mf4_rs::cut::cut_mdf_by_time(src, out, 0.0, 1.0)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

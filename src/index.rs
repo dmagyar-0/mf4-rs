@@ -1352,11 +1352,18 @@ impl MdfIndex {
             return None;
         }
         let last = total - full;
-        let mut out = Vec::with_capacity(n as usize);
+        let mut out: Vec<DataBlockInfo> = Vec::with_capacity(n as usize);
         for (i, &addr) in dl.data_links.iter().enumerate() {
             let data = if i as u64 + 1 == n { last } else { equal };
             let size = data.checked_add(24)?;
             if file_size > 0 && addr.checked_add(size)? > file_size {
+                return None;
+            }
+            // Fragments must not overlap (ascending, each starting after the
+            // previous one ends); anything else is left to the headers.
+            if let Some(prev) = out.last()
+                && addr < prev.file_offset.checked_add(prev.size)?
+            {
                 return None;
             }
             out.push(DataBlockInfo { file_offset: addr, size, is_compressed: false });
@@ -1372,9 +1379,11 @@ impl MdfIndex {
     /// A column-oriented file stores each signal's blocks contiguously, so a
     /// whole signal arrives in one range request instead of one per block.
     /// Every read starts at a block header, and each block's header is
-    /// verified (`##DT`/`##DV` with the indexed length) before its data is
-    /// decoded — so fragment sizes derived from an equal-length `##DL` can
-    /// never silently decode bytes beyond a block.
+    /// verified (`##DT`/`##DV`) before its data is decoded. The header's own
+    /// length is authoritative: when it disagrees with the indexed size (e.g.
+    /// fragment sizes derived from an equal-length `##DL` and a stale cycle
+    /// count), the block's real data section is used — re-read if it extends
+    /// beyond the coalesced read — so bytes beyond a block are never decoded.
     fn for_each_data_section<R, F>(
         reader: &mut R,
         blocks: &[DataBlockInfo],
@@ -1409,15 +1418,11 @@ impl MdfIndex {
             for b in &blocks[i..j] {
                 let header_start = (b.file_offset - start) as usize;
                 let data_start = header_start + 24;
-                Self::verify_data_block_header(buf.get(header_start..data_start), b)?;
-                let data_end = data_start + Self::data_section_size(b)? as usize;
-                let data = buf.get(data_start..data_end).ok_or(MdfError::TooShortBuffer {
-                    actual: buf.len(),
-                    expected: data_end,
-                    file: file!(),
-                    line: line!(),
-                })?;
-                f(data)?;
+                let len = Self::verified_data_len(buf.get(header_start..data_start), b)?;
+                match usize::try_from(len).ok().and_then(|l| buf.get(data_start..data_start.checked_add(l)?)) {
+                    Some(data) => f(data)?,
+                    None => f(&reader.read_range(b.file_offset + 24, len)?)?,
+                }
             }
             i = j;
         }
@@ -1425,11 +1430,12 @@ impl MdfIndex {
     }
 
     /// Check that `header` (the 24 header bytes of `block`, if available) is an
-    /// uncompressed `##DT`/`##DV` block of the indexed length.
-    fn verify_data_block_header(header: Option<&[u8]>, block: &DataBlockInfo) -> Result<(), MdfError> {
+    /// uncompressed `##DT`/`##DV` block and return the length of its data
+    /// section according to the header (which wins over the indexed size).
+    fn verified_data_len(header: Option<&[u8]>, block: &DataBlockInfo) -> Result<u64, MdfError> {
         let h = BlockHeader::from_bytes(header.unwrap_or(&[]))?;
-        if (h.id == "##DT" || h.id == "##DV") && h.block_len == block.size {
-            return Ok(());
+        if (h.id == "##DT" || h.id == "##DV") && h.block_len >= 24 {
+            return Ok(h.block_len - 24);
         }
         Err(MdfError::BlockSerializationError(format!(
             "data block at offset {} is {} with length {} but the index expects an \
@@ -2241,8 +2247,12 @@ impl MdfIndex {
     }
 
     /// Look up a channel by group name + channel name.
+    ///
+    /// Every group carrying that name is searched (like [`MdfIndex::read_in`]),
+    /// since a column-oriented file has one channel group per signal.
     pub fn channel_in(&self, group: &str, name: &str) -> Option<&IndexedChannel> {
-        self.group(group)?.channel(name)
+        let (g, c) = self.locate_in(group, name)?;
+        self.channel_groups.get(g)?.channels.get(c)
     }
 
     /// The attached data source rendered as a string (file path or URL).
@@ -2903,35 +2913,24 @@ impl MdfIndex {
     /// wrapping or panicking.
     #[allow(dead_code)] // used by the Python bindings (pyo3 feature)
     fn slice_data_block<'a>(file_data: &'a [u8], data_block: &DataBlockInfo) -> Result<&'a [u8], MdfError> {
-        let data_len = Self::data_section_size(data_block)?;
-        let bounds = data_block
-            .file_offset
-            .checked_add(24)
-            .and_then(|start| start.checked_add(data_len).map(|end| (start, end)))
-            .and_then(|(start, end)| {
-                Some((usize::try_from(start).ok()?, usize::try_from(end).ok()?))
-            });
-        let (data_start, data_end) = match bounds {
-            Some(b) => b,
-            None => {
-                return Err(MdfError::TooShortBuffer {
-                    actual: file_data.len(),
-                    expected: usize::MAX,
-                    file: file!(),
-                    line: line!(),
-                });
-            }
+        Self::data_section_size(data_block)?;
+        let too_short = |expected: usize| MdfError::TooShortBuffer {
+            actual: file_data.len(),
+            expected,
+            file: file!(),
+            line: line!(),
         };
-        if data_end > file_data.len() {
-            return Err(MdfError::TooShortBuffer {
-                actual: file_data.len(),
-                expected: data_end,
-                file: file!(),
-                line: line!(),
-            });
-        }
-        Self::verify_data_block_header(file_data.get(data_start - 24..data_start), data_block)?;
-        Ok(&file_data[data_start..data_end])
+        let data_start = usize::try_from(data_block.file_offset)
+            .ok()
+            .and_then(|o| o.checked_add(24))
+            .ok_or_else(|| too_short(usize::MAX))?;
+        // The block header's own length wins over the indexed size.
+        let data_len = Self::verified_data_len(file_data.get(data_start - 24..data_start), data_block)?;
+        let data_end = usize::try_from(data_len)
+            .ok()
+            .and_then(|l| data_start.checked_add(l))
+            .ok_or_else(|| too_short(usize::MAX))?;
+        file_data.get(data_start..data_end).ok_or_else(|| too_short(data_end))
     }
 }
 

@@ -189,7 +189,8 @@ straight through — the requested channel and its master are both covered for
 any record layout. This is what `MdfIndex.values`/`read` fetch under the
 hood. Fragments stored back to back are bridged into a single span, and for a
 column-oriented (MDF 4.2 remote-master) group the shared time group's spans are
-included as well.
+included as well — pass `withMaster = false` (third argument) to leave them
+out when only the values are needed, as `MdfIndex.values` does.
 
 `byteRanges(name, group)` is a lower-level power-user API: it returns the
 spans that a *single* channel's bytes fall in. Because records interleave all

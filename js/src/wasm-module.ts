@@ -57,7 +57,7 @@ export interface WasmMdfIndex {
     ranges: unknown,
     fragments: unknown,
   ): unknown;
-  signalByteRanges(name: string, group?: string | null): unknown;
+  signalByteRanges(name: string, group?: string | null, withMaster?: boolean | null): unknown;
   toJson(): string;
   validate(): void;
   valuesFromFragments(
