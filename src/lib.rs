@@ -16,6 +16,7 @@ pub mod merge;
 pub mod index;
 pub mod signal;
 pub mod block_layout;
+pub mod column;
 
 pub mod parsing {
     pub mod decoder;

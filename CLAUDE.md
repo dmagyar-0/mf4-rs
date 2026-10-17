@@ -50,7 +50,7 @@ The pipeline takes the **highest** bump implied by any commit since the last tag
 
 ## Project Overview
 
-`mf4-rs` is a Rust library for working with ASAM MDF 4 (Measurement Data Format) files. It implements a subset of the MDF 4.1 specification sufficient for data logging and inspection tasks. The library supports reading existing MDF files, writing new ones, creating lightweight JSON indexes for fast random access, time-based file cutting, and file merging. Optional Python bindings are available via PyO3 (published to PyPI), and optional WebAssembly bindings via wasm-bindgen are wrapped by a TypeScript package in `js/` (published to npm as `mf4-rs`).
+`mf4-rs` is a Rust library for working with ASAM MDF 4 (Measurement Data Format) files. It implements a subset of the MDF 4.1 specification sufficient for data logging and inspection tasks. The library supports reading existing MDF files, writing new ones, creating lightweight JSON indexes for fast random access, time-based file cutting, file merging, and streaming conversion to column-oriented MDF 4.20 files optimised for cloud reads. Optional Python bindings are available via PyO3 (published to PyPI), and optional WebAssembly bindings via wasm-bindgen are wrapped by a TypeScript package in `js/` (published to npm as `mf4-rs`).
 
 **Key stats:** ~15,000 lines of Rust across ~52 source files, plus a TypeScript wrapper package in `js/`. Rust edition 2024, MIT licensed. The version in `Cargo.toml` / `pyproject.toml` / `js/package.json` is managed by the release workflow — never edit it by hand.
 
@@ -61,7 +61,7 @@ The pipeline takes the **highest** bump implied by any commit since the last tag
 # Build the library (rlib + cdylib)
 cargo build
 
-# Run all tests (note: tests/enhanced_index_conversions.rs has a known compile error for missing start_time_ns field)
+# Run all tests
 cargo test
 
 # Run a specific test file
@@ -80,6 +80,7 @@ cargo run --example read_file
 cargo run --example index_operations
 cargo run --example cut_file
 cargo run --example merge_files
+cargo run --release --example column_oriented -- input.mf4 output.mf4
 ```
 
 ### Python Bindings Development
@@ -128,7 +129,8 @@ The codebase is organized into distinct layers. The module structure is defined 
 ### 1. API Layer (`src/api/`)
 - **High-level user-facing API** - what external users interact with
 - `MDF` (`mdf.rs`) - Entry point; wraps `MdfFile`, provides `channel_groups()` and `start_time_ns()`
-- `ChannelGroup` (`channel_group.rs`) - Borrows from `RawDataGroup`, `RawChannelGroup`, and the mmap; provides `name()`, `comment()`, `source()`, `channels()`
+- `ChannelGroup` (`channel_group.rs`) - Borrows from `RawDataGroup`, `RawChannelGroup`, and the mmap; provides `name()`, `comment()`, `source()`, `channels()`, `master_channel()` (local master, or the MDF 4.2 remote master via `cg_cg_master` — needs the file's other groups, so build groups through `MDF::channel_groups()`; `ChannelGroup::new` has none)
+- `MDF::signal_in(group, name)` searches **every** group with that name (column-oriented files have one group per signal, all named after the source group); `MDF::group(name)` still returns only the first
 - `Channel` (`channel.rs`) - Borrows from `ChannelBlock` and raw types; provides `name()`, `unit()`, `comment()`, `source()`, `values()`
 - All API types carry lifetime `'a` tied to the memory-mapped file owned by `MDF`
 
@@ -156,7 +158,7 @@ The codebase is organized into distinct layers. The module structure is defined 
   - `IdentificationBlock` (64 bytes) - File identification, version validation (>= 4.10 required)
   - `HeaderBlock` (104 bytes) - File header with absolute timestamp, timezone, links to data groups
   - `DataGroupBlock` (64 bytes) - Container linking to channel groups and data blocks
-  - `ChannelGroupBlock` (104 bytes) - Group metadata, record layout, invalidation byte count
+  - `ChannelGroupBlock` (104 bytes; 112 with the MDF 4.2 `cg_cg_master` link) - Group metadata, record layout, invalidation byte count, `master_cg_addr` (remote master, set when flag bit 3 `CG_FLAG_REMOTE_MASTER` is present)
   - `ChannelBlock` (160 bytes) - Channel metadata, conversion link, name resolution, invalidation bit position
   - `TextBlock` (variable, 8-byte aligned) - Null-terminated strings with padding
   - `MetadataBlock` (variable) - XML metadata
@@ -181,7 +183,7 @@ The codebase is organized into distinct layers. The module structure is defined 
 ### 4. Parsing Layer (`src/parsing/`)
 - `MdfFile` (`mdf_file.rs`) - Opens file with `memmap2::Mmap`, parses identification block (64 bytes), header block, then walks data group → channel group → channel linked lists
 - `RawDataGroup` (`raw_data_group.rs`) - Wraps `DataGroupBlock` + `Vec<RawChannelGroup>`; `data_blocks()` method transparently follows `##DT`/`##DV`/`##DL` chains
-- `RawChannelGroup` (`raw_channel_group.rs`) - Simple wrapper: `ChannelGroupBlock` + `Vec<RawChannel>`
+- `RawChannelGroup` (`raw_channel_group.rs`) - Simple wrapper: `addr` (its `##CG` offset, for resolving remote-master links) + `ChannelGroupBlock` + `Vec<RawChannel>`
 - `RawChannel` (`raw_channel.rs`) - Wraps `ChannelBlock`; `records()` returns a boxed iterator that handles both fixed-size records and VLSD channels (channel type 1 with `##SD`/`##DL` chains)
 - `decoder.rs` - Core value decoding:
   - `DecodedValue` enum: `UnsignedInteger(u64)`, `SignedInteger(i64)`, `Float(f64)`, `String(String)`, `ByteArray(Vec<u8>)`, `MimeSample`, `MimeStream`, `Unknown`
@@ -194,7 +196,7 @@ The codebase is organized into distinct layers. The module structure is defined 
 
 ### 5. Index System (`src/index.rs`)
 - `MdfIndex` - Self-contained index with `file_size`, `start_time_ns`, and `Vec<IndexedChannelGroup>`
-- `IndexedChannelGroup` - Stores record layout metadata + `Vec<IndexedChannel>` + `Vec<DataBlockInfo>`
+- `IndexedChannelGroup` - Stores record layout metadata + `Vec<IndexedChannel>` + `Vec<DataBlockInfo>` + `master_group: Option<usize>` (index of the group holding a remote MDF 4.2 master; `MdfIndex::master_location(g, c)` resolves local or remote masters for every read path, including wasm `signalByteRanges`/`conversionRangesStep`)
 - `IndexedChannel` - Channel metadata including fully resolved `ConversionBlock` (serializable via serde)
 - `ByteRangeReader` trait - Abstraction for data sources: `read_range(offset, length) -> Vec<u8>`
 - `FileRangeReader` - Built-in local file implementation
@@ -210,6 +212,7 @@ The codebase is organized into distinct layers. The module structure is defined 
 - `Signal` (`src/signal.rs`) is the Rust equivalent of a pandas `Series`: `{ name, unit, timestamps: Vec<f64>, values: Vec<Option<DecodedValue>> }`, with `values_f64()` / `has_timestamps()`. Produced by `MDF::signal()`, `ChannelGroup::signal()`, `MdfReader::signal()`, and `MdfIndex::read()`.
 
 ### 6. File Operations
+- `column.rs` - `to_column_oriented(input, output, &ColumnOptions)` (also `to_column_oriented_with(reader, sink, opts)` over any `ByteRangeReader` + `ColumnSink`, and `to_column_oriented_bytes`): rewrites any uncompressed MDF 4 file (sorted or unsorted) as a column-oriented **MDF 4.20** file — one DG/CG/CN per signal, the source group's master written once into its own "time group" and referenced via the remote-master link (byte-identical time axes across groups are merged when `share_identical_time`), every non-data block at the front (attachments at the end), each signal's `##DV` (`##DT` when it carries an invalidation byte) blocks back to back with whole records, a payload that is a multiple of 8 (no padding between blocks), and **always** an equal-length `##DL` (even for one block) so block sizes are derivable from metadata. Two phases: plan + lay out everything from metadata, then stream the source once (record-aligned chunks; records may straddle blocks) into per-channel buffers flushed to precomputed offsets. Raw bytes are copied (no decoding); VLSD `##SD` streams are copied verbatim as one `##SD` right after the signal's records so inline offsets stay valid. Skips `##CA` array channels and VLSD-CG channels (reported in `ColumnReport::skipped_channels`); rejects `##DZ`
 - `cut.rs` - `cut_mdf_by_time(input, output, start_time, end_time)`: Copies only records whose master channel value falls within `[start_time, end_time]`. Identifies master channels by `channel_type == 2 && sync_type == 1`.
 - `merge.rs` - `merge_files(output, first, second)`: Merges two files. Channel groups with identical layouts (same channel names, types, offsets) are concatenated; different groups are appended separately.
 
@@ -230,6 +233,7 @@ The codebase is organized into distinct layers. The module structure is defined 
 - Main classes:
   - `Mdf` (struct `PyMDF`) - Wraps `MDF`; `groups` property (each `GroupInfo` carries its `channels`), `group(name)`, `channel(name)`, `channel_names`; reads: `read()` → Series, `values()` → numpy, `__getitem__`, `file_layout()`
   - `MdfWriter` (struct `PyMdfWriter`) - Wraps `MdfWriter`; manages ID mapping between Python and Rust IDs; provides `add_time_channel()`, `add_float_channel()`, `add_int_channel()` convenience methods (writer API unchanged in the redesign)
+  - `to_column_oriented(input_path, output_path, block_size=None, memory_budget=None, share_identical_time=None)` → `ColumnReport` (GIL released)
   - `MdfIndex` (struct `PyMdfIndex`) - Wraps `MdfIndex`; `from_file()` / `load()` / `from_url()` / `save()`; navigation (`groups`, `group`, `channel`, `channel_names`, `groups_with_channel`); **carries its data `source`** (settable `source` property, autodetecting `http(s)://` URLs vs file paths, plus `set_source()`); **lazy** `read()` → Series and `values()` → numpy (range request happens on read, GIL released); `byte_ranges()` / `byte_ranges_for_records()`; `conversion_info(name)`. (There is no separate `MdfData` class — the index *is* the bound reader.)
   - `ChannelInfo`, `GroupInfo`, `DecodedValue`, `DataType`, `FileLayout`/`BlockInfo`/`LinkInfo`/`GapInfo` - Data transfer / inspection types
 - Helper functions: `create_float_value()`, `create_uint_value()`, `create_int_value()`, `create_string_value()`, `create_data_type_*()` factory functions
@@ -240,6 +244,7 @@ The codebase is organized into distinct layers. The module structure is defined 
 ### 9. WebAssembly / TypeScript Bindings (`src/wasm.rs` + `js/`)
 - `src/wasm.rs` is built only when the `wasm` feature is enabled (wasm-bindgen + js-sys + serde-wasm-bindgen); it also compiles on native targets for IDE friendliness
 - Mirrors the **name-based** API philosophy of the Python bindings: `Mdf` (in-memory reader from bytes), `MdfIndex` (self-contained index + fragment-based reads), `MdfWriter` (in-memory writer producing a `Uint8Array`)
+- Column-oriented conversion: `toColumnOriented(bytes, options)` → `{ bytes, report }` and `toColumnOrientedStream(size, read, write, options)` over **synchronous** JS callbacks (`JsCallbackReader` / `JsCallbackSink`); the TS wrapper (`js/src/column.ts`) adds `toColumnOrientedFile` (Node, sync `fs` I/O, only in the `.` entry)
 - The wasm module has no filesystem/network access — I/O lives on the JS side. `MdfIndex` exposes `signalByteRanges()` + `valuesFromFragments()`/`readFromFragments()` so callers fetch bytes themselves and pass fragments in
 - `js/` is the npm package (`mf4-rs`): a typed TypeScript wrapper (`js/src/`) over the generated wasm-bindgen module, adding convenience constructors (`Mdf.fromFile`, `Mdf.fromUrl`, `MdfIndex.fromFile`, `MdfIndex.fromRangeSource`, `MdfIndex.fromUrl`) and the pluggable `RangeSource` abstraction (`FetchRangeSource`, `FileRangeSource`, `BytesRangeSource`) for lazy remote reads. `MdfIndex.fromUrl`/`fromRangeSource` build the index **fetching only metadata** (never the sample data), mirroring the native `MdfIndex::from_url`: the wasm `MdfIndex.buildIndexStep` runs the native `from_range_reader` walk against a record-replay reader and reports the next byte range it needs, and the JS wrapper loops fetching those ranges (seed prefix + look-ahead) until the index is built
 - Two entry points share the same wrapper classes: `mf4-rs` (the `.` export) loads the synchronous `pkg-node/` (`--target nodejs`) build via `src/wasm-module-node.ts`; `mf4-rs/web` (the `./web` export, `src/web.ts`) loads the async `pkg-web/` (`--target web`) build and adds an `init()` that must be awaited once before use. The shared `src/wasm-module.ts` holds no target-specific loader (`getWasmModule()` + `registerWasmLoader`/`setWasmModule`) so bundling the web entry never pulls in the Node `require` of `pkg-node`. The web ESM output is post-processed (`scripts/fix-web-esm.mjs`) to carry explicit `.js` extensions so it runs natively (browser/Deno) as well as through bundlers
@@ -337,6 +342,10 @@ Channels with `channel_type == 1` and a non-zero `data` field store variable-len
 - `ByteRangeReader` trait allows plugging in HTTP, S3, or other data sources
 - VLSD channels (`channel_type == 1`) are readable through the index: each channel's `##SD` fragment chain is captured at build time in `IndexedChannel.vlsd_data_blocks`, and `read()` / `values()` resolve each record's inline 8-byte offset into that stream. `byte_ranges()` still refuses VLSD channels (a static range cannot express the offset indirection). Old JSON indexes without `vlsd_data_blocks` load fine but error on VLSD reads with a "rebuild the index" message.
 - Compressed blocks (`##DZ`) are not yet supported in the index reader
+- `from_range_reader` does **not** read fragment headers of an equal-length `##DL` reached directly from a DG when `cycles × record size` is consistent with the list and the file size (`derive_equal_length_fragments`); the read path verifies the in-span headers it fetches. This is what keeps a column-oriented index build inside the metadata prefix
+- Reader-based value reads go through `for_each_data_section`, which coalesces physically adjacent blocks (≤7 bytes padding apart, ≤64 MiB per request) into one `read_range` — one request per contiguous signal. Keep new read paths on it
+- `locate_in(group, name)` searches every group with that name (column files repeat group names)
+- URL reads (`Source::Url`) resolve a deferred conversion through a 64 KiB read-ahead cache first, then switch to bypass for the data; `CachingRangeReader::set_known_size` is set from the size probe so the final chunk is not re-requested
 
 ### When Modifying Conversions
 - Each conversion type has its own application function in `src/blocks/conversion/`
@@ -409,7 +418,11 @@ These same steps run automatically (via `prepublishOnly`) in the release workflo
 - `merge.rs` - Merging files with identical and different channel structures
 - `test_invalidation_bits.rs` - Invalidation flag shortcuts, bit position checking, flag priority, edge cases
 - `cross_compatibility.rs` - **Spec-compliance and regression tests** (10 tests): float32/float64 roundtrip, signed/unsigned integer boundary values, multi-group with master channels, data block splitting (##DL) for 300K records, value-to-text conversions, performance (100K records < 10s), file identification block validation, master channel type/sync verification
-- `enhanced_index_conversions.rs` - Index with text conversions, conversion dependency resolution, index persistence with resolved data (**has a known compile error**: missing `start_time_ns` field in `MdfIndex` constructor)
+- `enhanced_index_conversions.rs` - Index with text conversions, conversion dependency resolution, index persistence with resolved data
+- `column.rs` - Column-oriented conversion: round-trips via `MDF`, local/range-reader/JSON indexes, layout invariants (metadata prefix, contiguous blocks), tiny memory budget, sharing on/off, re-conversion of a 4.20 file, hand-built unsorted input, `##DZ` rejection, range-request/byte counts (`CountingReader`) and a real-HTTP `from_url` test (`http` feature)
+
+### Python Column-Oriented Tests (`tests/test_column_oriented.py`)
+asammdf-built sources (incl. a VLSD string and a linear conversion) → `to_column_oriented` → asammdf reads the 4.20 output identically (independent check of the remote-master encoding), `Mdf`/`MdfIndex` read identically, HTTP `from_url` request counts. Exits 0 when asammdf/numpy are missing.
 
 ### Python Cross-Compatibility Tests (`tests/test_asammdf_interop.py`)
 14 tests verifying interoperability between mf4-rs and asammdf:

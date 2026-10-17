@@ -384,27 +384,33 @@ export class MdfIndex {
   }
 
   /**
-   * Full data-section byte ranges for the group owning `name`, merged.
+   * Byte ranges of every data block of the group owning `name`, merged.
    *
-   * Returns one span per data-block fragment covering the entire data section
-   * (block bytes minus the 24-byte header); for a VLSD channel the spans of
-   * its `##SD` fragment chain are included too. This is exactly the range set
+   * Returns one span per data-block fragment covering the whole block
+   * (including its 24-byte header, which the decoder verifies); blocks stored
+   * back to back are merged into one span. For a VLSD channel the spans of its
+   * `##SD` fragment chain are included too, and for a column-oriented (MDF 4.2
+   * remote-master) group so are the shared time group's blocks unless
+   * `withMaster` is `false` (default `true`; pass `false` when only the values
+   * are needed, as `values()` does). This is exactly the range set
    * the fragment readers need: `valuesFromFragments`/`readFromFragments`
    * decode whole data sections (all channels interleave per record), so fetch
    * these and pass the fetched fragments straight through — the requested
    * channel and its master are both covered for any record layout. This is
    * also what `values`/`read` fetch under the hood.
    */
-  signalByteRanges(name: string, group?: string | null): ByteRange[] {
-    return this.inner.signalByteRanges(name, group) as ByteRange[];
+  signalByteRanges(name: string, group?: string | null, withMaster = true): ByteRange[] {
+    return this.inner.signalByteRanges(name, group, withMaster) as ByteRange[];
   }
 
   /**
    * Decode a numeric channel to a `Float64Array` from caller-fetched
    * fragments (invalid/non-numeric samples become `NaN`).
    *
-   * `ranges`/`fragments` must be a matching pair previously obtained from
-   * `byteRanges`/`signalByteRanges` and fetched bytes for each span.
+   * `ranges`/`fragments` must be a matching pair: the ranges from
+   * `signalByteRanges` (whole data blocks including their 24-byte headers,
+   * which the decoder verifies — `byteRanges` spans are not sufficient) and
+   * the bytes fetched for each span.
    */
   valuesFromFragments(
     name: string,
@@ -418,8 +424,9 @@ export class MdfIndex {
   /**
    * Decode a channel to a `Signal` from caller-fetched fragments.
    *
-   * `ranges`/`fragments` must be a matching pair previously obtained from
-   * `signalByteRanges` and fetched bytes for each span.
+   * `ranges`/`fragments` must be a matching pair: the ranges from
+   * `signalByteRanges` (whole data blocks including their 24-byte headers,
+   * with the master's blocks) and the bytes fetched for each span.
    */
   readFromFragments(
     name: string,
@@ -434,14 +441,14 @@ export class MdfIndex {
    * Lazily decode a numeric channel to a `Float64Array`, fetching only the
    * bytes it needs from `source`.
    *
-   * Fetches the group's full data-section ranges (`signalByteRanges`) from
-   * `source` concurrently, then decodes via `valuesFromFragments`. The
-   * fragment decoders read whole data sections (records interleave every
-   * channel), so `signalByteRanges` is exactly the right range set for any
-   * group shape.
+   * Fetches the group's whole data blocks (`signalByteRanges`, without a
+   * remote master's time blocks) from `source` concurrently, then decodes via
+   * `valuesFromFragments`. The fragment decoders read whole data blocks
+   * (records interleave every channel), so `signalByteRanges` is exactly the
+   * right range set for any group shape.
    */
   async values(name: string, source: RangeSource, group?: string | null): Promise<Float64Array> {
-    const ranges = this.signalByteRanges(name, group);
+    const ranges = this.signalByteRanges(name, group, false);
     const fragments = await readAllRanges(source, ranges);
     // Indexes built over the network resolve conversions lazily; fetch the
     // channel's conversion blocks (if any) so the decoder can apply them.
@@ -453,8 +460,9 @@ export class MdfIndex {
    * Lazily decode a channel to a `Signal`, fetching only the bytes it needs
    * from `source`.
    *
-   * Fetches the group's full data-section ranges (`signalByteRanges`) from
-   * `source` concurrently, then decodes via `readFromFragments`.
+   * Fetches the group's whole data blocks plus its master's
+   * (`signalByteRanges`) from `source` concurrently, then decodes via
+   * `readFromFragments`.
    */
   async read(name: string, source: RangeSource, group?: string | null): Promise<Signal> {
     const ranges = this.signalByteRanges(name, group);

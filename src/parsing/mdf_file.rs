@@ -24,6 +24,23 @@ pub struct MdfFile {
 }
 
 impl MdfFile {
+    /// Error if any channel group keeps its master in another channel group
+    /// (MDF 4.2 remote master, as in column-oriented files): `operation`
+    /// (cut / merge) works per group and would lose or misplace the time axis.
+    pub(crate) fn reject_remote_masters(&self, operation: &str) -> Result<(), MdfError> {
+        let remote = self.data_groups.iter().flat_map(|dg| &dg.channel_groups).any(|cg| {
+            cg.block.master_cg_addr != 0
+                || cg.block.flags & crate::blocks::channel_group_block::CG_FLAG_REMOTE_MASTER != 0
+        });
+        if remote {
+            return Err(MdfError::BlockSerializationError(format!(
+                "{operation} does not support files whose channel groups use a remote master \
+                 (MDF 4.2 column-oriented files); convert the source file instead"
+            )));
+        }
+        Ok(())
+    }
+
     /// Parse an MDF file from a given file path.
     ///
     /// Not available on `wasm32-unknown-unknown`; use [`parse_from_bytes`] instead.
@@ -120,6 +137,7 @@ impl MdfFile {
                         next_cg_addr
                     )));
                 }
+                let cg_addr = next_cg_addr;
                 let offset = next_cg_addr as usize;
                 let cg_bytes = data.get(offset..).ok_or(MdfError::TooShortBuffer {
                     actual:   data.len(),
@@ -137,6 +155,7 @@ impl MdfFile {
                     .collect();
 
                 raw_channel_groups.push(RawChannelGroup {
+                    addr: cg_addr,
                     block: channel_group_block,
                     raw_channels,
                 });

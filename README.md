@@ -45,6 +45,7 @@ The codebase is organized into distinct layers:
 - `merge.rs` - File merging utilities
 - `error.rs` - Centralized error handling
 - `index.rs` - MDF file indexing system for fast metadata-based access
+- `column.rs` - Streaming conversion to column-oriented MDF 4.20 files optimised for cloud reads
 - `signal.rs` - `Signal` struct pairing channel values with the group's master/time axis
 
 #### 6. Bindings
@@ -85,6 +86,7 @@ The project includes simplified examples in the `examples/` directory:
 - `merge_files.rs` - Merging multiple MF4 files
 - `cut_file.rs` - Time-based file cutting
 - `visualize_layout.rs` - Dumping the block layout of a file
+- `column_oriented.rs` - Converting a file to the column-oriented MDF 4.20 layout
 - `wasm-smoke/` - Browser smoke test for the WebAssembly bindings
 
 Run them with:
@@ -186,6 +188,61 @@ let ranges = index.byte_ranges("Temperature")?;
 
 Custom data sources (S3, caches, …) plug in through the `ByteRangeReader` trait: `index.open(reader)` returns an `MdfReader` with `values(name)` / `signal(name)` methods.
 
+### Column-oriented MDF 4.20 for cloud reads
+
+A regular (row-oriented) MDF file interleaves every channel of a group record
+by record, so reading one signal over HTTP still downloads all of its group's
+data. `mf4_rs::column::to_column_oriented` rewrites any uncompressed MDF 4 file
+(sorted or unsorted) into a **column-oriented MDF 4.20** file built for
+single-signal cloud reads:
+
+- **One channel group per signal**, its data blocks (default 4 MiB, whole
+  records, tunable via `block_size`) written **back to back** and listed by an
+  equal-length `##DL` block — one range request fetches the whole signal.
+- **Shared timestamps** via the MDF 4.2 *remote master* (`cg_cg_master`, channel
+  group flag bit 3): each source group's time channel is written once into its
+  own group and referenced by all of its signals. Source groups whose time axes
+  are byte-identical share a single time group (`share_identical_time`).
+- **All metadata at the front** (`##ID`/`##HD`/`##FH`/`##DG`/`##CG`/`##CN`/`##TX`/
+  `##MD`/`##CC`/`##SI`/`##DL`), so the whole structure — including every data
+  block's location and size — comes from one prefix fetch. Attachments go to
+  the end of the file.
+- **Streaming and lossless**: the layout is computed from the metadata first,
+  then the source is read once in chunks and each channel's raw bytes are
+  appended to small per-channel buffers flushed straight to their final
+  offsets. Memory stays bounded by `memory_budget` (default 64 MiB) whatever
+  the file size; nothing is decoded, so conversions, units, comments, sources,
+  invalidation bits and VLSD (`##SD`) channels carry over unchanged.
+
+```rust
+use mf4_rs::column::{to_column_oriented, ColumnOptions};
+
+let report = to_column_oriented("recording.mf4", "recording.col.mf4", &ColumnOptions::default())?;
+println!("{} signals, {} time groups, metadata prefix {} bytes",
+         report.signal_groups, report.time_groups, report.metadata_size);
+```
+
+The output reads like any other MDF file: `MDF`, `MdfIndex`, the Python and
+TypeScript bindings and asammdf all resolve the remote master transparently
+(`signal("Speed")` comes back with its shared timestamps). Lower-level entry
+points: `to_column_oriented_with(reader, sink, options)` over any
+`ByteRangeReader` and `ColumnSink`, and `to_column_oriented_bytes` in memory.
+
+Range requests for a cold read of one signal from a fresh file (measured in
+`tests/column.rs` / `tests/test_column_oriented.py` / `js/test/column.test.ts`):
+
+| Step | Column-oriented file | Row-oriented original |
+|------|----------------------|------------------------|
+| Build the index (`MdfIndex::from_url`) | size probe + **1** prefix fetch; the data region is never touched | size probe + metadata + data-block headers |
+| Read one numeric signal | **2** (values + shared time; **1** when they are adjacent) | same count, but downloads every channel of the group |
+| Bytes to read one 400k-sample f64 signal (values + timestamps) of a 9-channel group | **6.3 MB** | 56 MB |
+| Extra for a lazily resolved conversion / a VLSD `##SD` stream | +1 each | +1 each |
+
+Converting a 1 GB file (3 groups × 21 channels × 2M records) takes about 4.5 s
+with a peak resident set of ~70 MB. Not supported yet: compressed (`##DZ`)
+input. Array (`##CA`) channels and VLSD data stored in VLSD channel groups are
+skipped and listed in `ColumnReport::skipped_channels`.
+
 ## Python Bindings
 
 `mf4-rs` includes high-performance Python bindings generated using `pyo3`. This allows you to use the library's features directly from Python with minimal overhead. Wheels for Linux, macOS, and Windows are published to [PyPI](https://pypi.org/project/mf4-rs/) on every release.
@@ -248,6 +305,10 @@ for group in mdf.groups:
 series = mdf.read("Data")     # pandas Series with DatetimeIndex
 array = mdf.values("Data")    # numpy float64 array (no pandas needed)
 same = mdf["Data"]            # __getitem__ is read()
+
+# Column-oriented MDF 4.20 copy for cloud reads (streaming, bounded memory)
+report = mf4_rs.to_column_oriented("output.mf4", "output.col.mf4")
+print(report)  # ColumnReport(signal_groups=..., time_groups=..., ...)
 
 # Lazy remote/indexed reads
 index = mf4_rs.MdfIndex.from_file("output.mf4")

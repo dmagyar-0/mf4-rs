@@ -209,6 +209,7 @@ pub fn cut_mdf_by_time(
     end_time: f64,
 ) -> Result<(), MdfError> {
     let mdf = MdfFile::parse_from_file(input_path)?;
+    mdf.reject_remote_masters("cut")?;
     let mut writer = MdfWriter::new(output_path)?;
     writer.init_mdf_file()?;
 

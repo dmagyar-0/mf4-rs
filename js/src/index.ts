@@ -17,6 +17,15 @@ import "./wasm-module-node";
 export { Mdf } from "./mdf";
 export { MdfIndex, type IndexBuildOptions } from "./mdf-index";
 export { MdfWriter, type RecordValue } from "./mdf-writer";
+export {
+  toColumnOriented,
+  toColumnOrientedStream,
+  toColumnOrientedFile,
+  type ColumnOptions,
+  type ColumnReport,
+  type SyncByteSource,
+  type SyncByteSink,
+} from "./column";
 
 export {
   FetchRangeSource,

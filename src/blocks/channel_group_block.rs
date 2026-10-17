@@ -21,17 +21,40 @@ pub struct ChannelGroupBlock {
     pub reserved1: u32,                   // 4 bytes
     pub samples_byte_nr: u32,             // 4 bytes
     pub invalidation_bytes_nr: u32,       // 4 bytes
-
+    /// `cg_cg_master` (MDF 4.2): channel group holding this group's master
+    /// channel when the *remote master* flag (bit 3 of `flags`) is set; 0
+    /// otherwise. Stored as a 7th link, so such a block is 112 bytes long.
+    pub master_cg_addr: u64,
 }
+
+/// Channel-group flag (MDF 4.2): the master channel is in the channel group
+/// referenced by [`ChannelGroupBlock::master_cg_addr`].
+pub const CG_FLAG_REMOTE_MASTER: u16 = 1 << 3;
 
 impl BlockParse<'_> for ChannelGroupBlock {
     const ID: &'static str = "##CG";
-    /// Creates a ChannelGroupBlock from a 104-byte slice.
+    /// Creates a ChannelGroupBlock from a 104-byte slice (112 bytes for an
+    /// MDF 4.2 block carrying the `cg_cg_master` link).
     fn from_bytes(bytes: &[u8]) -> Result<Self, MdfError> {
 
         let header = Self::parse_header(bytes)?;
 
-        let expected_bytes = 104;
+        // The data section follows the links; MDF 4.2 appends `cg_cg_master`
+        // as a 7th link, shifting it by 8 bytes.
+        let d = header
+            .links_nr
+            .checked_mul(8)
+            .and_then(|l| l.checked_add(24))
+            .filter(|&d| header.links_nr >= 6 && d.checked_add(32).is_some_and(|end| end <= header.block_len))
+            .and_then(|d| usize::try_from(d).ok())
+            .ok_or_else(|| {
+                MdfError::BlockSerializationError(format!(
+                    "##CG block has {} links but is {} bytes long",
+                    header.links_nr, header.block_len
+                ))
+            })?;
+        let links = header.links_nr as usize;
+        let expected_bytes = d + 32;
         if bytes.len() < expected_bytes {
             return Err(MdfError::TooShortBuffer {
                 actual:   bytes.len(),
@@ -49,19 +72,27 @@ impl BlockParse<'_> for ChannelGroupBlock {
             acq_source_addr: LittleEndian::read_u64(&bytes[48..56]),
             first_sample_reduction_addr: LittleEndian::read_u64(&bytes[56..64]),
             comment_addr: LittleEndian::read_u64(&bytes[64..72]),
-            record_id: LittleEndian::read_u64(&bytes[72..80]),
-            cycles_nr: LittleEndian::read_u64(&bytes[80..88]),
-            flags: LittleEndian::read_u16(&bytes[88..90]),
-            path_separator: LittleEndian::read_u16(&bytes[90..92]),
-            reserved1: LittleEndian::read_u32(&bytes[92..96]),
-            samples_byte_nr: LittleEndian::read_u32(&bytes[96..100]),
-            invalidation_bytes_nr: LittleEndian::read_u32(&bytes[100..104]),
+            record_id: LittleEndian::read_u64(&bytes[d..d + 8]),
+            cycles_nr: LittleEndian::read_u64(&bytes[d + 8..d + 16]),
+            flags: LittleEndian::read_u16(&bytes[d + 16..d + 18]),
+            path_separator: LittleEndian::read_u16(&bytes[d + 18..d + 20]),
+            reserved1: LittleEndian::read_u32(&bytes[d + 20..d + 24]),
+            samples_byte_nr: LittleEndian::read_u32(&bytes[d + 24..d + 28]),
+            invalidation_bytes_nr: LittleEndian::read_u32(&bytes[d + 28..d + 32]),
+            master_cg_addr: if links >= 7 && LittleEndian::read_u16(&bytes[d + 16..d + 18]) & CG_FLAG_REMOTE_MASTER != 0 {
+                LittleEndian::read_u64(&bytes[72..80])
+            } else {
+                0
+            },
         })
     }
 }
 impl ChannelGroupBlock {
     
-    /// Serializes the ChannelGroupBlock to bytes according to MDF 4.1 specification.
+    /// Serializes the ChannelGroupBlock to bytes according to MDF 4.1 specification
+    /// (112 bytes with the MDF 4.2 `cg_cg_master` 7th link when
+    /// `master_cg_addr` is set or the block was parsed with 7 links; the
+    /// header's length and link count are derived, not taken from `header`).
     /// 
     /// # Structure (104 bytes total):
     /// - BlockHeader (24 bytes): Standard block header with id="##CG"
@@ -92,17 +123,25 @@ impl ChannelGroupBlock {
             ));
         }
         
-        if self.header.block_len != 104 {
-            return Err(MdfError::BlockSerializationError(
-                format!("ChannelGroupBlock must have block_len=104, found {}", self.header.block_len)
-            ));
-        }
+        // The link count follows from `master_cg_addr`: a remote master needs
+        // the MDF 4.2 7th link (112 bytes). A block parsed with 7 links keeps
+        // them (writing a null master link); otherwise it is the 4.1 104 bytes.
+        let remote = self.master_cg_addr != 0;
+        let seven = remote || self.header.links_nr >= 7;
+        let expected_len: u64 = if seven { 112 } else { 104 };
+        let header = BlockHeader {
+            id: self.header.id.clone(),
+            reserved0: self.header.reserved0,
+            block_len: expected_len,
+            links_nr: if seven { 7 } else { 6 },
+        };
+        let flags = if remote { self.flags | CG_FLAG_REMOTE_MASTER } else { self.flags & !CG_FLAG_REMOTE_MASTER };
         
         // Create a buffer with exact capacity for efficiency
-        let mut buffer = Vec::with_capacity(104);
+        let mut buffer = Vec::with_capacity(expected_len as usize);
         
         // 1. Write the block header (24 bytes)
-        buffer.extend_from_slice(&self.header.to_bytes()?);
+        buffer.extend_from_slice(&header.to_bytes()?);
         
         // 2. Write the link addresses (48 bytes total, 6 links at 8 bytes each)
         buffer.extend_from_slice(&self.next_cg_addr.to_le_bytes());           // Next channel group
@@ -111,20 +150,22 @@ impl ChannelGroupBlock {
         buffer.extend_from_slice(&self.acq_source_addr.to_le_bytes());        // Acquisition source
         buffer.extend_from_slice(&self.first_sample_reduction_addr.to_le_bytes()); // Sample reduction
         buffer.extend_from_slice(&self.comment_addr.to_le_bytes());           // Comment
+        if seven {
+            buffer.extend_from_slice(&self.master_cg_addr.to_le_bytes());     // Remote master (4.2)
+        }
         
         // 3. Write the data section (32 bytes)
         buffer.extend_from_slice(&self.record_id.to_le_bytes());              // Record ID (8 bytes)
         buffer.extend_from_slice(&self.cycles_nr.to_le_bytes());              // Cycles count (8 bytes)
-        buffer.extend_from_slice(&self.flags.to_le_bytes());                  // Flags (2 bytes)
+        buffer.extend_from_slice(&flags.to_le_bytes());                       // Flags (2 bytes)
         buffer.extend_from_slice(&self.path_separator.to_le_bytes());         // Path separator (2 bytes)
         buffer.extend_from_slice(&self.reserved1.to_le_bytes());              // Reserved (4 bytes)
         buffer.extend_from_slice(&self.samples_byte_nr.to_le_bytes());        // Sample bytes (4 bytes)
         buffer.extend_from_slice(&self.invalidation_bytes_nr.to_le_bytes());  // Invalidation bytes (4 bytes)
         
-        // Verify the buffer is exactly 104 bytes
-        if buffer.len() != 104 {
+        if buffer.len() as u64 != expected_len {
             return Err(MdfError::BlockSerializationError(
-                format!("ChannelGroupBlock must be exactly 104 bytes, got {}", buffer.len())
+                format!("ChannelGroupBlock must be exactly {} bytes, got {}", expected_len, buffer.len())
             ));
         }
         
@@ -195,6 +236,7 @@ impl Default for ChannelGroupBlock {
             reserved1: 0,
             samples_byte_nr: 0,
             invalidation_bytes_nr: 0,
+            master_cg_addr: 0,
         }
     }
 }

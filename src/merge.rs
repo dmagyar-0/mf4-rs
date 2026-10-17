@@ -237,6 +237,8 @@ fn collect_groups(file: &MdfFile, src_file: usize) -> Result<Vec<MergedGroup>, M
 pub fn merge_files(output: &str, first: &str, second: &str) -> Result<(), MdfError> {
     let mdf1 = MdfFile::parse_from_file(first)?;
     let mdf2 = MdfFile::parse_from_file(second)?;
+    mdf1.reject_remote_masters("merge")?;
+    mdf2.reject_remote_masters("merge")?;
 
     let mut groups = collect_groups(&mdf1, 0)?;
     let other_groups = collect_groups(&mdf2, 1)?;

@@ -179,15 +179,18 @@ use `fromUrl` when a client wants to open an arbitrary remote file directly.
 
 ### `signalByteRanges` vs. `byteRanges`
 
-`signalByteRanges(name, group)` returns the **full data-section ranges** for
+`signalByteRanges(name, group)` returns the **full data-block ranges** for
 the group that owns the channel — one span per data-block fragment covering
-the entire section (block bytes minus the 24-byte header). These are exactly
+the whole block, including its 24-byte header (verified before decoding). These are exactly
 the bytes the fragment decoders need: `valuesFromFragments` /
 `readFromFragments` decode whole data sections (every channel is interleaved
 per record), so fetch `signalByteRanges` and pass the fetched fragments
 straight through — the requested channel and its master are both covered for
 any record layout. This is what `MdfIndex.values`/`read` fetch under the
-hood.
+hood. Fragments stored back to back are bridged into a single span, and for a
+column-oriented (MDF 4.2 remote-master) group the shared time group's spans are
+included as well — pass `withMaster = false` (third argument) to leave them
+out when only the values are needed, as `MdfIndex.values` does.
 
 `byteRanges(name, group)` is a lower-level power-user API: it returns the
 spans that a *single* channel's bytes fall in. Because records interleave all
@@ -196,6 +199,38 @@ on their own guarantee full-data-section coverage — so they are not suitable
 to feed directly to the fragment decoders. Use `byteRanges` only when you are
 building a custom fetch strategy and understand the record layout;
 otherwise prefer `signalByteRanges`.
+
+### Column-oriented files
+
+`toColumnOriented` rewrites any (uncompressed) MDF 4 file as a
+**column-oriented MDF 4.20** file built for exactly this access pattern: one
+channel group per signal with its data blocks back to back, timestamps shared
+through the MDF 4.2 remote-master link, and all metadata at the front. An index
+built with `MdfIndex.fromUrl` then needs a single prefix fetch, and reading a
+signal costs two range requests (values + shared time channel; one when they
+are adjacent) that transfer only that signal's bytes.
+
+```ts
+import { toColumnOriented, toColumnOrientedFile, toColumnOrientedStream } from "mf4-rs";
+
+// In memory: { bytes: Uint8Array, report }
+const { bytes, report } = toColumnOriented(fileBytes, { blockSize: 4 << 20 });
+
+// Node: stream file to file with bounded memory (sync fs I/O under the hood)
+await toColumnOrientedFile("recording.mf4", "recording.col.mf4");
+
+// Any synchronous random-access source / positional sink (e.g. an OPFS
+// FileSystemSyncAccessHandle in a browser worker)
+toColumnOrientedStream(
+  { size, read: (offset, length) => readBytes(offset, length) },
+  (offset, chunk) => writeBytes(offset, chunk),
+);
+```
+
+Options (all optional): `blockSize` (default 4 MiB), `memoryBudget` (default
+64 MiB), `readChunkSize` (default 4 MiB), `shareIdenticalTime` (default
+`true`). The returned `ColumnReport` lists the groups written, the
+`metadataSize` prefix length, and any `skippedChannels`.
 
 ### Custom range sources
 
@@ -269,12 +304,15 @@ Node classes plus a headless run of the `mf4-rs/web` build).
   `setTimeChannel`, `startDataBlock`, `writeRecord`, `finishDataBlock`,
   `finalize()`, `dispose()`. Numeric channels accept `number` or `bigint`
   record values; string channels (`addStringChannel`) accept `string`.
+- Column-oriented conversion: `toColumnOriented` (in memory),
+  `toColumnOrientedStream` (synchronous source/sink callbacks),
+  `toColumnOrientedFile` (Node); `ColumnOptions`, `ColumnReport`.
 - `RangeSource` implementations: `FetchRangeSource`, `FileRangeSource`,
   `BytesRangeSource`.
 - Types: `Signal`, `GroupInfo`, `IndexGroupInfo`, `ChannelInfo`,
   `ByteRange`, `ChannelValue`.
 - Entry points: `mf4-rs` (Node, synchronous) and `mf4-rs/web` (browser; adds
   `init()` and re-exports the same classes minus the Node-only
-  `FileRangeSource`).
+  `FileRangeSource` and `toColumnOrientedFile`).
 
 See the inline TSDoc comments in `src/` for full parameter documentation.

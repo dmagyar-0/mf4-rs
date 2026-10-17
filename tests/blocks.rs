@@ -150,6 +150,51 @@ fn channel_group_block_roundtrip() -> Result<(), MdfError> {
 }
 
 #[test]
+fn channel_group_block_link_count_follows_master_link() -> Result<(), MdfError> {
+    // MDF 4.1: 104 bytes, byte-identical round trip.
+    let mut cg = ChannelGroupBlock::default();
+    cg.cycles_nr = 42;
+    cg.samples_byte_nr = 9;
+    let bytes = cg.to_bytes()?;
+    assert_eq!(bytes.len(), 104);
+    assert_eq!(ChannelGroupBlock::from_bytes(&bytes)?.to_bytes()?, bytes);
+
+    // A remote master: 7 links / 112 bytes and flag bit 3, whatever the header says.
+    cg.master_cg_addr = 0x1000;
+    let bytes = cg.to_bytes()?;
+    assert_eq!(bytes.len(), 112);
+    let parsed = ChannelGroupBlock::from_bytes(&bytes)?;
+    assert_eq!((parsed.header.links_nr, parsed.header.block_len), (7, 112));
+    assert_eq!(parsed.master_cg_addr, 0x1000);
+    assert_eq!(parsed.flags & (1 << 3), 1 << 3);
+    assert_eq!((parsed.cycles_nr, parsed.samples_byte_nr), (42, 9));
+    assert_eq!(parsed.to_bytes()?, bytes);
+
+    // A parsed 7-link block without a master keeps its 7 links (null link).
+    let mut parsed = parsed;
+    parsed.master_cg_addr = 0;
+    let bytes = parsed.to_bytes()?;
+    assert_eq!(bytes.len(), 112);
+    let again = ChannelGroupBlock::from_bytes(&bytes)?;
+    assert_eq!((again.master_cg_addr, again.flags & (1 << 3)), (0, 0));
+    assert_eq!(again.cycles_nr, 42);
+
+    // Data section beyond 7 links is read at the offset the link count implies.
+    let mut eight = bytes[..24 + 56].to_vec();
+    eight.extend_from_slice(&0u64.to_le_bytes());
+    eight.extend_from_slice(&bytes[24 + 56..]);
+    eight[8..16].copy_from_slice(&120u64.to_le_bytes());
+    eight[16..24].copy_from_slice(&8u64.to_le_bytes());
+    assert_eq!(ChannelGroupBlock::from_bytes(&eight)?.cycles_nr, 42);
+
+    // A link count the block length cannot hold is an error.
+    let mut bad = cg.to_bytes()?;
+    bad[8..16].copy_from_slice(&104u64.to_le_bytes());
+    assert!(ChannelGroupBlock::from_bytes(&bad).is_err());
+    Ok(())
+}
+
+#[test]
 fn channel_block_roundtrip() -> Result<(), MdfError> {
     let ch = ChannelBlock::default();
     let bytes = ch.to_bytes()?;

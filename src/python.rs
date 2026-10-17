@@ -619,6 +619,11 @@ impl PyMDF {
     }
 
     /// Find a channel group by name (first match), or ``None``.
+    ///
+    /// In a column-oriented file every signal is its own group named after
+    /// its source group, so this returns only the first of them; use
+    /// ``read(name, group=...)`` / ``values(name, group=...)``, which search
+    /// every group with that name.
     fn group(&self, name: &str) -> PyResult<Option<PyChannelGroupInfo>> {
         for g in self.mdf.channel_groups() {
             if g.name()?.as_deref() == Some(name) {
@@ -681,7 +686,9 @@ impl PyMDF {
         let signal = py.allow_threads(|| -> Result<Option<crate::signal::Signal>, MdfError> {
             match group {
                 Some(gn) => match self.mdf.group(gn) {
-                    Some(g) => g.signal(name),
+                    // Search every group with that name: a column-oriented
+                    // file has one channel group per signal.
+                    Some(_) => self.mdf.signal_in(gn, name),
                     None => Err(MdfError::BlockSerializationError(format!(
                         "Channel group '{}' not found", gn
                     ))),
@@ -1323,6 +1330,11 @@ impl PyMdfIndex {
     }
 
     /// Find a channel group by name (first match), or ``None``.
+    ///
+    /// In a column-oriented file every signal is its own group named after
+    /// its source group, so this returns only the first of them; use
+    /// ``read(name, group=...)`` / ``values(name, group=...)``, which search
+    /// every group with that name.
     fn group(&self, name: &str) -> Option<PyChannelGroupInfo> {
         self.index.group(name).map(PyChannelGroupInfo::from_indexed)
     }
@@ -1827,6 +1839,153 @@ fn cut_mdf_by_time(
     Ok(())
 }
 
+/// Summary of a :func:`to_column_oriented` conversion.
+///
+/// Attributes
+/// ----------
+/// source_groups : int
+///     Channel groups found in the source file.
+/// time_groups : int
+///     Time (master) channel groups written. Each is shared by every signal of
+///     its source group(s).
+/// signal_groups : int
+///     Signal channel groups written (one per signal).
+/// shared_time_groups : int
+///     Source groups whose time axis was byte-identical to an earlier group's
+///     and therefore reuse that group's time channel.
+/// data_blocks : int
+///     Data blocks (``##DV`` / ``##DT`` / ``##SD``) written.
+/// metadata_size : int
+///     Byte offset where sample data starts. Everything before it is metadata,
+///     so fetching this prefix is enough to build an index of the file.
+/// file_size : int
+///     Size of the output file in bytes.
+/// skipped_channels : list[str]
+///     Channels that could not be represented as a column, as
+///     ``"group/channel: reason"``.
+#[gen_stub_pyclass]
+#[pyclass(name = "ColumnReport")]
+#[derive(Clone)]
+pub struct PyColumnReport {
+    #[pyo3(get)]
+    pub source_groups: usize,
+    #[pyo3(get)]
+    pub time_groups: usize,
+    #[pyo3(get)]
+    pub signal_groups: usize,
+    #[pyo3(get)]
+    pub shared_time_groups: usize,
+    #[pyo3(get)]
+    pub data_blocks: usize,
+    #[pyo3(get)]
+    pub metadata_size: u64,
+    #[pyo3(get)]
+    pub file_size: u64,
+    #[pyo3(get)]
+    pub skipped_channels: Vec<String>,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyColumnReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "ColumnReport(signal_groups={}, time_groups={}, shared_time_groups={}, \
+             data_blocks={}, metadata_size={}, file_size={}, skipped_channels={})",
+            self.signal_groups,
+            self.time_groups,
+            self.shared_time_groups,
+            self.data_blocks,
+            self.metadata_size,
+            self.file_size,
+            self.skipped_channels.len()
+        )
+    }
+}
+
+impl From<crate::column::ColumnReport> for PyColumnReport {
+    fn from(r: crate::column::ColumnReport) -> Self {
+        Self {
+            source_groups: r.source_groups,
+            time_groups: r.time_groups,
+            signal_groups: r.signal_groups,
+            shared_time_groups: r.shared_time_groups,
+            data_blocks: r.data_blocks,
+            metadata_size: r.metadata_size,
+            file_size: r.file_size,
+            skipped_channels: r.skipped_channels,
+        }
+    }
+}
+
+/// Rewrite an MDF 4 file as a column-oriented MDF 4.20 file optimised for
+/// reading single signals from cloud storage.
+///
+/// Each signal gets its own channel group whose data blocks are written back
+/// to back, so one HTTP range request fetches the whole signal. Timestamps are
+/// stored once per source group and shared by all its signals through the MDF
+/// 4.2 *remote master* link (and, with ``share_identical_time``, shared across
+/// source groups that have identical time axes). All metadata blocks sit at
+/// the front of the file, so building an :class:`MdfIndex` over HTTP needs a
+/// single prefix fetch. Raw bytes are copied, never decoded: conversions,
+/// units, comments, sources, invalidation bits and VLSD channels carry over.
+///
+/// The source is streamed once and memory stays bounded by ``memory_budget``
+/// regardless of file size. The GIL is released during the conversion.
+///
+/// Parameters
+/// ----------
+/// input_path : str
+///     Path to the source MF4 file (sorted or unsorted, uncompressed).
+/// output_path : str
+///     Destination path (overwritten); must differ from ``input_path``.
+/// block_size : int, optional
+///     Target payload size of each data block. Larger signals are split into
+///     several equally sized blocks (whole records each), listed by a ``##DL``.
+///     Default 4 MiB.
+/// memory_budget : int, optional
+///     Upper bound for the per-channel write buffers. Default 64 MiB.
+/// share_identical_time : bool, optional
+///     Default ``True``. Merge byte-identical time axes of different source groups into one
+///     time channel group.
+///
+/// Returns
+/// -------
+/// ColumnReport
+///
+/// Raises
+/// ------
+/// MdfException
+///     On I/O errors or unsupported input (e.g. compressed ``##DZ`` blocks).
+///
+/// Example
+/// -------
+/// >>> report = mf4_rs.to_column_oriented("recording.mf4", "recording.col.mf4")
+/// >>> idx = mf4_rs.MdfIndex.from_url("https://host/recording.col.mf4")
+/// >>> speed = idx.read("Speed")   # two range requests: values + time
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn to_column_oriented(
+    py: Python<'_>,
+    input_path: &str,
+    output_path: &str,
+    block_size: Option<u64>,
+    memory_budget: Option<u64>,
+    share_identical_time: Option<bool>,
+) -> PyResult<PyColumnReport> {
+    let defaults = crate::column::ColumnOptions::default();
+    let options = crate::column::ColumnOptions {
+        block_size: block_size.unwrap_or(defaults.block_size),
+        memory_budget: memory_budget.unwrap_or(defaults.memory_budget),
+        share_identical_time: share_identical_time.unwrap_or(defaults.share_identical_time),
+        ..defaults
+    };
+    let report = py.allow_threads(|| {
+        crate::column::to_column_oriented(input_path, output_path, &options)
+    })?;
+    Ok(report.into())
+}
+
 /// Convert a Python `datetime`, an ISO 8601 string, or a numeric UNIX
 /// timestamp (seconds, with fractional part) into UNIX-epoch nanoseconds.
 fn coerce_to_unix_ns(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<i64> {
@@ -2046,6 +2205,7 @@ pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlockInfo>()?;
     m.add_class::<PyLinkInfo>()?;
     m.add_class::<PyGapInfo>()?;
+    m.add_class::<PyColumnReport>()?;
 
     // Helper functions
     m.add_function(wrap_pyfunction!(create_float_value, m)?)?;
@@ -2060,6 +2220,7 @@ pub fn init_mf4_rs_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(merge_files, m)?)?;
     m.add_function(wrap_pyfunction!(cut_mdf_by_time, m)?)?;
     m.add_function(wrap_pyfunction!(cut_mdf_by_utc, m)?)?;
+    m.add_function(wrap_pyfunction!(to_column_oriented, m)?)?;
 
     Ok(())
 }

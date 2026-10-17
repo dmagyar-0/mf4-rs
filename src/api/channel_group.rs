@@ -14,6 +14,10 @@ pub struct ChannelGroup<'a> {
     raw_data_group:    &'a RawDataGroup,
     raw_channel_group: &'a RawChannelGroup,
     mmap:              &'a [u8],
+    /// Every data group of the file, used to resolve an MDF 4.2 remote master
+    /// (a master channel stored in another channel group). Empty when the
+    /// group was built standalone via [`ChannelGroup::new`].
+    file_groups:       &'a [RawDataGroup],
 }
 
 impl<'a> ChannelGroup<'a> {
@@ -31,7 +35,47 @@ impl<'a> ChannelGroup<'a> {
         raw_channel_group: &'a RawChannelGroup,
         mmap: &'a [u8],
     ) -> Self {
-        ChannelGroup { raw_data_group, raw_channel_group, mmap }
+        ChannelGroup { raw_data_group, raw_channel_group, mmap, file_groups: &[] }
+    }
+
+    /// Like [`ChannelGroup::new`], but aware of the file's other data groups so
+    /// MDF 4.2 remote masters can be resolved.
+    pub(crate) fn with_file_groups(
+        raw_data_group: &'a RawDataGroup,
+        raw_channel_group: &'a RawChannelGroup,
+        mmap: &'a [u8],
+        file_groups: &'a [RawDataGroup],
+    ) -> Self {
+        ChannelGroup { raw_data_group, raw_channel_group, mmap, file_groups }
+    }
+
+    /// The channel holding this group's time axis: the group's own master
+    /// channel (channel type 2), or — for an MDF 4.2 column-oriented file —
+    /// the master of the channel group referenced by `cg_cg_master`.
+    ///
+    /// `None` when the group has no master.
+    pub fn master_channel(&self) -> Option<Channel<'a>> {
+        if let Some(raw) = self
+            .raw_channel_group
+            .raw_channels
+            .iter()
+            .find(|c| c.block.channel_type == 2)
+        {
+            return Some(Channel::new(&raw.block, self.raw_data_group, self.raw_channel_group, raw, self.mmap));
+        }
+        let target = self.raw_channel_group.block.master_cg_addr;
+        if target == 0 {
+            return None;
+        }
+        for dg in self.file_groups {
+            for cg in &dg.channel_groups {
+                if cg.addr == target {
+                    let raw = cg.raw_channels.iter().find(|c| c.block.channel_type == 2)?;
+                    return Some(Channel::new(&raw.block, dg, cg, raw, self.mmap));
+                }
+            }
+        }
+        None
     }
 
     /// Retrieve the human readable group name.
@@ -83,25 +127,23 @@ impl<'a> ChannelGroup<'a> {
     ///
     /// Returns `Ok(None)` if no channel with that name exists in this group.
     /// `timestamps` is empty when the group has no master channel or when the
-    /// requested channel *is* the master.
+    /// requested channel *is* the master. A remote master (MDF 4.2
+    /// column-oriented files) is followed transparently.
     pub fn signal(&self, name: &str) -> Result<Option<Signal>, MdfError> {
         let channels = self.channels();
         let mut target: Option<usize> = None;
-        let mut master: Option<usize> = None;
         for (i, ch) in channels.iter().enumerate() {
-            // First master wins (matches MdfIndex's master selection)
-            if master.is_none() && ch.block().channel_type == 2 {
-                master = Some(i);
-            }
-            if target.is_none() && ch.name()?.as_deref() == Some(name) {
+            if ch.name()?.as_deref() == Some(name) {
                 target = Some(i);
+                break;
             }
         }
         let Some(ci) = target else { return Ok(None) };
 
         let values = channels[ci].values()?;
-        let timestamps = match master {
-            Some(mi) if mi != ci => channels[mi].values_as_f64()?,
+        // First master wins (matches MdfIndex's master selection)
+        let timestamps = match self.master_channel() {
+            Some(m) if !std::ptr::eq(m.block(), channels[ci].block()) => m.values_as_f64()?,
             _ => Vec::new(),
         };
         Ok(Some(Signal {
