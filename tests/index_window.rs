@@ -223,3 +223,64 @@ fn writer_linear_conversion_is_applied() {
     assert_eq!(ch.values_as_f64().unwrap(), vec![10.0]);
     assert_eq!(ch.conversion().unwrap().unwrap().cc_val, vec![-40.0, 0.5]);
 }
+
+#[test]
+fn window_reads_verify_block_headers() {
+    use mf4_rs::index::SliceRangeReader;
+    let n = 300_000; // two data blocks
+    let path = write_file("index_window_headers.mf4", n);
+    let index = MdfIndex::from_file(&path).unwrap();
+    let blocks = index.groups()[0].data_blocks.clone();
+    assert!(blocks.len() > 1);
+    let bytes = std::fs::read(&path).unwrap();
+
+    // A block that is not ##DT/##DV (e.g. compressed) is refused, whether the
+    // window starts at the block's first record or inside it.
+    let second = blocks[1].file_offset as usize;
+    let mut dz = bytes.clone();
+    dz[second..second + 4].copy_from_slice(b"##DZ");
+    let mut r = index.open(SliceRangeReader::new(dz));
+    let first_rec_of_second = (blocks[0].size - 24) / 16;
+    assert!(r.signal_records("V", first_rec_of_second, 10).is_err());
+    assert!(r.signal_records("V", first_rec_of_second + 5, 10).is_err());
+    assert!(r.signal_records("V", 0, 10).is_ok(), "first block is intact");
+
+    // A header shorter than the index expects (stale index / other file).
+    let mut short = bytes.clone();
+    let len_pos = second + 8;
+    let real = u64::from_le_bytes(short[len_pos..len_pos + 8].try_into().unwrap());
+    short[len_pos..len_pos + 8].copy_from_slice(&(real - 16 * 100).to_le_bytes());
+    let mut r = index.open(SliceRangeReader::new(short));
+    let err = r.signal_records("V", n - 10, 10).unwrap_err().to_string();
+    assert!(err.contains("rebuild the index"), "{err}");
+}
+
+#[test]
+fn virtual_read_is_bounded_by_the_data() {
+    let path = write_file("index_window_forged.mf4", 10);
+    let mut index = MdfIndex::from_file(&path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&index.to_json().unwrap()).unwrap();
+    v["channel_groups"][0]["record_count"] = serde_json::json!(u64::MAX / 2);
+    v["channel_groups"][0]["channels"][1]["channel_type"] = serde_json::json!(6);
+    index = MdfIndex::from_json(&v.to_string()).unwrap();
+    let mut r = index.open(FileRangeReader::new(&path).unwrap());
+    assert!(r.values("V").is_err());
+}
+
+#[test]
+fn writer_conversion_after_start_data_block_is_refused() {
+    let path = std::env::temp_dir().join("index_window_late_conv.mf4");
+    let mut w = MdfWriter::new(path.to_str().unwrap()).unwrap();
+    w.init_mdf_file().unwrap();
+    let cg = w.add_channel_group(None, |_| {}).unwrap();
+    let v = w
+        .add_channel(&cg, None, |ch| {
+            ch.data_type = DataType::UnsignedIntegerLE;
+            ch.name = Some("V".into());
+            ch.bit_count = 8;
+        })
+        .unwrap();
+    w.start_data_block_for_cg(&cg, 0).unwrap();
+    assert!(w.add_linear_conversion(0.0, 1.0, Some(&v)).is_err());
+    assert!(w.add_value_to_text_conversion(&[(1, "one")], "x", Some(&v)).is_err());
+}

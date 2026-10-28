@@ -1783,7 +1783,7 @@ impl MdfIndex {
         let conversion = Self::resolve_conversion(channel, reader)?;
 
         if channel.is_virtual() {
-            return Self::virtual_values(0, group.record_count, conversion.as_ref());
+            return Self::virtual_values(group, 0, group.record_count, conversion.as_ref());
         }
         if channel.channel_type == 1 {
             return self.read_vlsd_channel_values(group, channel, conversion.as_ref(), reader);
@@ -1797,10 +1797,34 @@ impl MdfIndex {
     /// `[start, start + count)`: the raw value is the record index, converted
     /// through the channel's conversion (MDF 4.1 §6.6.3).
     fn virtual_values(
+        group: &IndexedChannelGroup,
         start: u64,
         count: u64,
         conversion: Option<&ConversionBlock>,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
+        // Nothing is read for a virtual channel, so bound the record count by
+        // what the group's data blocks hold (or a sane cap when it has none)
+        // instead of trusting a possibly forged `record_count`.
+        let available = if group.data_blocks.is_empty() {
+            1 << 24
+        } else {
+            let record_size = Self::checked_record_size(group)?;
+            let mut total = 0u64;
+            for block in &group.data_blocks {
+                total = total.saturating_add(Self::records_in_block(block, record_size)?);
+            }
+            total
+        };
+        match start.checked_add(count) {
+            Some(end) if end <= available => {}
+            _ => {
+                return Err(MdfError::BlockSerializationError(format!(
+                    "virtual channel read of {} records from {} exceeds the {} records the \
+                     group's data holds (rebuild the index)",
+                    count, start, available
+                )))
+            }
+        }
         let mut values = Vec::with_capacity((count as usize).min(1 << 24));
         for i in start..start + count {
             let raw = DecodedValue::UnsignedInteger(i);
@@ -1816,10 +1840,9 @@ impl MdfIndex {
     /// `[start, start + count)` only.
     ///
     /// For a regular channel only the bytes of the window's records are read
-    /// (one range per data block the window touches). A VLSD channel is read in
-    /// full and sliced, since its payloads sit in a separate stream. The
-    /// window's data-block headers are not re-read, so the index must match
-    /// the file.
+    /// (one range per data block the window touches, plus that block's
+    /// 24-byte header, which is verified). A VLSD channel is read in full and
+    /// sliced, since its payloads sit in a separate stream.
     pub(crate) fn read_channel_values_window<R: ByteRangeReader<Error = MdfError>>(
         &self,
         g: usize,
@@ -1844,7 +1867,7 @@ impl MdfIndex {
         reader: &mut R,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         if channel.is_virtual() {
-            return Self::virtual_values(start, count, conversion);
+            return Self::virtual_values(group, start, count, conversion);
         }
         if channel.channel_type == 1 {
             let all = self.read_vlsd_channel_values(group, channel, conversion, reader)?;
@@ -1915,9 +1938,33 @@ impl MdfIndex {
             let block_end = block_start + Self::records_in_block(block, record_size)?;
             let (from, to) = (start.max(block_start), end.min(block_end));
             if from < to {
-                let offset = block.file_offset + 24 + (from - block_start) * record_size as u64;
-                match reader.read_range(offset, (to - from) * record_size as u64) {
-                    Ok(bytes) if first_err.is_none() => f(&bytes)?,
+                let rel = (from - block_start) * record_size as u64;
+                let len = (to - from) * record_size as u64;
+                // Verify the block header like the full read path does (the
+                // header wins over the index): a window starting at the
+                // block's first record reads header and data in one request.
+                let read = if rel == 0 {
+                    reader.read_range(block.file_offset, 24 + len).map(|mut bytes| {
+                        let data = bytes.split_off(24.min(bytes.len()));
+                        (bytes, data)
+                    })
+                } else {
+                    let header = reader.read_range(block.file_offset, 24);
+                    let data = reader.read_range(block.file_offset + 24 + rel, len);
+                    header.and_then(|h| data.map(|d| (h, d)))
+                };
+                match read {
+                    Ok((header, data)) if first_err.is_none() => {
+                        let real_len = Self::verified_data_len(Some(&header), block)?;
+                        if rel + len > real_len {
+                            return Err(MdfError::BlockSerializationError(format!(
+                                "data block at offset {} holds {} data bytes but the index \
+                                 expects at least {} (inconsistent file; rebuild the index)",
+                                block.file_offset, real_len, rel + len
+                            )));
+                        }
+                        f(&data)?
+                    }
                     Ok(_) => {}
                     Err(e) if reader.is_probing() => {
                         first_err.get_or_insert(e);
@@ -3035,7 +3082,7 @@ impl MdfIndex {
         let conversion = Self::resolve_conversion(channel, reader)?;
 
         if channel.is_virtual() {
-            let vals = Self::virtual_values(0, group.record_count, conversion.as_ref())?;
+            let vals = Self::virtual_values(group, 0, group.record_count, conversion.as_ref())?;
             return Ok(Self::vlsd_values_to_f64(vals));
         }
         if channel.channel_type == 1 {
@@ -3091,7 +3138,7 @@ impl MdfIndex {
         let conversion = Self::resolve_conversion(channel, &mut slice_reader)?;
 
         if channel.is_virtual() {
-            return Self::virtual_values(0, group.record_count, conversion.as_ref());
+            return Self::virtual_values(group, 0, group.record_count, conversion.as_ref());
         }
         if channel.channel_type == 1 {
             return self.read_vlsd_channel_values(group, channel, conversion.as_ref(), &mut slice_reader);
@@ -3142,7 +3189,7 @@ impl MdfIndex {
         let conversion = Self::resolve_conversion(channel, &mut slice_reader)?;
 
         if channel.is_virtual() {
-            let vals = Self::virtual_values(0, group.record_count, conversion.as_ref())?;
+            let vals = Self::virtual_values(group, 0, group.record_count, conversion.as_ref())?;
             return Ok(Self::vlsd_values_to_f64(vals));
         }
         if channel.channel_type == 1 {
@@ -3233,7 +3280,9 @@ impl Bound {
         if span <= TIME_SEARCH_FANOUT {
             return (self.lo..self.hi).collect();
         }
-        (0..TIME_SEARCH_FANOUT).map(|i| self.lo + i * span / TIME_SEARCH_FANOUT).collect()
+        (0..TIME_SEARCH_FANOUT)
+            .map(|i| self.lo + (i as u128 * span as u128 / TIME_SEARCH_FANOUT as u128) as u64)
+            .collect()
     }
 
     /// Narrow to the gap between the last probe below the bound and the first

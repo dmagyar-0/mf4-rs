@@ -151,6 +151,7 @@ impl MdfWriter {
         default_text: &str,
         channel_id: Option<&str>,
     ) -> Result<(String, u64), MdfError> {
+        self.ensure_no_open_data_block("add_value_to_text_conversion")?;
         let cc_count = self.block_positions.keys().filter(|k| k.starts_with("cc_")).count();
         let cc_id = format!("cc_{}", cc_count);
 
@@ -208,6 +209,7 @@ impl MdfWriter {
         factor: f64,
         channel_id: Option<&str>,
     ) -> Result<(String, u64), MdfError> {
+        self.ensure_no_open_data_block("add_linear_conversion")?;
         let cc_count = self.block_positions.keys().filter(|k| k.starts_with("cc_")).count();
         let cc_id = format!("cc_{}", cc_count);
         let block = ConversionBlock {
@@ -236,6 +238,18 @@ impl MdfWriter {
             self.update_block_link(cn, 56, &cc_id)?;
         }
         Ok((cc_id, pos))
+    }
+
+    /// Metadata blocks are written at the current file position, which lies
+    /// inside an open `##DT` block while records are being written; refuse
+    /// instead of corrupting the data.
+    fn ensure_no_open_data_block(&self, what: &str) -> Result<(), MdfError> {
+        if self.open_dts.is_empty() {
+            return Ok(());
+        }
+        Err(MdfError::BlockSerializationError(format!(
+            "{what} must be called before start_data_block (a data block is open)"
+        )))
     }
 
     /// Write a `##TX` block holding `name` and link it as the channel group's

@@ -636,6 +636,11 @@ export class MdfIndex {
     sourceOrOptions: RangeSource | ReadOptions | null | undefined,
     group: string | null | undefined,
   ): ReadOptions {
+    // Plain-JS callers may pass a group name here, as `Mdf.values(name, group)`
+    // takes it.
+    if (typeof sourceOrOptions === "string") {
+      return { group: sourceOrOptions };
+    }
     if (sourceOrOptions && typeof (sourceOrOptions as RangeSource).read === "function") {
       return { source: sourceOrOptions as RangeSource, group };
     }

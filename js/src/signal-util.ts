@@ -68,7 +68,7 @@ export function sliceSignal(signal: Signal, window: ReadWindow, timeAxis: ArrayL
   let start: number;
   let end: number;
   if (window.startTime !== undefined || window.endTime !== undefined) {
-    if (timeAxis.length === 0) {
+    if (timeAxis.length === 0 && signal.values.length > 0) {
       throw new Error(`Channel '${signal.name}' has no master (time) channel; cannot select by time.`);
     }
     const t0 = window.startTime;

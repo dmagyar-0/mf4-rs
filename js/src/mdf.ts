@@ -90,7 +90,18 @@ export class Mdf {
     if (!hasWindow(opts)) {
       return signal;
     }
-    return sliceSignal(signal, checkWindow(opts), timeAxisOf(signal));
+    const window = checkWindow(opts);
+    const byTime = window.startTime !== undefined || window.endTime !== undefined;
+    // Without timestamps only a master channel is its own time axis; any
+    // other channel's values must not be mistaken for times.
+    const axis =
+      signal.timestamps.length || !byTime || this.#isMaster(name, opts.group)
+        ? timeAxisOf(signal)
+        : [];
+    if (byTime && axis.length === 0 && signal.values.length > 0) {
+      throw new Error(`Channel '${name}' has no master (time) channel; cannot select by time.`);
+    }
+    return sliceSignal(signal, window, axis);
   }
 
   /**

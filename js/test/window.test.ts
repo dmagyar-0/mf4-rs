@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { buildSampleFile } from "./helpers";
 import { Mdf } from "../src/mdf";
 import { MdfIndex } from "../src/mdf-index";
+import { MdfWriter } from "../src/mdf-writer";
 import { BytesRangeSource, type RangeSource } from "../src/range-source";
 import { toAbsoluteNs } from "../src/signal-util";
 
@@ -162,4 +163,40 @@ test("modules shared with the web entry import no node: built-ins", () => {
     const text = readFileSync(path.join(__dirname, "../src", file), "utf8");
     assert.doesNotMatch(text, /["']node:/, `${file} references a node: module`);
   }
+});
+
+test("Mdf time window on a group without master throws instead of using values as times", () => {
+  const w = new MdfWriter();
+  w.initMdfFile();
+  const g = w.addChannelGroup("NoMaster");
+  w.addFloatChannel(g, "Speed");
+  w.startDataBlock(g);
+  for (let i = 0; i < 10; i++) w.writeRecord(g, [i]);
+  w.finishDataBlock(g);
+  const mdf = Mdf.fromBytes(w.finalize());
+  w.dispose();
+  assert.throws(() => mdf.read("Speed", { startTime: 3, endTime: 5 }), /no master/);
+  assert.throws(() => mdf.values("Speed", { startTime: 3 }), /no master/);
+  assert.equal(mdf.values("Speed", { startRecord: 3, recordCount: 2 }).length, 2);
+  mdf.dispose();
+});
+
+test("MdfIndex accepts a group name as the second argument", async () => {
+  const w = new MdfWriter();
+  w.initMdfFile();
+  for (const [name, base] of [["A", 0], ["B", 100]] as const) {
+    const g = w.addChannelGroup(name);
+    const t = w.addTimeChannel(g, "Time");
+    w.addFloatChannel(g, "V");
+    w.setTimeChannel(t);
+    w.startDataBlock(g);
+    for (let i = 0; i < 3; i++) w.writeRecord(g, [i, base + i]);
+    w.finishDataBlock(g);
+  }
+  const idx = MdfIndex.fromBytes(w.finalize());
+  w.dispose();
+  const asAny = idx as unknown as { values(n: string, g: string): Promise<Float64Array> };
+  assert.deepEqual(Array.from(await asAny.values("V", "B")), [100, 101, 102]);
+  assert.deepEqual(Array.from(await idx.values("V", { group: "B" })), [100, 101, 102]);
+  idx.dispose();
 });
