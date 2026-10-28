@@ -1,3 +1,8 @@
+## v3.8.0 — 2026-10-28
+
+### Features
+- browser-safe bundle, time/record-window reads, channel metadata and conversion info (#95)
+
 ## v3.7.0 — 2026-10-17
 
 ### Features
