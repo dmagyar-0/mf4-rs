@@ -284,3 +284,51 @@ fn writer_conversion_after_start_data_block_is_refused() {
     assert!(w.add_linear_conversion(0.0, 1.0, Some(&v)).is_err());
     assert!(w.add_value_to_text_conversion(&[(1, "one")], "x", Some(&v)).is_err());
 }
+
+#[test]
+fn column_virtual_master_is_bounded_by_its_signal_groups() {
+    // Source with a virtual master; the column-oriented output keeps it as a
+    // byte-less time group referenced by the signal group.
+    let src = std::env::temp_dir().join("index_window_colvirt.mf4");
+    let out = std::env::temp_dir().join("index_window_colvirt_out.mf4");
+    let mut w = MdfWriter::new(src.to_str().unwrap()).unwrap();
+    w.init_mdf_file().unwrap();
+    let cg = w.add_channel_group(None, |_| {}).unwrap();
+    let t = w
+        .add_channel(&cg, None, |ch| {
+            ch.data_type = DataType::UnsignedIntegerLE;
+            ch.name = Some("t".into());
+            ch.channel_type = 3;
+            ch.sync_type = 1;
+            ch.bit_count = 0;
+        })
+        .unwrap();
+    w.add_channel(&cg, Some(&t), |ch| {
+        ch.data_type = DataType::UnsignedIntegerLE;
+        ch.name = Some("V".into());
+        ch.bit_count = 32;
+    })
+    .unwrap();
+    w.start_data_block_for_cg(&cg, 0).unwrap();
+    for i in 0..50u64 {
+        w.write_record(&cg, &[DecodedValue::UnsignedInteger(0), DecodedValue::UnsignedInteger(i)]).unwrap();
+    }
+    w.finish_data_block(&cg).unwrap();
+    w.finalize().unwrap();
+    mf4_rs::column::to_column_oriented(&src, &out, &Default::default()).unwrap();
+
+    let index = MdfIndex::from_file(out.to_str().unwrap()).unwrap();
+    let time_group = index.groups().iter().position(|g| g.channel("t").is_some()).unwrap();
+    assert!(index.groups()[time_group].data_blocks.is_empty(), "time group stores no bytes");
+    let mut r = index.open(FileRangeReader::new(out.to_str().unwrap()).unwrap());
+    let sig = r.signal("V").unwrap();
+    assert_eq!(sig.values.len(), 50);
+    assert_eq!(sig.timestamps, (0..50).map(|i| i as f64).collect::<Vec<_>>());
+
+    // A forged time-group record count beyond the signal data is refused.
+    let mut v: serde_json::Value = serde_json::from_str(&index.to_json().unwrap()).unwrap();
+    v["channel_groups"][time_group]["record_count"] = serde_json::json!(u64::MAX / 2);
+    let forged = MdfIndex::from_json(&v.to_string()).unwrap();
+    let mut r = forged.open(FileRangeReader::new(out.to_str().unwrap()).unwrap());
+    assert!(r.values("t").is_err());
+}

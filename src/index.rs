@@ -1783,7 +1783,7 @@ impl MdfIndex {
         let conversion = Self::resolve_conversion(channel, reader)?;
 
         if channel.is_virtual() {
-            return Self::virtual_values(group, 0, group.record_count, conversion.as_ref());
+            return self.virtual_values(group, 0, group.record_count, conversion.as_ref());
         }
         if channel.channel_type == 1 {
             return self.read_vlsd_channel_values(group, channel, conversion.as_ref(), reader);
@@ -1797,23 +1797,28 @@ impl MdfIndex {
     /// `[start, start + count)`: the raw value is the record index, converted
     /// through the channel's conversion (MDF 4.1 §6.6.3).
     fn virtual_values(
+        &self,
         group: &IndexedChannelGroup,
         start: u64,
         count: u64,
         conversion: Option<&ConversionBlock>,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         // Nothing is read for a virtual channel, so bound the record count by
-        // what the group's data blocks hold (or a sane cap when it has none)
-        // instead of trusting a possibly forged `record_count`.
-        let available = if group.data_blocks.is_empty() {
-            1 << 24
+        // stored data instead of trusting a possibly forged `record_count`:
+        // the group's own data blocks, or — for a byte-less time group (the
+        // virtual master `to_column_oriented` writes) — the largest
+        // data-backed group using it as its remote master.
+        let available = if !group.data_blocks.is_empty() {
+            Self::stored_records(group)?
         } else {
-            let record_size = Self::checked_record_size(group)?;
-            let mut total = 0u64;
-            for block in &group.data_blocks {
-                total = total.saturating_add(Self::records_in_block(block, record_size)?);
-            }
-            total
+            let me = self.channel_groups.iter().position(|g| std::ptr::eq(g, group));
+            self.channel_groups
+                .iter()
+                .filter(|g| me.is_some() && g.master_group == me && !g.data_blocks.is_empty())
+                .filter_map(|g| Self::stored_records(g).ok())
+                .max()
+                // Nothing stored to check against: trust the group.
+                .unwrap_or(group.record_count)
         };
         match start.checked_add(count) {
             Some(end) if end <= available => {}
@@ -1867,7 +1872,7 @@ impl MdfIndex {
         reader: &mut R,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         if channel.is_virtual() {
-            return Self::virtual_values(group, start, count, conversion);
+            return self.virtual_values(group, start, count, conversion);
         }
         if channel.channel_type == 1 {
             let all = self.read_vlsd_channel_values(group, channel, conversion, reader)?;
@@ -1984,6 +1989,16 @@ impl MdfIndex {
             )));
         }
         Ok(())
+    }
+
+    /// Records held by a group's data blocks.
+    fn stored_records(group: &IndexedChannelGroup) -> Result<u64, MdfError> {
+        let record_size = Self::checked_record_size(group)?;
+        let mut total = 0u64;
+        for block in &group.data_blocks {
+            total = total.saturating_add(Self::records_in_block(block, record_size)?);
+        }
+        Ok(total)
     }
 
     fn group_and_channel(&self, g: usize, c: usize) -> Result<(&IndexedChannelGroup, &IndexedChannel), MdfError> {
@@ -3082,7 +3097,7 @@ impl MdfIndex {
         let conversion = Self::resolve_conversion(channel, reader)?;
 
         if channel.is_virtual() {
-            let vals = Self::virtual_values(group, 0, group.record_count, conversion.as_ref())?;
+            let vals = self.virtual_values(group, 0, group.record_count, conversion.as_ref())?;
             return Ok(Self::vlsd_values_to_f64(vals));
         }
         if channel.channel_type == 1 {
@@ -3138,7 +3153,7 @@ impl MdfIndex {
         let conversion = Self::resolve_conversion(channel, &mut slice_reader)?;
 
         if channel.is_virtual() {
-            return Self::virtual_values(group, 0, group.record_count, conversion.as_ref());
+            return self.virtual_values(group, 0, group.record_count, conversion.as_ref());
         }
         if channel.channel_type == 1 {
             return self.read_vlsd_channel_values(group, channel, conversion.as_ref(), &mut slice_reader);
@@ -3189,7 +3204,7 @@ impl MdfIndex {
         let conversion = Self::resolve_conversion(channel, &mut slice_reader)?;
 
         if channel.is_virtual() {
-            let vals = Self::virtual_values(group, 0, group.record_count, conversion.as_ref())?;
+            let vals = self.virtual_values(group, 0, group.record_count, conversion.as_ref())?;
             return Ok(Self::vlsd_values_to_f64(vals));
         }
         if channel.channel_type == 1 {

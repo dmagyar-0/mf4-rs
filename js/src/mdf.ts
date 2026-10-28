@@ -127,12 +127,15 @@ export class Mdf {
     return this.inner.conversionInfo(name, group) as ConversionInfo | null;
   }
 
+  /** Whether the channel `read(name, group)` resolves to (the first match)
+   * is a master. */
   #isMaster(name: string, group?: string | null): boolean {
-    return this.groups().some(
-      (g) =>
-        (group == null || g.name === group) &&
-        g.channels.some((c) => c.name === name && c.isMaster),
-    );
+    for (const g of this.groups()) {
+      if (group != null && g.name !== group) continue;
+      const ch = g.channels.find((c) => c.name === name);
+      if (ch) return ch.isMaster;
+    }
+    return false;
   }
 
   /**
