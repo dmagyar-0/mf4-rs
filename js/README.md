@@ -203,6 +203,23 @@ await index.read("Speed", { group: "Engine", startTime: 10 });
 `Mdf.read` / `Mdf.values` accept the same window options (sliced in memory),
 and `Mdf.timeRange(name)` returns a group's start/end time.
 
+Conversions are applied by `values`/`read`; `conversionInfo(name)` shows
+which one (`null` when the channel has none):
+
+```ts
+await index.conversionInfo("EngineTemp");
+// { type: "Linear", values: [-40, 0.5], precision: 0, flags: 0 }
+await index.conversionInfo("Gear");
+// { type: "ValueToText", values: [0, 1, 2],
+//   texts: { "0": "N", "1": "D", "2": "R", "3": "?" }, ... }
+```
+
+`texts` / nested `refs` are keyed by position in the block's reference list
+(for `ValueToText`, `values[i]` ↔ `texts[i]`, and index `values.length` is
+the default); `formula` holds an `Algebraic` expression. An index built over
+the network fetches the conversion block on demand; `Mdf.conversionInfo` is
+synchronous.
+
 Timestamps stay `number` seconds **relative to the measurement start** —
 that is how MDF stores them, and a float64 keeps sub-nanosecond precision
 for any realistic recording length. Absolute epoch nanoseconds do not fit a
@@ -345,7 +362,8 @@ Node classes plus a headless run of the `mf4-rs/web` build).
 
 - `Mdf` — in-memory reader: `fromBytes`, `fromFile` (Node), `fromUrl`,
   `groups()`, `channelNames()`, `values()`, `read()` (both take a group name
-  or `ReadOptions` window), `timeRange()`, `startTimeNs()`, `dispose()`.
+  or `ReadOptions` window), `timeRange()`, `conversionInfo()`,
+  `startTimeNs()`, `dispose()`.
 - `MdfIndex` — self-contained index + lazy reads: `fromBytes`,
   `fromJson(json, source?)`, `fromFile` (Node), `fromRangeSource` / `fromUrl`
   (metadata-only, over a `RangeSource` / HTTP), `source` / `setSource()`,
@@ -353,11 +371,11 @@ Node classes plus a headless run of the `mf4-rs/web` build).
   `startTimeNs()`, `fileSize()`, `byteRanges()`, `byteRangesForRecords()`,
   `signalByteRanges()`, `valuesFromFragments()`, `readFromFragments()`,
   `values()` / `read()` (lazy; `(name, source?, group?)` or
-  `(name, ReadOptions)`), `timeRange()`, `dispose()`.
+  `(name, ReadOptions)`), `timeRange()`, `conversionInfo()`, `dispose()`.
 - `MdfWriter` — in-memory writer: `initMdfFile`, `setStartTime`,
   `addChannelGroup`, `addChannel`, `addTimeChannel`, `addFloatChannel`,
   `addFloat32Channel`, `addIntChannel`, `addSintChannel`, `addStringChannel`,
-  `setTimeChannel`, `startDataBlock`, `writeRecord`, `finishDataBlock`,
+  `setTimeChannel`, `addLinearConversion`, `addValueToTextConversion`, `startDataBlock`, `writeRecord`, `finishDataBlock`,
   `finalize()`, `dispose()`. Numeric channels accept `number` or `bigint`
   record values; string channels (`addStringChannel`) accept `string`.
 - Column-oriented conversion: `toColumnOriented` (in memory),
@@ -368,7 +386,7 @@ Node classes plus a headless run of the `mf4-rs/web` build).
 - Helpers: `toAbsoluteNs(timestamps, startTimeNs)`, `mergeByteRanges`,
   `readAllRanges`.
 - Types: `Signal`, `GroupInfo`, `IndexGroupInfo`, `ChannelInfo`,
-  `IndexChannelInfo`, `ReadOptions`, `ReadWindow`, `TimeRange`, `ByteRange`,
+  `IndexChannelInfo`, `ConversionInfo`, `ReadOptions`, `ReadWindow`, `TimeRange`, `ByteRange`,
   `ChannelValue`.
 - Entry points: `mf4-rs` (Node, synchronous) and `mf4-rs/web` (browser; adds
   `init()` and re-exports the same classes minus the Node-only

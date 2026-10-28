@@ -56,6 +56,16 @@ impl<'a> Channel<'a> {
         read_string_block(self.mmap, self.block.comment_addr)
     }
 
+    /// The channel's conversion with every referenced text and nested
+    /// conversion resolved, or `None` when it has none.
+    pub fn conversion(&self) -> Result<Option<crate::blocks::conversion::ConversionBlock>, MdfError> {
+        let Some(mut conversion) = self.block.conversion.clone() else {
+            return Ok(None);
+        };
+        conversion.resolve_all_dependencies(self.mmap)?;
+        Ok(Some(conversion))
+    }
+
     /// Get the acquisition source for this channel if available.
     pub fn source(&self) -> Result<Option<SourceInfo>, MdfError> {
         let addr = self.block.source_addr;

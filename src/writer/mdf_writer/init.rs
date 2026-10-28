@@ -200,6 +200,44 @@ impl MdfWriter {
         Ok((cc_id, pos))
     }
 
+    /// Creates and writes a linear conversion block (`phys = offset + factor *
+    /// raw`), linking it to `channel_id` when given.
+    pub fn add_linear_conversion(
+        &mut self,
+        offset: f64,
+        factor: f64,
+        channel_id: Option<&str>,
+    ) -> Result<(String, u64), MdfError> {
+        let cc_count = self.block_positions.keys().filter(|k| k.starts_with("cc_")).count();
+        let cc_id = format!("cc_{}", cc_count);
+        let block = ConversionBlock {
+            header: BlockHeader { id: "##CC".into(), reserved0: 0, block_len: 0, links_nr: 0 },
+            cc_tx_name: None,
+            cc_md_unit: None,
+            cc_md_comment: None,
+            cc_cc_inverse: None,
+            cc_ref: Vec::new(),
+            cc_type: ConversionType::Linear,
+            cc_precision: 0,
+            cc_flags: 0,
+            cc_ref_count: 0,
+            cc_val_count: 2,
+            cc_phy_range_min: None,
+            cc_phy_range_max: None,
+            cc_val: vec![offset, factor],
+            formula: None,
+            resolved_texts: None,
+            resolved_conversions: None,
+            default_conversion: None,
+        };
+        let cc_bytes = block.to_bytes()?;
+        let pos = self.write_block_with_id(&cc_bytes, &cc_id)?;
+        if let Some(cn) = channel_id {
+            self.update_block_link(cn, 56, &cc_id)?;
+        }
+        Ok((cc_id, pos))
+    }
+
     /// Write a `##TX` block holding `name` and link it as the channel group's
     /// `acq_name_addr`.
     ///

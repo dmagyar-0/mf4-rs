@@ -80,6 +80,34 @@ export interface ReadOptions extends ReadWindow {
   source?: import("./range-source").RangeSource;
 }
 
+/**
+ * A channel's conversion (raw -> physical value), fully resolved.
+ *
+ * `type` is one of `Identity`, `Linear`, `Rational`, `Algebraic`,
+ * `TableLookupInterp`, `TableLookupNoInterp`, `RangeLookup`, `ValueToText`,
+ * `RangeToText`, `TextToValue`, `TextToText`, `BitfieldText`. `values` holds
+ * the block's parameters (`cc_val`): e.g. `[offset, factor]` for `Linear`
+ * (`phys = values[0] + values[1] * raw`), the six rational coefficients, or
+ * the table keys. `texts` / `refs` are keyed by the position in the block's
+ * reference list; how they pair with `values` depends on `type` (MDF 4.1
+ * §6.17) — for `ValueToText`, `values[i]` maps to `texts[i]` (or the nested
+ * `refs[i]`) and index `values.length` is the default.
+ */
+export interface ConversionInfo {
+  type: string;
+  values: number[];
+  precision: number;
+  flags: number;
+  /** `[min, max]` physical range, when the block declares one. */
+  physicalRange?: [number, number];
+  /** Formula of an `Algebraic` conversion (variable `X`). */
+  formula?: string;
+  texts?: Record<string, string>;
+  refs?: Record<string, ConversionInfo>;
+  /** Default (fallback) conversion, when it is itself a conversion. */
+  default?: ConversionInfo;
+}
+
 /** First and last master (time) value of a channel's group. */
 export interface TimeRange {
   start: number;

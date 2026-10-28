@@ -196,3 +196,30 @@ fn channel_comment_is_indexed_locally_and_remotely() {
     let json = v.to_string();
     assert!(MdfIndex::from_json(&json).unwrap().channel("Time").unwrap().comment.is_none());
 }
+
+#[test]
+fn writer_linear_conversion_is_applied() {
+    let path = std::env::temp_dir().join("index_window_linear.mf4");
+    let path = path.to_str().unwrap().to_string();
+    let mut w = MdfWriter::new(&path).unwrap();
+    w.init_mdf_file().unwrap();
+    let cg = w.add_channel_group(None, |_| {}).unwrap();
+    let v = w
+        .add_channel(&cg, None, |ch| {
+            ch.data_type = DataType::UnsignedIntegerLE;
+            ch.name = Some("V".into());
+            ch.bit_count = 16;
+        })
+        .unwrap();
+    w.add_linear_conversion(-40.0, 0.5, Some(&v)).unwrap();
+    w.start_data_block_for_cg(&cg, 0).unwrap();
+    w.write_record(&cg, &[DecodedValue::UnsignedInteger(100)]).unwrap();
+    w.finish_data_block(&cg).unwrap();
+    w.finalize().unwrap();
+
+    let mdf = MDF::from_file(&path).unwrap();
+    let group = &mdf.channel_groups()[0];
+    let ch = &group.channels()[0];
+    assert_eq!(ch.values_as_f64().unwrap(), vec![10.0]);
+    assert_eq!(ch.conversion().unwrap().unwrap().cc_val, vec![-40.0, 0.5]);
+}

@@ -580,6 +580,65 @@ struct IndexChannelInfoJs {
     has_conversion: bool,
 }
 
+/// A resolved conversion as handed to JS (`conversionInfo`).
+///
+/// `texts` / `refs` are keyed by the index into the block's `cc_ref` list;
+/// how `values` pair with those indices depends on `type` (MDF 4.1 §6.17):
+/// e.g. for `ValueToText` `values[i]` maps to ref `i` and ref
+/// `values.length` is the default.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversionInfoJs {
+    #[serde(rename = "type")]
+    cc_type: String,
+    values: Vec<f64>,
+    precision: u8,
+    flags: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    physical_range: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    formula: Option<String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    texts: std::collections::BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    refs: std::collections::BTreeMap<String, ConversionInfoJs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<Box<ConversionInfoJs>>,
+}
+
+impl From<&crate::blocks::conversion::ConversionBlock> for ConversionInfoJs {
+    fn from(cc: &crate::blocks::conversion::ConversionBlock) -> Self {
+        ConversionInfoJs {
+            cc_type: format!("{:?}", cc.cc_type),
+            values: cc.cc_val.clone(),
+            precision: cc.cc_precision,
+            flags: cc.cc_flags,
+            physical_range: cc.cc_phy_range_min.zip(cc.cc_phy_range_max).map(|(a, b)| [a, b]),
+            formula: cc.formula.clone(),
+            texts: cc.resolved_texts.iter().flatten().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            refs: cc
+                .resolved_conversions
+                .iter()
+                .flatten()
+                .map(|(k, v)| (k.to_string(), ConversionInfoJs::from(v.as_ref())))
+                .collect(),
+            default: cc.default_conversion.as_deref().map(|d| Box::new(d.into())),
+        }
+    }
+}
+
+/// `conversion` as a plain JS object (maps become objects), or `null`.
+fn conversion_to_js(
+    conversion: Option<&crate::blocks::conversion::ConversionBlock>,
+) -> Result<JsValue, JsError> {
+    match conversion {
+        None => Ok(JsValue::NULL),
+        Some(cc) => ConversionInfoJs::from(cc)
+            .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+            .map_err(|e| JsError::new(&e.to_string())),
+    }
+}
+
 /// Record or time window passed to `readWindowStep` (all fields optional).
 #[derive(serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -742,6 +801,28 @@ impl WasmMdf {
     #[wasm_bindgen(js_name = startTimeNs)]
     pub fn start_time_ns(&self) -> Option<u64> {
         self.mdf.start_time_ns()
+    }
+
+    /// The conversion of channel `name` (fully resolved), or `null` when the
+    /// channel has none. See `MdfIndex.conversionInfo` for the shape.
+    #[wasm_bindgen(js_name = conversionInfo)]
+    pub fn conversion_info(&self, name: &str, group: Option<String>) -> Result<JsValue, JsError> {
+        for g in self.mdf.channel_groups() {
+            if let Some(gn) = group.as_deref() {
+                if g.name().map_err(err_to_js)?.as_deref() != Some(gn) {
+                    continue;
+                }
+            }
+            for ch in g.channels() {
+                if ch.name().map_err(err_to_js)?.as_deref() == Some(name) {
+                    return conversion_to_js(ch.conversion().map_err(err_to_js)?.as_ref());
+                }
+            }
+        }
+        Err(JsError::new(&match group {
+            Some(gn) => format!("Channel '{}' not found in group '{}'", name, gn),
+            None => format!("Channel '{}' not found", name),
+        }))
     }
 }
 
@@ -1021,6 +1102,43 @@ impl WasmMdfIndex {
     #[wasm_bindgen(js_name = startTimeNs)]
     pub fn start_time_ns(&self) -> Option<u64> {
         self.index.start_time_ns
+    }
+
+    /// One step of resolving the conversion of `name` from caller-fetched
+    /// fragments. Returns `{ done: true, conversion }` (`conversion` is
+    /// `null` when the channel has none) once every block it needs is in
+    /// `fragments` — immediately for a locally built index, which stores
+    /// conversions resolved — else `{ done: false, needed: [[offset,
+    /// length], ...] }` to fetch and feed back, like `conversionRangesStep`.
+    #[wasm_bindgen(js_name = conversionStep)]
+    pub fn conversion_step(
+        &self,
+        name: &str,
+        group: Option<String>,
+        ranges: JsValue,
+        fragments: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let (g, c) = self.locate(name, group.as_deref())?;
+        let parsed = build_fragment_reader(&ranges, &fragments)?;
+        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: false };
+        let result = self.index.resolve_channel_conversion(g, c, &mut reader);
+        let out = Object::new();
+        let set = |k: &str, v: &JsValue| -> Result<(), JsError> {
+            Reflect::set(&out, &JsValue::from_str(k), v)
+                .map(|_| ())
+                .map_err(|_| JsError::new("failed to build conversion step"))
+        };
+        if !reader.misses.is_empty() {
+            set("done", &JsValue::FALSE)?;
+            let needed = serde_wasm_bindgen::to_value(&misses_to_needed(reader.misses))
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            set("needed", &needed)?;
+            return Ok(out.into());
+        }
+        let conversion = result.map_err(err_to_js)?;
+        set("done", &JsValue::TRUE)?;
+        set("conversion", &conversion_to_js(conversion.as_ref())?)?;
+        Ok(out.into())
     }
 
     /// One step of a windowed read of `name` from caller-fetched fragments.
@@ -1353,6 +1471,13 @@ pub struct WasmMdfWriter {
 }
 
 impl WasmMdfWriter {
+    fn rust_channel_id(&self, channel_id: &str) -> Result<String, JsError> {
+        self.channels
+            .get(channel_id)
+            .cloned()
+            .ok_or_else(|| JsError::new("Channel not found"))
+    }
+
     fn writer_mut(&mut self) -> Result<&mut MdfWriter, JsError> {
         self.writer
             .as_mut()
@@ -1555,6 +1680,42 @@ impl WasmMdfWriter {
             .ok_or_else(|| JsError::new("Channel not found"))?
             .clone();
         self.writer_mut()?.set_time_channel(&ch_id).map_err(err_to_js)?;
+        Ok(())
+    }
+
+    /// Attach a linear conversion (`phys = offset + factor * raw`) to a channel.
+    #[wasm_bindgen(js_name = addLinearConversion)]
+    pub fn add_linear_conversion(&mut self, channel_id: &str, offset: f64, factor: f64) -> Result<(), JsError> {
+        let ch_id = self.rust_channel_id(channel_id)?;
+        self.writer_mut()?
+            .add_linear_conversion(offset, factor, Some(&ch_id))
+            .map_err(err_to_js)?;
+        Ok(())
+    }
+
+    /// Attach a value-to-text conversion to an integer channel: `mapping` is an
+    /// array of `[value, text]` pairs, `defaultText` the text for any other
+    /// value.
+    #[wasm_bindgen(js_name = addValueToTextConversion)]
+    pub fn add_value_to_text_conversion(
+        &mut self,
+        channel_id: &str,
+        mapping: JsValue,
+        default_text: &str,
+    ) -> Result<(), JsError> {
+        let ch_id = self.rust_channel_id(channel_id)?;
+        let pairs: Vec<(f64, String)> = serde_wasm_bindgen::from_value(mapping)
+            .map_err(|_| JsError::new("mapping must be an array of [value, text] pairs"))?;
+        let mut ints = Vec::with_capacity(pairs.len());
+        for (v, text) in &pairs {
+            if !v.is_finite() || v.fract() != 0.0 || v.abs() > MAX_SAFE_INTEGER as f64 {
+                return Err(JsError::new(&format!("mapping value {} must be a safe integer", v)));
+            }
+            ints.push((*v as i64, text.as_str()));
+        }
+        self.writer_mut()?
+            .add_value_to_text_conversion(&ints, default_text, Some(&ch_id))
+            .map_err(err_to_js)?;
         Ok(())
     }
 

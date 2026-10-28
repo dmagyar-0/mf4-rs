@@ -9,7 +9,7 @@ import {
   timeAxisOf,
   toFloat64,
 } from "./signal-util";
-import type { GroupInfo, ReadOptions, Signal, TimeRange } from "./types";
+import type { ConversionInfo, GroupInfo, ReadOptions, Signal, TimeRange } from "./types";
 
 /**
  * Read-only handle to an MDF 4 file parsed from an in-memory byte buffer.
@@ -106,6 +106,14 @@ export class Mdf {
       throw new Error(`Channel '${name}' has no master (time) channel.`);
     }
     return rangeOf(timeAxisOf(signal));
+  }
+
+  /**
+   * The conversion that `values`/`read` apply to channel `name` (fully
+   * resolved), or `null` when the channel has none.
+   */
+  conversionInfo(name: string, group?: string | null): ConversionInfo | null {
+    return this.inner.conversionInfo(name, group) as ConversionInfo | null;
   }
 
   #isMaster(name: string, group?: string | null): boolean {

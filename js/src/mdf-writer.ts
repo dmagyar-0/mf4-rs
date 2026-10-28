@@ -88,6 +88,27 @@ export class MdfWriter {
     this.inner.setTimeChannel(channelId);
   }
 
+  /**
+   * Attach a linear conversion to a channel: readers return
+   * `offset + factor * raw`. Call before `startDataBlock`.
+   */
+  addLinearConversion(channelId: string, offset: number, factor: number): void {
+    this.inner.addLinearConversion(channelId, offset, factor);
+  }
+
+  /**
+   * Attach a value-to-text conversion to an integer channel: readers return
+   * the text mapped to each raw value, or `defaultText` for unmapped values.
+   * Call before `startDataBlock`.
+   */
+  addValueToTextConversion(
+    channelId: string,
+    mapping: Array<[number, string]>,
+    defaultText: string,
+  ): void {
+    this.inner.addValueToTextConversion(channelId, mapping, defaultText);
+  }
+
   /** Open a fresh `##DT` data block for a channel group. */
   startDataBlock(groupId: string): void {
     this.inner.startDataBlock(groupId);

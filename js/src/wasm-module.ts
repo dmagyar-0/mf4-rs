@@ -25,6 +25,7 @@ export interface WasmMdf {
   read(name: string, group?: string | null): unknown;
   startTimeNs(): bigint | undefined;
   values(name: string, group?: string | null): Float64Array;
+  conversionInfo(name: string, group?: string | null): unknown;
 }
 
 export interface WasmMdfConstructor {
@@ -59,6 +60,12 @@ export interface WasmMdfIndex {
   ): unknown;
   signalByteRanges(name: string, group?: string | null, withMaster?: boolean | null): unknown;
   startTimeNs(): bigint | undefined;
+  conversionStep(
+    name: string,
+    group: string | null | undefined,
+    ranges: unknown,
+    fragments: unknown,
+  ): { done: boolean; needed?: [number, number][]; conversion?: unknown };
   readWindowStep(
     name: string,
     group: string | null | undefined,
@@ -143,6 +150,8 @@ export interface WasmMdfWriter {
   initMdfFile(): void;
   setStartTime(abs_time_ns: bigint): void;
   setTimeChannel(channel_id: string): void;
+  addLinearConversion(channel_id: string, offset: number, factor: number): void;
+  addValueToTextConversion(channel_id: string, mapping: unknown, default_text: string): void;
   startDataBlock(group_id: string): void;
   writeRecord(group_id: string, values: unknown): void;
 }

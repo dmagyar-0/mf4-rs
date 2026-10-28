@@ -79,6 +79,7 @@ export type {
   GroupInfo,
   IndexGroupInfo,
   IndexChannelInfo,
+  ConversionInfo,
   ReadOptions,
   ReadWindow,
   TimeRange,

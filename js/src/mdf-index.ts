@@ -10,6 +10,7 @@ import {
 import { checkWindow, hasWindow, rangeOf, timeAxisOf, toFloat64 } from "./signal-util";
 import type {
   ByteRange,
+  ConversionInfo,
   IndexChannelInfo,
   IndexGroupInfo,
   ReadOptions,
@@ -591,18 +592,59 @@ export class MdfIndex {
     return a && b ? { start: a.start, end: b.end } : undefined;
   }
 
+  /**
+   * The conversion that `values`/`read` apply to channel `name` (fully
+   * resolved), or `null` when the channel has none. Arguments as for
+   * {@link values} (a source is only needed for indexes built over the
+   * network, which fetch the conversion block on demand).
+   */
+  async conversionInfo(
+    name: string,
+    sourceOrOptions?: RangeSource | Pick<ReadOptions, "group" | "source"> | null,
+    group?: string | null,
+  ): Promise<ConversionInfo | null> {
+    const options = this.#options(sourceOrOptions, group);
+    const ranges: ByteRange[] = [];
+    const fragments: Uint8Array[] = [];
+    // Conversion chains are short; a small look-ahead keeps this to one or
+    // two round-trips even when a block and its text refs sit adjacently.
+    const lookahead = 8 * 1024;
+    for (let round = 0; round < 10_000; round++) {
+      const step = this.inner.conversionStep(name, options.group, ranges, fragments);
+      if (step.done) return (step.conversion ?? null) as ConversionInfo | null;
+      const source = this.#requireSource(options);
+      const spans = coalesceNeeded(step.needed!, lookahead, lookahead, this.fileSize());
+      const fetched = await Promise.all(spans.map(([o, l]) => source.read(o, l)));
+      spans.forEach(([offset], i) => {
+        ranges.push([offset, fetched[i]!.length]);
+        fragments.push(fetched[i]!);
+      });
+    }
+    throw new Error("MdfIndex: conversion resolution did not converge; the index or source may be inconsistent.");
+  }
+
   /** Pick the source and options out of the `values`/`read` arguments. */
   #resolve(
     sourceOrOptions: RangeSource | ReadOptions | null | undefined,
     group: string | null | undefined,
   ): { source: RangeSource; options: ReadOptions } {
-    let options: ReadOptions;
+    const options = this.#options(sourceOrOptions, group);
+    return { source: this.#requireSource(options), options };
+  }
+
+  #options(
+    sourceOrOptions: RangeSource | ReadOptions | null | undefined,
+    group: string | null | undefined,
+  ): ReadOptions {
     if (sourceOrOptions && typeof (sourceOrOptions as RangeSource).read === "function") {
-      options = { source: sourceOrOptions as RangeSource, group };
-    } else {
-      options = { ...((sourceOrOptions as ReadOptions | null | undefined) ?? {}) };
-      if (options.group === undefined) options.group = group;
+      return { source: sourceOrOptions as RangeSource, group };
     }
+    const options = { ...((sourceOrOptions as ReadOptions | null | undefined) ?? {}) };
+    if (options.group === undefined) options.group = group;
+    return options;
+  }
+
+  #requireSource(options: ReadOptions): RangeSource {
     const source = options.source ?? this.#source;
     if (!source) {
       throw new Error(
@@ -610,7 +652,7 @@ export class MdfIndex {
           "build the index with fromUrl/fromRangeSource/fromBytes, or call setSource().",
       );
     }
-    return { source, options };
+    return source;
   }
 
   #readWindow(name: string, options: ReadOptions, source: RangeSource): Promise<Signal> {
