@@ -70,6 +70,7 @@ export {
 } from "./range-source";
 
 export { mergeByteRanges } from "./byte-ranges";
+export { toAbsoluteNs } from "./signal-util";
 
 export type {
   ChannelValue,
@@ -77,5 +78,9 @@ export type {
   ChannelInfo,
   GroupInfo,
   IndexGroupInfo,
+  IndexChannelInfo,
+  ReadOptions,
+  ReadWindow,
+  TimeRange,
   ByteRange,
 } from "./types";

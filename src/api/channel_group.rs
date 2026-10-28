@@ -59,7 +59,7 @@ impl<'a> ChannelGroup<'a> {
             .raw_channel_group
             .raw_channels
             .iter()
-            .find(|c| c.block.channel_type == 2)
+            .find(|c| matches!(c.block.channel_type, 2 | 3))
         {
             return Some(Channel::new(&raw.block, self.raw_data_group, self.raw_channel_group, raw, self.mmap));
         }
@@ -70,7 +70,7 @@ impl<'a> ChannelGroup<'a> {
         for dg in self.file_groups {
             for cg in &dg.channel_groups {
                 if cg.addr == target {
-                    let raw = cg.raw_channels.iter().find(|c| c.block.channel_type == 2)?;
+                    let raw = cg.raw_channels.iter().find(|c| matches!(c.block.channel_type, 2 | 3))?;
                     return Some(Channel::new(&raw.block, dg, cg, raw, self.mmap));
                 }
             }

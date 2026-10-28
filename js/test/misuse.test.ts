@@ -7,7 +7,8 @@ import * as fsp from "node:fs/promises";
 import { Mdf } from "../src/mdf";
 import { MdfIndex } from "../src/mdf-index";
 import { MdfWriter } from "../src/mdf-writer";
-import { FileRangeSource, BytesRangeSource } from "../src/range-source";
+import { BytesRangeSource } from "../src/range-source";
+import { FileRangeSource } from "../src/file-range-source";
 import { buildSampleFile } from "./helpers";
 
 test("Mdf.values() throws for an unknown channel name", () => {

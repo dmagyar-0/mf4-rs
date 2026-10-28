@@ -1,11 +1,21 @@
 import { getWasmModule, type WasmMdfIndex } from "./wasm-module";
+import { readFileNodeOnly } from "./platform";
 import {
   readAllRanges,
+  BytesRangeSource,
   FetchRangeSource,
   type RangeSource,
   type FetchLike,
 } from "./range-source";
-import type { ByteRange, IndexGroupInfo, Signal } from "./types";
+import { checkWindow, hasWindow, rangeOf, timeAxisOf, toFloat64 } from "./signal-util";
+import type {
+  ByteRange,
+  IndexChannelInfo,
+  IndexGroupInfo,
+  ReadOptions,
+  Signal,
+  TimeRange,
+} from "./types";
 
 /** Initial prefix fetched before the build loop — metadata usually starts at
  * the front of the file, so seeding this often completes the build in one or
@@ -24,6 +34,11 @@ const BUILD_MAX_LOOKAHEAD_BYTES = 1024 * 1024;
  * bridging pulls **every** intervening byte, so a large bridge on a file whose
  * metadata is interleaved with data blocks would transfer the data blocks too. */
 const BUILD_BRIDGE_BYTES = 64 * 1024;
+/** Gap bridged into one request by windowed reads. The time search reads
+ * single records spread over the file; once its probes close in, they bridge
+ * into one request per round. No look-ahead: padding each of the ~32 probes
+ * of a round would cost more bytes than it saves rounds. */
+const WINDOW_BRIDGE_BYTES = 4 * 1024;
 
 /**
  * Tuning for the incremental index build, for callers who know their file's
@@ -174,33 +189,38 @@ function coalesceNeeded(
  */
 export class MdfIndex {
   private readonly inner: WasmMdfIndex;
+  #source: RangeSource | undefined;
 
-  private constructor(inner: WasmMdfIndex) {
+  private constructor(inner: WasmMdfIndex, source?: RangeSource) {
     this.inner = inner;
+    this.#source = source;
   }
 
   /**
    * Build a fresh index by parsing an MDF file from an in-memory buffer.
    *
    * All conversions are resolved during construction, so the index is fully
-   * self-contained afterwards (and can be serialised with `toJson`).
+   * self-contained afterwards (and can be serialised with `toJson`). The
+   * buffer becomes the index's bound {@link source}, so `values`/`read` work
+   * without passing one; call `setSource(undefined)` to release it.
    */
   static fromBytes(data: Uint8Array): MdfIndex {
     const wasm = getWasmModule();
-    return new MdfIndex(wasm.MdfIndex.fromBytes(data));
+    return new MdfIndex(wasm.MdfIndex.fromBytes(data), new BytesRangeSource(data));
   }
 
-  /** Reload a previously serialised index from its JSON string. */
-  static fromJson(json: string): MdfIndex {
+  /**
+   * Reload a previously serialised index from its JSON string. The source is
+   * not part of the JSON: pass it here or attach it later with `setSource`.
+   */
+  static fromJson(json: string, source?: RangeSource): MdfIndex {
     const wasm = getWasmModule();
-    return new MdfIndex(wasm.MdfIndex.fromJson(json));
+    return new MdfIndex(wasm.MdfIndex.fromJson(json), source);
   }
 
   /** Build a fresh index by parsing an MDF file from disk. Node only. */
   static async fromFile(path: string): Promise<MdfIndex> {
-    const fsp = await import("node:fs/promises");
-    const buf = await fsp.readFile(path);
-    return MdfIndex.fromBytes(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+    return MdfIndex.fromBytes(await readFileNodeOnly(path, "MdfIndex.fromFile"));
   }
 
   /**
@@ -229,6 +249,9 @@ export class MdfIndex {
    * {@link IndexBuildOptions}. On a file whose metadata is interleaved with
    * data blocks, lowering `maxLookaheadBytes` toward one metadata cluster's
    * size trades extra round-trips for a large reduction in bytes.
+   *
+   * `source` becomes the index's bound {@link source}, so later
+   * `values`/`read` calls need no source argument.
    */
   static async fromRangeSource(
     source: RangeSource,
@@ -273,7 +296,7 @@ export class MdfIndex {
       for (let round = 0; round < maxRounds; round++) {
         const step = builder.step();
         if (step.done) {
-          return MdfIndex.fromJson(step.json as string);
+          return MdfIndex.fromJson(step.json as string, source);
         }
         // Bridge and look-ahead are separate knobs: bridging pulls every
         // intervening byte, so it stays small and constant, while the
@@ -305,9 +328,8 @@ export class MdfIndex {
    * ignore `Range` fall back to a single full download. Each round of the
    * build fetches every byte range the walk still needs concurrently (see
    * `fromRangeSource`), so a file with many channel groups converges in a
-   * handful of round-trips rather than one request per group. Once built,
-   * read with `values`/`read` over a `RangeSource` for lazy, partial sample
-   * reads.
+   * handful of round-trips rather than one request per group. The URL stays
+   * bound to the index, so `values(name)` / `read(name)` read lazily from it.
    *
    * Pass `options` to tune the fetch windows for your file's shape — see
    * {@link IndexBuildOptions}.
@@ -320,7 +342,22 @@ export class MdfIndex {
     return MdfIndex.fromRangeSource(new FetchRangeSource(url, fetchImpl), options);
   }
 
-  /** Serialise the index to a JSON string. */
+  /**
+   * The source `values`/`read` fetch sample bytes from when none is passed:
+   * set by `fromUrl` / `fromRangeSource` / `fromBytes` / `fromFile`, or with
+   * `setSource`.
+   */
+  get source(): RangeSource | undefined {
+    return this.#source;
+  }
+
+  /** Bind (or, with `undefined`, unbind) the default source for reads. */
+  setSource(source: RangeSource | undefined): this {
+    this.#source = source;
+    return this;
+  }
+
+  /** Serialise the index to a JSON string (the bound source is not included). */
   toJson(): string {
     return this.inner.toJson();
   }
@@ -330,9 +367,36 @@ export class MdfIndex {
     this.inner.validate();
   }
 
-  /** Metadata for every channel group. */
+  /**
+   * Metadata for every channel group: name, comment, record count, master
+   * channel and per-channel `{ name, unit, comment, dataType, bitCount,
+   * isMaster, isVlsd, hasConversion }`. Start/end times need sample data —
+   * see {@link timeRange}.
+   */
   groups(): IndexGroupInfo[] {
     return this.inner.groups() as IndexGroupInfo[];
+  }
+
+  /**
+   * Metadata of one channel (first match, or within `group`), or `undefined`
+   * if there is no such channel.
+   */
+  channel(name: string, group?: string | null): IndexChannelInfo | undefined {
+    for (const g of this.groups()) {
+      if (group != null && g.name !== group) continue;
+      const found = g.channels.find((c) => c.name === name);
+      if (found) return found;
+    }
+    return undefined;
+  }
+
+  /**
+   * Measurement start time in nanoseconds since the Unix epoch, or
+   * `undefined` if the file header does not record one. Master (time)
+   * values are seconds relative to this — see `toAbsoluteNs`.
+   */
+  startTimeNs(): bigint | undefined {
+    return this.inner.startTimeNs();
   }
 
   /** Names of every named channel across all groups (duplicates kept). */
@@ -439,38 +503,163 @@ export class MdfIndex {
 
   /**
    * Lazily decode a numeric channel to a `Float64Array`, fetching only the
-   * bytes it needs from `source`.
+   * bytes it needs (invalid/non-numeric samples become `NaN`).
    *
-   * Fetches the group's whole data blocks (`signalByteRanges`, without a
-   * remote master's time blocks) from `source` concurrently, then decodes via
-   * `valuesFromFragments`. The fragment decoders read whole data blocks
-   * (records interleave every channel), so `signalByteRanges` is exactly the
-   * right range set for any group shape.
+   * The second argument is either a `RangeSource` (the original signature,
+   * `values(name, source, group)`) or a {@link ReadOptions} object; without
+   * one the index's bound {@link source} is used. A window
+   * (`startTime`/`endTime` or `startRecord`/`recordCount`) fetches only the
+   * selected records: the time window is located by searching the master
+   * channel (a few single-record reads), not by downloading it.
+   *
+   * Without a window, the group's whole data blocks (`signalByteRanges`,
+   * without a remote master's time blocks) are fetched concurrently and
+   * decoded via `valuesFromFragments`.
    */
-  async values(name: string, source: RangeSource, group?: string | null): Promise<Float64Array> {
-    const ranges = this.signalByteRanges(name, group, false);
+  async values(
+    name: string,
+    sourceOrOptions?: RangeSource | ReadOptions | null,
+    group?: string | null,
+  ): Promise<Float64Array> {
+    const { source, options } = this.#resolve(sourceOrOptions, group);
+    if (hasWindow(options)) {
+      return toFloat64((await this.#readWindow(name, options, source)).values);
+    }
+    const ranges = this.signalByteRanges(name, options.group, false);
     const fragments = await readAllRanges(source, ranges);
     // Indexes built over the network resolve conversions lazily; fetch the
     // channel's conversion blocks (if any) so the decoder can apply them.
-    await this.#fetchConversionRanges(name, group, false, source, ranges, fragments);
-    return this.valuesFromFragments(name, group, ranges, fragments);
+    await this.#fetchConversionRanges(name, options.group, false, source, ranges, fragments);
+    return this.valuesFromFragments(name, options.group, ranges, fragments);
   }
 
   /**
-   * Lazily decode a channel to a `Signal`, fetching only the bytes it needs
-   * from `source`.
+   * Lazily decode a channel to a `Signal` (values paired with the group's
+   * time axis), fetching only the bytes it needs. For the master channel
+   * itself `timestamps` is empty: its `values` are the time axis.
    *
-   * Fetches the group's whole data blocks plus its master's
-   * (`signalByteRanges`) from `source` concurrently, then decodes via
-   * `readFromFragments`.
+   * Arguments as for {@link values}; a window reads only the selected
+   * records of the channel and its master.
    */
-  async read(name: string, source: RangeSource, group?: string | null): Promise<Signal> {
-    const ranges = this.signalByteRanges(name, group);
+  async read(
+    name: string,
+    sourceOrOptions?: RangeSource | ReadOptions | null,
+    group?: string | null,
+  ): Promise<Signal> {
+    const { source, options } = this.#resolve(sourceOrOptions, group);
+    if (hasWindow(options)) {
+      return this.#readWindow(name, options, source);
+    }
+    const ranges = this.signalByteRanges(name, options.group);
     const fragments = await readAllRanges(source, ranges);
     // A signal read decodes the group master too, so resolve the master's
     // conversion as well as the channel's (withMaster = true).
-    await this.#fetchConversionRanges(name, group, true, source, ranges, fragments);
-    return this.readFromFragments(name, group, ranges, fragments);
+    await this.#fetchConversionRanges(name, options.group, true, source, ranges, fragments);
+    return this.readFromFragments(name, options.group, ranges, fragments);
+  }
+
+  /**
+   * First and last master (time) value of the group holding `name` — the
+   * group's start and end time, in seconds relative to `startTimeNs()` for a
+   * time master. Reads just two records. `undefined` for an empty group;
+   * throws if the group has no master channel.
+   */
+  async timeRange(
+    name: string,
+    sourceOrOptions?: RangeSource | Pick<ReadOptions, "group" | "source"> | null,
+    group?: string | null,
+  ): Promise<TimeRange | undefined> {
+    const { source, options } = this.#resolve(sourceOrOptions, group);
+    const info = this.channel(name, options.group);
+    if (!info) {
+      throw new Error(
+        options.group == null
+          ? `Channel '${name}' not found`
+          : `Channel '${name}' not found in group '${options.group}'`,
+      );
+    }
+    const total = this.#recordCount(name, options.group);
+    if (total === 0) return undefined;
+    const one = (startRecord: number) =>
+      this.#windowStep(name, options.group, { startRecord, recordCount: 1 }, source);
+    const [first, last] = await Promise.all([one(0), one(total - 1)]);
+    if (first.timestamps.length === 0 && !info.isMaster) {
+      throw new Error(`Channel '${name}' has no master (time) channel.`);
+    }
+    const a = rangeOf(timeAxisOf(first));
+    const b = rangeOf(timeAxisOf(last));
+    return a && b ? { start: a.start, end: b.end } : undefined;
+  }
+
+  /** Pick the source and options out of the `values`/`read` arguments. */
+  #resolve(
+    sourceOrOptions: RangeSource | ReadOptions | null | undefined,
+    group: string | null | undefined,
+  ): { source: RangeSource; options: ReadOptions } {
+    let options: ReadOptions;
+    if (sourceOrOptions && typeof (sourceOrOptions as RangeSource).read === "function") {
+      options = { source: sourceOrOptions as RangeSource, group };
+    } else {
+      options = { ...((sourceOrOptions as ReadOptions | null | undefined) ?? {}) };
+      if (options.group === undefined) options.group = group;
+    }
+    const source = options.source ?? this.#source;
+    if (!source) {
+      throw new Error(
+        "MdfIndex has no source to read from: pass a RangeSource (or { source }), " +
+          "build the index with fromUrl/fromRangeSource/fromBytes, or call setSource().",
+      );
+    }
+    return { source, options };
+  }
+
+  #readWindow(name: string, options: ReadOptions, source: RangeSource): Promise<Signal> {
+    return this.#windowStep(name, options.group, checkWindow(options), source);
+  }
+
+  /** Drive `readWindowStep` until every byte the windowed read needs is in. */
+  async #windowStep(
+    name: string,
+    group: string | null | undefined,
+    window: object,
+    source: RangeSource,
+  ): Promise<Signal> {
+    const size = this.fileSize();
+    const ranges: ByteRange[] = [];
+    const fragments: Uint8Array[] = [];
+    const maxRounds = 10_000;
+    for (let round = 0; round < maxRounds; round++) {
+      const step = this.inner.readWindowStep(name, group, window, ranges, fragments);
+      if (step.done) {
+        return step.signal as Signal;
+      }
+      const spans = coalesceNeeded(
+        step.needed as [number, number][],
+        WINDOW_BRIDGE_BYTES,
+        0,
+        size,
+      );
+      const fetched = await Promise.all(
+        spans.map(async ([offset, length]): Promise<[ByteRange, Uint8Array]> => {
+          const bytes = await source.read(offset, length);
+          return [[offset, bytes.length], bytes];
+        }),
+      );
+      for (const [range, bytes] of fetched) {
+        ranges.push(range);
+        fragments.push(bytes);
+      }
+    }
+    throw new Error("MdfIndex: windowed read did not converge; the index or source may be inconsistent.");
+  }
+
+  /** Record count of the group `name` resolves to (first match / in `group`). */
+  #recordCount(name: string, group: string | null | undefined): number {
+    for (const g of this.groups()) {
+      if (group != null && g.name !== group) continue;
+      if (g.channelNames.includes(name)) return g.recordCount;
+    }
+    return 0;
   }
 
   /**

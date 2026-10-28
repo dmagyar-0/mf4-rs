@@ -25,8 +25,8 @@ export type FetchLike = (
 /**
  * Abstraction over "fetch N bytes at offset O" for an MDF data source.
  *
- * Implementations: `FetchRangeSource` (HTTP), `FileRangeSource` (Node
- * filesystem), `BytesRangeSource` (in-memory buffer).
+ * Implementations: `FetchRangeSource` (HTTP), `BytesRangeSource` (in-memory
+ * buffer) and, from the Node entry point only, `FileRangeSource` (filesystem).
  */
 export interface RangeSource {
   /** Total size of the underlying data in bytes, if cheaply known. */
@@ -69,7 +69,10 @@ export class FetchRangeSource implements RangeSource {
           "new FetchRangeSource(url, fetchImpl)",
       );
     }
-    this.fetchImpl = impl;
+    // Never call the platform fetch as a method of this object: browsers
+    // (and workers) throw "Illegal invocation" when `fetch` runs with a
+    // receiver other than the global scope.
+    this.fetchImpl = fetchImpl ? (input, init) => impl(input, init) : (input, init) => impl.call(globalThis, input, init);
   }
 
   async size(): Promise<number> {
@@ -162,65 +165,6 @@ export class FetchRangeSource implements RangeSource {
       );
     }
     return body.subarray(offset, offset + length);
-  }
-}
-
-/**
- * `RangeSource` backed by a local file, read via `fs/promises`.
- *
- * Node-only.
- */
-export class FileRangeSource implements RangeSource {
-  private readonly path: string;
-  private handlePromise: Promise<import("node:fs/promises").FileHandle> | undefined;
-
-  constructor(path: string) {
-    this.path = path;
-  }
-
-  private async handle(): Promise<import("node:fs/promises").FileHandle> {
-    if (!this.handlePromise) {
-      const fsp = await import("node:fs/promises");
-      this.handlePromise = fsp.open(this.path, "r");
-    }
-    return this.handlePromise;
-  }
-
-  async size(): Promise<number> {
-    const fh = await this.handle();
-    const stat = await fh.stat();
-    return stat.size;
-  }
-
-  async read(offset: number, length: number): Promise<Uint8Array> {
-    if (length <= 0) {
-      return new Uint8Array(0);
-    }
-    const fh = await this.handle();
-    const buffer = Buffer.alloc(length);
-    // A single fh.read may return fewer bytes than requested; loop until the
-    // whole span is read, treating a 0-byte read as EOF.
-    let total = 0;
-    while (total < length) {
-      const { bytesRead } = await fh.read(buffer, total, length - total, offset + total);
-      if (bytesRead === 0) {
-        throw new Error(
-          `FileRangeSource: short read at offset ${offset + total} — wanted ${length - total} ` +
-            `more byte(s) but hit EOF (requested [${offset}, ${offset + length}))`,
-        );
-      }
-      total += bytesRead;
-    }
-    return new Uint8Array(buffer.buffer, buffer.byteOffset, length);
-  }
-
-  /** Close the underlying file handle, if opened. */
-  async close(): Promise<void> {
-    if (this.handlePromise) {
-      const fh = await this.handlePromise;
-      await fh.close();
-      this.handlePromise = undefined;
-    }
   }
 }
 

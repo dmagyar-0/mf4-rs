@@ -81,6 +81,15 @@ impl<'a> Channel<'a> {
         // cn_flags bit 0: all values invalid, regardless of invalidation bytes
         let all_invalid = self.block.flags & 0x01 != 0;
 
+        // Virtual channels (cn_type 3 master / 6 data) store no bytes: the
+        // raw value is the record index.
+        if matches!(self.block.channel_type, 3 | 6) {
+            for i in 0..self.raw_channel_group.block.cycles_nr {
+                out.push(Some(self.block.apply_conversion_value(DecodedValue::UnsignedInteger(i), self.mmap)?));
+            }
+            return Ok(out);
+        }
+
         // VLSD channels must use the boxed iterator path. The iterator yields
         // the variable-length payload, not the fixed record, so per-record
         // invalidation bits cannot be checked here — only the all-invalid flag.
@@ -170,6 +179,10 @@ impl<'a> Channel<'a> {
         let cg_data_bytes = self.raw_channel_group.block.samples_byte_nr;
         let capacity = self.raw_channel_group.block.cycles_nr as usize;
         let mut out = Vec::with_capacity(capacity);
+
+        if matches!(self.block.channel_type, 3 | 6) {
+            return Ok(self.values()?.iter().map(crate::signal::decoded_opt_to_f64).collect());
+        }
 
         let all_invalid = self.block.flags & 0x01 != 0;
         let conv = self.block.conversion.as_ref();

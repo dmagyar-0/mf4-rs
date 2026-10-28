@@ -58,6 +58,14 @@ export interface WasmMdfIndex {
     fragments: unknown,
   ): unknown;
   signalByteRanges(name: string, group?: string | null, withMaster?: boolean | null): unknown;
+  startTimeNs(): bigint | undefined;
+  readWindowStep(
+    name: string,
+    group: string | null | undefined,
+    window: unknown,
+    ranges: unknown,
+    fragments: unknown,
+  ): WasmWindowStep;
   toJson(): string;
   validate(): void;
   valuesFromFragments(
@@ -109,6 +117,15 @@ export interface WasmBuildStep {
    * false — the walk gathers them all in one pass so the driver can fetch them
    * as a batch. */
   needed?: [number, number][];
+}
+
+/** One step of a windowed read (`readWindowStep`). */
+export interface WasmWindowStep {
+  done: boolean;
+  needed?: [number, number][];
+  signal?: unknown;
+  startRecord?: number;
+  recordCount?: number;
 }
 
 export interface WasmMdfWriter {

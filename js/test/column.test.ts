@@ -9,11 +9,8 @@ import { Mdf } from "../src/mdf";
 import { MdfIndex } from "../src/mdf-index";
 import { MdfWriter } from "../src/mdf-writer";
 import { BytesRangeSource, type RangeSource } from "../src/range-source";
-import {
-  toColumnOriented,
-  toColumnOrientedFile,
-  toColumnOrientedStream,
-} from "../src/column";
+import { toColumnOriented, toColumnOrientedStream } from "../src/column";
+import { toColumnOrientedFile } from "../src/column-file";
 
 const FAST = 60_000;
 const SLOW = 2_000;

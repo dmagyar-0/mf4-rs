@@ -427,6 +427,11 @@ impl ByteRangeReader for FragmentRangeReader {
 struct RecordingRangeReader<'a> {
     store: &'a FragmentStore,
     misses: Vec<(u64, u64)>,
+    /// Record the whole request on a miss instead of only its first missing
+    /// sub-range. Windowed reads set this: a large data read that is partly
+    /// covered by earlier small probes would otherwise come back one hole per
+    /// round.
+    whole_request: bool,
 }
 
 impl<'a> ByteRangeReader for RecordingRangeReader<'a> {
@@ -436,7 +441,7 @@ impl<'a> ByteRangeReader for RecordingRangeReader<'a> {
         match self.store.assemble(offset, length)? {
             Coverage::Full(bytes) => Ok(bytes),
             Coverage::Gap { offset: miss, length: needed } => {
-                self.misses.push((miss, needed));
+                self.misses.push(if self.whole_request { (offset, length) } else { (miss, needed) });
                 Err(MdfError::BlockSerializationError(
                     "range not yet available; fetch and retry".to_string(),
                 ))
@@ -555,9 +560,34 @@ struct GroupInfoJs {
 #[serde(rename_all = "camelCase")]
 struct IndexGroupInfoJs {
     name: Option<String>,
+    comment: Option<String>,
     record_count: u64,
     channel_names: Vec<String>,
     master_channel: Option<String>,
+    channels: Vec<IndexChannelInfoJs>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexChannelInfoJs {
+    name: Option<String>,
+    unit: Option<String>,
+    comment: Option<String>,
+    data_type: String,
+    is_master: bool,
+    bit_count: u32,
+    is_vlsd: bool,
+    has_conversion: bool,
+}
+
+/// Record or time window passed to `readWindowStep` (all fields optional).
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct WindowJs {
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    start_record: Option<f64>,
+    record_count: Option<f64>,
 }
 
 /// One step of the incremental index build (`buildIndexStep`): either the
@@ -603,7 +633,7 @@ impl WasmMdf {
                     unit: ch.unit()?,
                     comment: ch.comment()?,
                     data_type: data_type_name(&block.data_type).to_string(),
-                    is_master: block.channel_type == 2,
+                    is_master: matches!(block.channel_type, 2 | 3),
                     bit_count: block.bit_count,
                 });
             }
@@ -845,7 +875,7 @@ impl WasmMdfIndex {
     ) -> Result<JsValue, JsError> {
         let file_size = f64_to_u64(Some(file_size), "file size")?;
         let parsed = build_fragment_reader(&ranges, &fragments)?;
-        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new() };
+        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: false };
         let walk = MdfIndex::from_range_reader(&mut reader, file_size);
 
         // The walk may have finished the linked-list traversal while still
@@ -898,7 +928,7 @@ impl WasmMdfIndex {
     ) -> Result<JsValue, JsError> {
         let (g, c) = self.locate(name, group.as_deref())?;
         let parsed = build_fragment_reader(&ranges, &fragments)?;
-        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new() };
+        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: false };
 
         let mut targets = vec![(g, c)];
         if with_master {
@@ -954,6 +984,7 @@ impl WasmMdfIndex {
             .iter()
             .map(|g| IndexGroupInfoJs {
                 name: g.name.clone(),
+                comment: g.comment.clone(),
                 record_count: g.record_count,
                 channel_names: g.channel_names().into_iter().map(String::from).collect(),
                 // A column-oriented (MDF 4.2) signal group reports the shared
@@ -966,9 +997,110 @@ impl WasmMdfIndex {
                             .and_then(|mg| mg.master_channel())
                     })
                     .and_then(|c| c.name.clone()),
+                channels: g
+                    .channels
+                    .iter()
+                    .map(|c| IndexChannelInfoJs {
+                        name: c.name.clone(),
+                        unit: c.unit.clone(),
+                        comment: c.comment.clone(),
+                        data_type: data_type_name(&c.data_type).to_string(),
+                        is_master: c.is_master(),
+                        bit_count: c.bit_count,
+                        is_vlsd: c.is_vlsd(),
+                        has_conversion: c.conversion.is_some() || c.conversion_addr != 0,
+                    })
+                    .collect(),
             })
             .collect();
         serde_wasm_bindgen::to_value(&groups).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Measurement start time in nanoseconds since the Unix epoch, or
+    /// `undefined` if the file header does not record one.
+    #[wasm_bindgen(js_name = startTimeNs)]
+    pub fn start_time_ns(&self) -> Option<u64> {
+        self.index.start_time_ns
+    }
+
+    /// One step of a windowed read of `name` from caller-fetched fragments.
+    ///
+    /// `window` is `{ startTime?, endTime? }` (seconds of the master channel,
+    /// inclusive; the master is searched, not read in full) or
+    /// `{ startRecord?, recordCount? }` (a record window). Drive it like
+    /// `conversionRangesStep`: start with empty `ranges`/`fragments`; each
+    /// call returns `{ done: false, needed: [[offset, length], ...] }` until
+    /// every byte the read touches is present, then
+    /// `{ done: true, signal, startRecord, recordCount }`. Only the selected
+    /// records (plus a few single-record probes of the master and any lazily
+    /// resolved conversion blocks) are ever requested.
+    #[wasm_bindgen(js_name = readWindowStep)]
+    pub fn read_window_step(
+        &self,
+        name: &str,
+        group: Option<String>,
+        window: JsValue,
+        ranges: JsValue,
+        fragments: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let (g, c) = self.locate(name, group.as_deref())?;
+        let w: WindowJs = if window.is_undefined() || window.is_null() {
+            WindowJs::default()
+        } else {
+            serde_wasm_bindgen::from_value(window).map_err(|e| JsError::new(&e.to_string()))?
+        };
+        let by_time = w.start_time.is_some() || w.end_time.is_some();
+        if by_time && (w.start_record.is_some() || w.record_count.is_some()) {
+            return Err(JsError::new(
+                "pass either startTime/endTime or startRecord/recordCount, not both",
+            ));
+        }
+        for t in [w.start_time, w.end_time].into_iter().flatten() {
+            if t.is_nan() {
+                return Err(JsError::new("startTime/endTime must not be NaN"));
+            }
+        }
+        let total = self.index.channel_groups[g].record_count;
+        let start_record = match w.start_record {
+            Some(v) => f64_to_u64(Some(v), "startRecord")?,
+            None => 0,
+        };
+        let record_count = match w.record_count {
+            Some(v) => f64_to_u64(Some(v), "recordCount")?,
+            None => total.saturating_sub(start_record),
+        };
+
+        let parsed = build_fragment_reader(&ranges, &fragments)?;
+        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: true };
+        let result = (|| {
+            let (start, count) = if by_time {
+                self.index.record_window_for_time(g, c, w.start_time, w.end_time, &mut reader)?
+            } else {
+                (start_record, record_count)
+            };
+            let signal = crate::index::read_signal_window(&self.index, g, c, start, count, &mut reader)?;
+            Ok::<_, MdfError>((start, count, signal))
+        })();
+
+        let out = Object::new();
+        let set = |k: &str, v: &JsValue| -> Result<(), JsError> {
+            Reflect::set(&out, &JsValue::from_str(k), v)
+                .map(|_| ())
+                .map_err(|_| JsError::new("failed to build window step"))
+        };
+        if !reader.misses.is_empty() {
+            set("done", &JsValue::FALSE)?;
+            let needed = serde_wasm_bindgen::to_value(&misses_to_needed(reader.misses))
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            set("needed", &needed)?;
+            return Ok(out.into());
+        }
+        let (start, count, signal) = result.map_err(err_to_js)?;
+        set("done", &JsValue::TRUE)?;
+        set("signal", &signal_to_js(signal)?)?;
+        set("startRecord", &JsValue::from_f64(start as f64))?;
+        set("recordCount", &JsValue::from_f64(count as f64))?;
+        Ok(out.into())
     }
 
     /// Names of every named channel across all groups (duplicates kept).
@@ -1152,7 +1284,7 @@ impl IndexBuilder {
     /// needs (gathered in one batched pass — see [`crate::parsing::reader_walk`] —
     /// rather than one gap per call) for the caller to fetch and `push` back.
     pub fn step(&mut self) -> Result<JsValue, JsError> {
-        let mut reader = RecordingRangeReader { store: &self.store, misses: Vec::new() };
+        let mut reader = RecordingRangeReader { store: &self.store, misses: Vec::new(), whole_request: false };
         let walk = MdfIndex::from_range_reader(&mut reader, self.file_size);
 
         // Mirrors `build_index_step`: only report `done` once the walk
