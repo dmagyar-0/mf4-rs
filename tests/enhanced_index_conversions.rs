@@ -253,6 +253,7 @@ fn test_index_serialization_with_resolved_data() -> Result<(), MdfError> {
     let indexed_channel = IndexedChannel {
         name: Some("Test Channel".to_string()),
         unit: Some("V".to_string()),
+        comment: None,
         data_type: DataType::FloatLE,
         byte_offset: 0,
         bit_offset: 0,

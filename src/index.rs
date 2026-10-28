@@ -33,6 +33,9 @@ pub struct IndexedChannel {
     pub name: Option<String>,
     /// Physical unit
     pub unit: Option<String>,
+    /// Channel comment (`##TX` text, or the raw `##MD` XML)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
     /// Data type of the channel
     pub data_type: DataType,
     /// Byte offset within each record
@@ -75,9 +78,16 @@ pub struct IndexedChannel {
 }
 
 impl IndexedChannel {
-    /// `true` if this is the group's master channel (usually time).
+    /// `true` if this is the group's master channel (usually time): a
+    /// regular (`cn_type` 2) or virtual (`cn_type` 3) master.
     pub fn is_master(&self) -> bool {
-        self.channel_type == 2
+        self.channel_type == 2 || self.channel_type == 3
+    }
+
+    /// `true` for a virtual channel (`cn_type` 3 master or 6 data): it stores
+    /// no bytes, its raw value is the record index.
+    pub fn is_virtual(&self) -> bool {
+        self.channel_type == 3 || self.channel_type == 6
     }
 
     /// `true` if this is a variable-length (VLSD) channel.
@@ -980,6 +990,7 @@ impl MdfIndex {
                 indexed_channels.push(IndexedChannel {
                     name: channel.name()?,
                     unit: channel.unit()?,
+                    comment: channel.comment()?,
                     data_type: block.data_type.clone(),
                     byte_offset: block.byte_offset,
                     bit_offset: block.bit_offset,
@@ -1155,6 +1166,7 @@ impl MdfIndex {
                 indexed_channels.push(IndexedChannel {
                     name: ch.name,
                     unit: ch.unit,
+                    comment: ch.comment,
                     data_type: block.data_type.clone(),
                     byte_offset: block.byte_offset,
                     bit_offset: block.bit_offset,
@@ -1770,12 +1782,319 @@ impl MdfIndex {
 
         let conversion = Self::resolve_conversion(channel, reader)?;
 
+        if channel.is_virtual() {
+            return self.virtual_values(group, 0, group.record_count, conversion.as_ref());
+        }
         if channel.channel_type == 1 {
             return self.read_vlsd_channel_values(group, channel, conversion.as_ref(), reader);
         }
 
         // For regular channels, read from data blocks
         self.read_regular_channel_values(group, channel, conversion.as_ref(), reader)
+    }
+
+    /// Values of a virtual channel (`cn_type` 3/6) for records
+    /// `[start, start + count)`: the raw value is the record index, converted
+    /// through the channel's conversion (MDF 4.1 §6.6.3).
+    fn virtual_values(
+        &self,
+        group: &IndexedChannelGroup,
+        start: u64,
+        count: u64,
+        conversion: Option<&ConversionBlock>,
+    ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
+        // Nothing is read for a virtual channel, so bound the record count by
+        // stored data instead of trusting a possibly forged `record_count`:
+        // the group's own data blocks, or — for a byte-less time group (the
+        // virtual master `to_column_oriented` writes) — the largest
+        // data-backed group using it as its remote master.
+        let available = if !group.data_blocks.is_empty() {
+            Self::stored_records(group)?
+        } else {
+            let me = self.channel_groups.iter().position(|g| std::ptr::eq(g, group));
+            self.channel_groups
+                .iter()
+                .filter(|g| me.is_some() && g.master_group == me && !g.data_blocks.is_empty())
+                .filter_map(|g| Self::stored_records(g).ok())
+                .max()
+                // Nothing stored to check against: trust the group.
+                .unwrap_or(group.record_count)
+        };
+        match start.checked_add(count) {
+            Some(end) if end <= available => {}
+            _ => {
+                return Err(MdfError::BlockSerializationError(format!(
+                    "virtual channel read of {} records from {} exceeds the {} records the \
+                     group's data holds (rebuild the index)",
+                    count, start, available
+                )))
+            }
+        }
+        let mut values = Vec::with_capacity((count as usize).min(1 << 24));
+        for i in start..start + count {
+            let raw = DecodedValue::UnsignedInteger(i);
+            values.push(Some(match conversion {
+                Some(conv) => conv.apply_decoded(raw, &[])?,
+                None => raw,
+            }));
+        }
+        Ok(values)
+    }
+
+    /// Read the samples of the channel at `(g, c)` for the record window
+    /// `[start, start + count)` only.
+    ///
+    /// For a regular channel only the bytes of the window's records are read
+    /// (one range per data block the window touches, plus that block's
+    /// 24-byte header, which is verified). A VLSD channel is read in full and
+    /// sliced, since its payloads sit in a separate stream.
+    pub(crate) fn read_channel_values_window<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        g: usize,
+        c: usize,
+        start: u64,
+        count: u64,
+        reader: &mut R,
+    ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
+        let (group, channel) = self.group_and_channel(g, c)?;
+        Self::check_window(group, start, count)?;
+        let conversion = Self::resolve_conversion(channel, reader)?;
+        self.window_values(group, channel, conversion.as_ref(), start, count, reader)
+    }
+
+    fn window_values<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        group: &IndexedChannelGroup,
+        channel: &IndexedChannel,
+        conversion: Option<&ConversionBlock>,
+        start: u64,
+        count: u64,
+        reader: &mut R,
+    ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
+        if channel.is_virtual() {
+            return self.virtual_values(group, start, count, conversion);
+        }
+        if channel.channel_type == 1 {
+            let all = self.read_vlsd_channel_values(group, channel, conversion, reader)?;
+            return Ok(all.into_iter().skip(start as usize).take(count as usize).collect());
+        }
+        let record_size = Self::checked_record_size(group)?;
+        let temp_cb = channel.to_channel_block();
+        let mut values = Vec::with_capacity((count as usize).min(1 << 24));
+        Self::for_each_window_section(reader, group, record_size, start, count, |data| {
+            Self::decode_records_to_values(data, record_size, group, conversion, &temp_cb, &mut values)
+        })?;
+        Ok(values)
+    }
+
+    /// `f64` variant of [`window_values`](Self::window_values) (invalid or
+    /// non-numeric samples are NaN).
+    fn window_values_f64<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        group: &IndexedChannelGroup,
+        channel: &IndexedChannel,
+        conversion: Option<&ConversionBlock>,
+        start: u64,
+        count: u64,
+        reader: &mut R,
+    ) -> Result<Vec<f64>, MdfError> {
+        if channel.is_virtual() || channel.channel_type == 1 {
+            let vals = self.window_values(group, channel, conversion, start, count, reader)?;
+            return Ok(Self::vlsd_values_to_f64(vals));
+        }
+        let record_size = Self::checked_record_size(group)?;
+        let temp_cb = channel.to_decode_only_channel_block();
+        let linear_coeffs = Self::get_linear_coeffs(conversion);
+        let mut values = Vec::with_capacity((count as usize).min(1 << 24));
+        Self::for_each_window_section(reader, group, record_size, start, count, |data| {
+            Self::decode_records_to_f64(data, record_size, group, channel, conversion, &temp_cb, linear_coeffs, conversion.is_some(), &mut values)
+        })?;
+        Ok(values)
+    }
+
+    /// Call `f` with the bytes of the records `[start, start + count)` of
+    /// `group`, one slice per data block the window touches.
+    fn for_each_window_section<R, F>(
+        reader: &mut R,
+        group: &IndexedChannelGroup,
+        record_size: usize,
+        start: u64,
+        count: u64,
+        mut f: F,
+    ) -> Result<(), MdfError>
+    where
+        R: ByteRangeReader<Error = MdfError>,
+        F: FnMut(&[u8]) -> Result<(), MdfError>,
+    {
+        let end = start + count;
+        let mut block_start = 0u64;
+        // A probing reader (the wasm fragment driver) records every missing
+        // block of the window in one pass instead of stopping at the first.
+        let mut first_err = None;
+        for block in &group.data_blocks {
+            if block_start >= end {
+                break;
+            }
+            if block.is_compressed {
+                return Err(MdfError::BlockSerializationError(
+                    "Compressed blocks not yet supported in index reader".to_string(),
+                ));
+            }
+            let block_end = block_start + Self::records_in_block(block, record_size)?;
+            let (from, to) = (start.max(block_start), end.min(block_end));
+            if from < to {
+                let rel = (from - block_start) * record_size as u64;
+                let len = (to - from) * record_size as u64;
+                // Verify the block header like the full read path does (the
+                // header wins over the index): a window starting at the
+                // block's first record reads header and data in one request.
+                let read = if rel == 0 {
+                    reader.read_range(block.file_offset, 24 + len).map(|mut bytes| {
+                        let data = bytes.split_off(24.min(bytes.len()));
+                        (bytes, data)
+                    })
+                } else {
+                    let header = reader.read_range(block.file_offset, 24);
+                    let data = reader.read_range(block.file_offset + 24 + rel, len);
+                    header.and_then(|h| data.map(|d| (h, d)))
+                };
+                match read {
+                    Ok((header, data)) if first_err.is_none() => {
+                        let real_len = Self::verified_data_len(Some(&header), block)?;
+                        if rel + len > real_len {
+                            return Err(MdfError::BlockSerializationError(format!(
+                                "data block at offset {} holds {} data bytes but the index \
+                                 expects at least {} (inconsistent file; rebuild the index)",
+                                block.file_offset, real_len, rel + len
+                            )));
+                        }
+                        f(&data)?
+                    }
+                    Ok(_) => {}
+                    Err(e) if reader.is_probing() => {
+                        first_err.get_or_insert(e);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            block_start = block_end;
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        if block_start < end {
+            return Err(MdfError::BlockSerializationError(format!(
+                "record window ending at {} exceeds the {} records held by the data blocks",
+                end, block_start
+            )));
+        }
+        Ok(())
+    }
+
+    /// Records held by a group's data blocks.
+    fn stored_records(group: &IndexedChannelGroup) -> Result<u64, MdfError> {
+        let record_size = Self::checked_record_size(group)?;
+        let mut total = 0u64;
+        for block in &group.data_blocks {
+            total = total.saturating_add(Self::records_in_block(block, record_size)?);
+        }
+        Ok(total)
+    }
+
+    fn group_and_channel(&self, g: usize, c: usize) -> Result<(&IndexedChannelGroup, &IndexedChannel), MdfError> {
+        let group = self.channel_groups.get(g)
+            .ok_or_else(|| MdfError::BlockSerializationError("Invalid group index".to_string()))?;
+        let channel = group.channels.get(c)
+            .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
+        Ok((group, channel))
+    }
+
+    fn check_window(group: &IndexedChannelGroup, start: u64, count: u64) -> Result<(), MdfError> {
+        match start.checked_add(count) {
+            Some(end) if end <= group.record_count => Ok(()),
+            _ => Err(MdfError::BlockSerializationError(format!(
+                "record window starting at {} for {} records exceeds the group's {} records",
+                start, count, group.record_count
+            ))),
+        }
+    }
+
+    /// `(group, channel)` of the time axis for `(g, c)`: its master, or the
+    /// channel itself when it *is* the master.
+    fn time_axis_location(&self, g: usize, c: usize) -> Option<(usize, usize)> {
+        match self.master_location(g, c) {
+            Some(m) => Some(m),
+            None => self.channel_groups.get(g)?.channels.get(c)?.is_master().then_some((g, c)),
+        }
+    }
+
+    /// Record window `(start, count)` of the group owning `(g, c)` whose
+    /// master (time) values lie in `[t_start, t_end]` (either bound optional).
+    ///
+    /// The master must be non-decreasing, as MDF requires for a time master.
+    /// It is searched rather than read: each step reads [`TIME_SEARCH_FANOUT`]
+    /// single records, so a window is found in a handful of small reads
+    /// (`log16(records)` rounds per bound). With a probing reader (the wasm
+    /// fragment driver) both bounds' probes of a round are attempted before the
+    /// first miss is returned, so every gap of the round is recorded at once.
+    pub(crate) fn record_window_for_time<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        g: usize,
+        c: usize,
+        t_start: Option<f64>,
+        t_end: Option<f64>,
+        reader: &mut R,
+    ) -> Result<(u64, u64), MdfError> {
+        let (mg, m) = self.time_axis_location(g, c).ok_or_else(|| {
+            MdfError::BlockSerializationError(
+                "channel group has no master (time) channel; cannot select by time".to_string(),
+            )
+        })?;
+        let (group, _) = self.group_and_channel(g, c)?;
+        let (mgroup, mchannel) = self.group_and_channel(mg, m)?;
+        let n = group.record_count.min(mgroup.record_count);
+        let conversion = Self::resolve_conversion(mchannel, reader)?;
+        let probe = |i: u64, reader: &mut R| -> Result<f64, MdfError> {
+            Ok(self.window_values_f64(mgroup, mchannel, conversion.as_ref(), i, 1, reader)?[0])
+        };
+        // first record with t >= t_start; first record with t > t_end
+        let mut lo = Bound::new(n);
+        let mut hi = Bound::new(n);
+        if t_start.is_none() {
+            lo.done_at(0);
+        }
+        if t_end.is_none() {
+            hi.done_at(n);
+        }
+        while !(lo.done() && hi.done()) {
+            let mut first_err = None;
+            for (bound, below) in [
+                (&mut lo, &(|v: f64| t_start.is_some_and(|t| v < t)) as &dyn Fn(f64) -> bool),
+                (&mut hi, &|v: f64| t_end.is_some_and(|t| v <= t)),
+            ] {
+                if bound.done() {
+                    continue;
+                }
+                let probes = bound.probes();
+                let mut below_flags = Vec::with_capacity(probes.len());
+                for &p in &probes {
+                    match probe(p, reader) {
+                        Ok(v) => below_flags.push(below(v)),
+                        Err(e) => {
+                            first_err.get_or_insert(e);
+                        }
+                    }
+                }
+                if below_flags.len() == probes.len() {
+                    bound.narrow(&probes, &below_flags);
+                }
+            }
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+        }
+        let (start, end) = (lo.lo, hi.lo.max(lo.lo));
+        Ok((start, end - start))
     }
 
     /// Resolve a channel's conversion for reading.
@@ -2777,6 +3096,10 @@ impl MdfIndex {
 
         let conversion = Self::resolve_conversion(channel, reader)?;
 
+        if channel.is_virtual() {
+            let vals = self.virtual_values(group, 0, group.record_count, conversion.as_ref())?;
+            return Ok(Self::vlsd_values_to_f64(vals));
+        }
         if channel.channel_type == 1 {
             let vals = self.read_vlsd_channel_values(group, channel, conversion.as_ref(), reader)?;
             return Ok(Self::vlsd_values_to_f64(vals));
@@ -2829,6 +3152,9 @@ impl MdfIndex {
         let mut slice_reader = BorrowedSliceReader { data: file_data };
         let conversion = Self::resolve_conversion(channel, &mut slice_reader)?;
 
+        if channel.is_virtual() {
+            return self.virtual_values(group, 0, group.record_count, conversion.as_ref());
+        }
         if channel.channel_type == 1 {
             return self.read_vlsd_channel_values(group, channel, conversion.as_ref(), &mut slice_reader);
         }
@@ -2877,6 +3203,10 @@ impl MdfIndex {
         let mut slice_reader = BorrowedSliceReader { data: file_data };
         let conversion = Self::resolve_conversion(channel, &mut slice_reader)?;
 
+        if channel.is_virtual() {
+            let vals = self.virtual_values(group, 0, group.record_count, conversion.as_ref())?;
+            return Ok(Self::vlsd_values_to_f64(vals));
+        }
         if channel.channel_type == 1 {
             let vals = self.read_vlsd_channel_values(group, channel, conversion.as_ref(), &mut slice_reader)?;
             return Ok(Self::vlsd_values_to_f64(vals));
@@ -2931,6 +3261,56 @@ impl MdfIndex {
             .and_then(|l| data_start.checked_add(l))
             .ok_or_else(|| too_short(usize::MAX))?;
         file_data.get(data_start..data_end).ok_or_else(|| too_short(data_end))
+    }
+}
+
+/// Records probed per round of the time search in
+/// [`MdfIndex::record_window_for_time`].
+const TIME_SEARCH_FANOUT: u64 = 16;
+
+/// State of one partition-point search over `[lo, hi)`: the answer is the
+/// first record for which the predicate ("still below the bound") is false.
+struct Bound {
+    lo: u64,
+    hi: u64,
+}
+
+impl Bound {
+    fn new(n: u64) -> Self {
+        Bound { lo: 0, hi: n }
+    }
+
+    fn done(&self) -> bool {
+        self.lo >= self.hi
+    }
+
+    fn done_at(&mut self, at: u64) {
+        self.lo = at;
+        self.hi = at;
+    }
+
+    /// Up to [`TIME_SEARCH_FANOUT`] distinct, increasing records in `[lo, hi)`.
+    fn probes(&self) -> Vec<u64> {
+        let span = self.hi - self.lo;
+        if span <= TIME_SEARCH_FANOUT {
+            return (self.lo..self.hi).collect();
+        }
+        (0..TIME_SEARCH_FANOUT)
+            .map(|i| self.lo + (i as u128 * span as u128 / TIME_SEARCH_FANOUT as u128) as u64)
+            .collect()
+    }
+
+    /// Narrow to the gap between the last probe below the bound and the first
+    /// one not below it (values are non-decreasing).
+    fn narrow(&mut self, probes: &[u64], below: &[bool]) {
+        match below.iter().position(|b| !b) {
+            Some(0) => self.hi = probes[0],
+            Some(j) => {
+                self.lo = probes[j - 1] + 1;
+                self.hi = probes[j];
+            }
+            None => self.lo = probes[probes.len() - 1] + 1,
+        }
     }
 }
 
@@ -3040,4 +3420,66 @@ impl<'a, R: ByteRangeReader<Error = MdfError>> MdfReader<'a, R> {
         };
         Ok(Signal { name, unit, timestamps, values })
     }
+
+    /// Read records `[start, start + count)` of a channel as a [`Signal`],
+    /// fetching only those records' bytes (and the master's).
+    pub fn signal_records(&mut self, name: &str, start: u64, count: u64) -> Result<Signal, MdfError> {
+        let (g, c) = self.locate(name)?;
+        self.read_signal_window(g, c, start, count)
+    }
+
+    /// [`MdfReader::signal_records`] addressed by group name + channel name.
+    pub fn signal_records_in(&mut self, group: &str, name: &str, start: u64, count: u64) -> Result<Signal, MdfError> {
+        let (g, c) = self.locate_in(group, name)?;
+        self.read_signal_window(g, c, start, count)
+    }
+
+    /// Read the samples of a channel whose master (time) value lies in
+    /// `[t_start, t_end]` (seconds, as stored in the master; `None` leaves that
+    /// side open). The window is located by searching the master, so only a
+    /// few single records plus the selected window are read.
+    pub fn signal_between(&mut self, name: &str, t_start: Option<f64>, t_end: Option<f64>) -> Result<Signal, MdfError> {
+        let (g, c) = self.locate(name)?;
+        let (start, count) = self.index.record_window_for_time(g, c, t_start, t_end, &mut self.reader)?;
+        self.read_signal_window(g, c, start, count)
+    }
+
+    /// [`MdfReader::signal_between`] addressed by group name + channel name.
+    pub fn signal_between_in(&mut self, group: &str, name: &str, t_start: Option<f64>, t_end: Option<f64>) -> Result<Signal, MdfError> {
+        let (g, c) = self.locate_in(group, name)?;
+        let (start, count) = self.index.record_window_for_time(g, c, t_start, t_end, &mut self.reader)?;
+        self.read_signal_window(g, c, start, count)
+    }
+
+    fn read_signal_window(&mut self, g: usize, c: usize, start: u64, count: u64) -> Result<Signal, MdfError> {
+        read_signal_window(self.index, g, c, start, count, &mut self.reader)
+    }
+}
+
+/// Window read shared by [`MdfReader`] and the wasm fragment driver: records
+/// `[start, start + count)` of `(g, c)` paired with the same window of its
+/// time axis.
+pub(crate) fn read_signal_window<R: ByteRangeReader<Error = MdfError>>(
+    index: &MdfIndex,
+    g: usize,
+    c: usize,
+    start: u64,
+    count: u64,
+    reader: &mut R,
+) -> Result<Signal, MdfError> {
+    let channel = &index.channel_groups[g].channels[c];
+    let (name, unit) = (channel.name.clone().unwrap_or_default(), channel.unit.clone());
+    let values = index.read_channel_values_window(g, c, start, count, reader);
+    // Read the master even when the values failed, so a probing reader
+    // records both gaps in one pass. Like a full read, the master itself
+    // carries no separate timestamps.
+    let timestamps = match index.master_location(g, c) {
+        Some((mg, m)) => index
+            .read_channel_values_window(mg, m, start, count, reader)?
+            .iter()
+            .map(decoded_opt_to_f64)
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(Signal { name, unit, timestamps, values: values? })
 }

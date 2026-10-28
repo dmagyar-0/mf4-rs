@@ -166,8 +166,8 @@ const url = "https://example.com/measurement.mf4";
 // servers that ignore Range fall back to a single full download):
 const index = await MdfIndex.fromUrl(url);
 
-// Now read specific signals lazily over the same URL:
-const speed = await index.read("VehicleSpeed", new FetchRangeSource(url));
+// The URL stays bound to the index, so reads need no source argument:
+const speed = await index.read("VehicleSpeed");
 
 // Or build from any RangeSource (Node file, in-memory bytes, custom):
 // const index = await MdfIndex.fromRangeSource(new FileRangeSource(path));
@@ -176,6 +176,64 @@ const speed = await index.read("VehicleSpeed", new FetchRangeSource(url));
 This mirrors the native Rust `MdfIndex::from_url`. Prefer the ship-the-JSON
 pattern above when many clients read the same file (build the index once);
 use `fromUrl` when a client wants to open an arbitrary remote file directly.
+
+### Metadata, time ranges and partial reads
+
+```ts
+index.startTimeNs();             // bigint ns since the Unix epoch, or undefined
+index.groups();                  // [{ name, comment, recordCount, masterChannel,
+                                 //    channels: [{ name, unit, comment, dataType,
+                                 //    bitCount, isMaster, isVlsd, hasConversion }] }]
+index.channel("VehicleSpeed");   // one channel's metadata
+
+// Start/end time of a channel's group (reads just two records):
+const { start, end } = (await index.timeRange("VehicleSpeed"))!;
+
+// Read only part of a signal. Time bounds are inclusive, in master units
+// (seconds since startTimeNs for a time master); the window is located by
+// searching the master, so only a few single records plus the selected
+// window are fetched — not the whole time channel.
+const slice = await index.read("VehicleSpeed", { startTime: 10, endTime: 20 });
+const head = await index.values("VehicleSpeed", { startRecord: 0, recordCount: 1000 });
+
+// Pass `group` (and optionally `source`) in the same options object:
+await index.read("Speed", { group: "Engine", startTime: 10 });
+```
+
+`Mdf.read` / `Mdf.values` accept the same window options (sliced in memory),
+and `Mdf.timeRange(name)` returns a group's start/end time.
+
+Conversions are applied by `values`/`read`; `conversionInfo(name)` shows
+which one (`null` when the channel has none):
+
+```ts
+await index.conversionInfo("EngineTemp");
+// { type: "Linear", values: [-40, 0.5], precision: 0, flags: 0 }
+await index.conversionInfo("Gear");
+// { type: "ValueToText", values: [0, 1, 2],
+//   texts: { "0": "N", "1": "D", "2": "R", "3": "?" }, ... }
+```
+
+`texts` / nested `refs` are keyed by position in the block's reference list
+(for `ValueToText`, `values[i]` ↔ `texts[i]`, and index `values.length` is
+the default); `formula` holds an `Algebraic` expression. An index built over
+the network fetches the conversion block on demand; `Mdf.conversionInfo` is
+synchronous.
+
+Timestamps stay `number` seconds **relative to the measurement start** —
+that is how MDF stores them, and a float64 keeps sub-nanosecond precision
+for any realistic recording length. Absolute epoch nanoseconds do not fit a
+`number` (they exceed 2^53), so convert with `toAbsoluteNs` when you need
+them:
+
+```ts
+import { toAbsoluteNs } from "mf4-rs";
+const absNs = toAbsoluteNs(slice.timestamps, index.startTimeNs()!); // BigInt64Array
+```
+
+For the master channel itself `read()` returns empty `timestamps`: its
+`values` *are* the time axis. Virtual masters (`cn_type` 3, no stored bytes)
+read as the record index through their conversion.
 
 ### `signalByteRanges` vs. `byteRanges`
 
@@ -273,14 +331,26 @@ mdf.dispose();
 
 // Lazy, range-based remote read (only the needed bytes are fetched):
 const index = await MdfIndex.fromUrl("https://example.com/data.mf4");
-const signal = await index.read("Temperature", new FetchRangeSource("https://example.com/data.mf4"));
+const signal = await index.read("Temperature");
+
+// Any RangeSource works the same way, e.g. a user-picked File:
+const file = input.files![0];
+const local = await MdfIndex.fromRangeSource({
+  size: async () => file.size,
+  read: async (offset, length) =>
+    new Uint8Array(await file.slice(offset, offset + length).arrayBuffer()),
+});
 ```
 
 `init()` optionally accepts a URL / `Response` / `BufferSource` /
 `WebAssembly.Module` to control where `mf4_rs_bg.wasm` is loaded from (handy
 behind a CDN or a strict CSP); omit it to load the `.wasm` next to the
-module. The `web` entry omits `FileRangeSource` (it needs Node's `fs`); use
-`FetchRangeSource` or `BytesRangeSource` instead. The `mf4-rs/web` build is
+module. The `web` entry omits the Node-only helpers (`FileRangeSource`,
+`toColumnOrientedFile`; `Mdf.fromFile` / `MdfIndex.fromFile` throw there) and
+contains no `node:` imports, so bundlers such as webpack 5 need no polyfills or
+fallbacks. Use `FetchRangeSource`, `BytesRangeSource` or your own
+`RangeSource` instead. `FetchRangeSource` works in pages and workers (the
+global `fetch` is always invoked with the global receiver). The `mf4-rs/web` build is
 compiled as native ES modules (with explicit file extensions), so it works
 both through bundlers (Vite, webpack, Next, …) and in native
 `<script type="module">` / Deno.
@@ -291,17 +361,21 @@ Node classes plus a headless run of the `mf4-rs/web` build).
 ## API surface
 
 - `Mdf` — in-memory reader: `fromBytes`, `fromFile` (Node), `fromUrl`,
-  `groups()`, `channelNames()`, `values()`, `read()`, `startTimeNs()`,
-  `dispose()`.
-- `MdfIndex` — self-contained index + lazy fragment reads: `fromBytes`,
-  `fromJson`, `fromFile` (Node), `fromRangeSource` / `fromUrl` (metadata-only, over a `RangeSource` / HTTP), `toJson()`, `validate()`, `groups()`,
-  `channelNames()`, `fileSize()`, `byteRanges()`, `byteRangesForRecords()`,
+  `groups()`, `channelNames()`, `values()`, `read()` (both take a group name
+  or `ReadOptions` window), `timeRange()`, `conversionInfo()`,
+  `startTimeNs()`, `dispose()`.
+- `MdfIndex` — self-contained index + lazy reads: `fromBytes`,
+  `fromJson(json, source?)`, `fromFile` (Node), `fromRangeSource` / `fromUrl`
+  (metadata-only, over a `RangeSource` / HTTP), `source` / `setSource()`,
+  `toJson()`, `validate()`, `groups()`, `channel()`, `channelNames()`,
+  `startTimeNs()`, `fileSize()`, `byteRanges()`, `byteRangesForRecords()`,
   `signalByteRanges()`, `valuesFromFragments()`, `readFromFragments()`,
-  `values()` (lazy, over a `RangeSource`), `read()` (lazy), `dispose()`.
+  `values()` / `read()` (lazy; `(name, source?, group?)` or
+  `(name, ReadOptions)`), `timeRange()`, `conversionInfo()`, `dispose()`.
 - `MdfWriter` — in-memory writer: `initMdfFile`, `setStartTime`,
   `addChannelGroup`, `addChannel`, `addTimeChannel`, `addFloatChannel`,
   `addFloat32Channel`, `addIntChannel`, `addSintChannel`, `addStringChannel`,
-  `setTimeChannel`, `startDataBlock`, `writeRecord`, `finishDataBlock`,
+  `setTimeChannel`, `addLinearConversion`, `addValueToTextConversion`, `startDataBlock`, `writeRecord`, `finishDataBlock`,
   `finalize()`, `dispose()`. Numeric channels accept `number` or `bigint`
   record values; string channels (`addStringChannel`) accept `string`.
 - Column-oriented conversion: `toColumnOriented` (in memory),
@@ -309,8 +383,11 @@ Node classes plus a headless run of the `mf4-rs/web` build).
   `toColumnOrientedFile` (Node); `ColumnOptions`, `ColumnReport`.
 - `RangeSource` implementations: `FetchRangeSource`, `FileRangeSource`,
   `BytesRangeSource`.
+- Helpers: `toAbsoluteNs(timestamps, startTimeNs)`, `mergeByteRanges`,
+  `readAllRanges`.
 - Types: `Signal`, `GroupInfo`, `IndexGroupInfo`, `ChannelInfo`,
-  `ByteRange`, `ChannelValue`.
+  `IndexChannelInfo`, `ConversionInfo`, `ReadOptions`, `ReadWindow`, `TimeRange`, `ByteRange`,
+  `ChannelValue`.
 - Entry points: `mf4-rs` (Node, synchronous) and `mf4-rs/web` (browser; adds
   `init()` and re-exports the same classes minus the Node-only
   `FileRangeSource` and `toColumnOrientedFile`).

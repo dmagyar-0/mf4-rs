@@ -13,6 +13,8 @@
 
 // Registers the lazy Node loader for the wasm module as an import side effect.
 import "./wasm-module-node";
+// Registers the fs-backed reader behind Mdf.fromFile / MdfIndex.fromFile.
+import "./node-platform";
 
 export { Mdf } from "./mdf";
 export { MdfIndex, type IndexBuildOptions } from "./mdf-index";
@@ -20,23 +22,24 @@ export { MdfWriter, type RecordValue } from "./mdf-writer";
 export {
   toColumnOriented,
   toColumnOrientedStream,
-  toColumnOrientedFile,
   type ColumnOptions,
   type ColumnReport,
   type SyncByteSource,
   type SyncByteSink,
 } from "./column";
+export { toColumnOrientedFile } from "./column-file";
 
 export {
   FetchRangeSource,
-  FileRangeSource,
   BytesRangeSource,
   readAllRanges,
   type RangeSource,
   type FetchLike,
 } from "./range-source";
+export { FileRangeSource } from "./file-range-source";
 
 export { mergeByteRanges } from "./byte-ranges";
+export { toAbsoluteNs } from "./signal-util";
 
 export type {
   ChannelValue,
@@ -44,6 +47,11 @@ export type {
   ChannelInfo,
   GroupInfo,
   IndexGroupInfo,
+  IndexChannelInfo,
+  ConversionInfo,
+  ReadOptions,
+  ReadWindow,
+  TimeRange,
   ByteRange,
 } from "./types";
 

@@ -151,6 +151,7 @@ impl MdfWriter {
         default_text: &str,
         channel_id: Option<&str>,
     ) -> Result<(String, u64), MdfError> {
+        self.ensure_no_open_data_block("add_value_to_text_conversion")?;
         let cc_count = self.block_positions.keys().filter(|k| k.starts_with("cc_")).count();
         let cc_id = format!("cc_{}", cc_count);
 
@@ -198,6 +199,57 @@ impl MdfWriter {
             self.update_block_link(cn, conv_offset, &cc_id)?;
         }
         Ok((cc_id, pos))
+    }
+
+    /// Creates and writes a linear conversion block (`phys = offset + factor *
+    /// raw`), linking it to `channel_id` when given.
+    pub fn add_linear_conversion(
+        &mut self,
+        offset: f64,
+        factor: f64,
+        channel_id: Option<&str>,
+    ) -> Result<(String, u64), MdfError> {
+        self.ensure_no_open_data_block("add_linear_conversion")?;
+        let cc_count = self.block_positions.keys().filter(|k| k.starts_with("cc_")).count();
+        let cc_id = format!("cc_{}", cc_count);
+        let block = ConversionBlock {
+            header: BlockHeader { id: "##CC".into(), reserved0: 0, block_len: 0, links_nr: 0 },
+            cc_tx_name: None,
+            cc_md_unit: None,
+            cc_md_comment: None,
+            cc_cc_inverse: None,
+            cc_ref: Vec::new(),
+            cc_type: ConversionType::Linear,
+            cc_precision: 0,
+            cc_flags: 0,
+            cc_ref_count: 0,
+            cc_val_count: 2,
+            cc_phy_range_min: None,
+            cc_phy_range_max: None,
+            cc_val: vec![offset, factor],
+            formula: None,
+            resolved_texts: None,
+            resolved_conversions: None,
+            default_conversion: None,
+        };
+        let cc_bytes = block.to_bytes()?;
+        let pos = self.write_block_with_id(&cc_bytes, &cc_id)?;
+        if let Some(cn) = channel_id {
+            self.update_block_link(cn, 56, &cc_id)?;
+        }
+        Ok((cc_id, pos))
+    }
+
+    /// Metadata blocks are written at the current file position, which lies
+    /// inside an open `##DT` block while records are being written; refuse
+    /// instead of corrupting the data.
+    fn ensure_no_open_data_block(&self, what: &str) -> Result<(), MdfError> {
+        if self.open_dts.is_empty() {
+            return Ok(());
+        }
+        Err(MdfError::BlockSerializationError(format!(
+            "{what} must be called before start_data_block (a data block is open)"
+        )))
     }
 
     /// Write a `##TX` block holding `name` and link it as the channel group's

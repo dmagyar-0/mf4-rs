@@ -1,5 +1,15 @@
 import { getWasmModule, type WasmMdf } from "./wasm-module";
-import type { GroupInfo, Signal } from "./types";
+import { readFileNodeOnly } from "./platform";
+import {
+  checkWindow,
+  hasWindow,
+  normaliseOptions,
+  rangeOf,
+  sliceSignal,
+  timeAxisOf,
+  toFloat64,
+} from "./signal-util";
+import type { ConversionInfo, GroupInfo, ReadOptions, Signal, TimeRange } from "./types";
 
 /**
  * Read-only handle to an MDF 4 file parsed from an in-memory byte buffer.
@@ -22,9 +32,7 @@ export class Mdf {
 
   /** Read an MDF 4 file from disk and parse it. Node only. */
   static async fromFile(path: string): Promise<Mdf> {
-    const fsp = await import("node:fs/promises");
-    const buf = await fsp.readFile(path);
-    return Mdf.fromBytes(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+    return Mdf.fromBytes(await readFileNodeOnly(path, "Mdf.fromFile"));
   }
 
   /** Download an MDF 4 file in full over HTTP(S) and parse it. */
@@ -33,7 +41,9 @@ export class Mdf {
     if (!impl) {
       throw new Error("No fetch implementation available; pass one explicitly to fromUrl().");
     }
-    const res = await impl(url);
+    // Called as a plain function: a browser `fetch` invoked with another
+    // receiver throws "Illegal invocation".
+    const res = await impl.call(globalThis, url);
     if (!res.ok) {
       throw new Error(`Mdf.fromUrl: request failed with status ${res.status}`);
     }
@@ -54,14 +64,78 @@ export class Mdf {
   /**
    * Read a numeric channel as a plain `Float64Array` (no timestamps).
    * Conversions are applied; invalid/non-numeric samples become `NaN`.
+   *
+   * The second argument is a group name or a {@link ReadOptions} object
+   * (`{ group, startTime, endTime }` or `{ group, startRecord, recordCount }`)
+   * to read only part of the channel.
    */
-  values(name: string, group?: string | null): Float64Array {
-    return this.inner.values(name, group);
+  values(name: string, groupOrOptions?: string | null | ReadOptions): Float64Array {
+    const opts = normaliseOptions(groupOrOptions);
+    if (!hasWindow(opts)) {
+      return this.inner.values(name, opts.group);
+    }
+    return toFloat64(this.read(name, opts).values);
   }
 
-  /** Read a channel as a `Signal` (values paired with its group's time axis). */
-  read(name: string, group?: string | null): Signal {
-    return this.inner.read(name, group) as Signal;
+  /**
+   * Read a channel as a `Signal` (values paired with its group's time axis).
+   * For the master channel itself `timestamps` is empty: its `values` are
+   * the time axis.
+   *
+   * The second argument is a group name or a {@link ReadOptions} window.
+   */
+  read(name: string, groupOrOptions?: string | null | ReadOptions): Signal {
+    const opts = normaliseOptions(groupOrOptions);
+    const signal = this.inner.read(name, opts.group) as Signal;
+    if (!hasWindow(opts)) {
+      return signal;
+    }
+    const window = checkWindow(opts);
+    const byTime = window.startTime !== undefined || window.endTime !== undefined;
+    // Without timestamps only a master channel is its own time axis; any
+    // other channel's values must not be mistaken for times.
+    const axis =
+      signal.timestamps.length || !byTime || this.#isMaster(name, opts.group)
+        ? timeAxisOf(signal)
+        : [];
+    if (byTime && axis.length === 0 && signal.values.length > 0) {
+      throw new Error(`Channel '${name}' has no master (time) channel; cannot select by time.`);
+    }
+    return sliceSignal(signal, window, axis);
+  }
+
+  /**
+   * First and last master (time) value of the group holding `name`, or
+   * `undefined` for an empty group. Throws if the group has no master.
+   */
+  timeRange(name: string, group?: string | null): TimeRange | undefined {
+    const signal = this.read(name, group);
+    if (signal.values.length === 0) {
+      return undefined;
+    }
+    if (signal.timestamps.length === 0 && !this.#isMaster(name, group)) {
+      throw new Error(`Channel '${name}' has no master (time) channel.`);
+    }
+    return rangeOf(timeAxisOf(signal));
+  }
+
+  /**
+   * The conversion that `values`/`read` apply to channel `name` (fully
+   * resolved), or `null` when the channel has none.
+   */
+  conversionInfo(name: string, group?: string | null): ConversionInfo | null {
+    return this.inner.conversionInfo(name, group) as ConversionInfo | null;
+  }
+
+  /** Whether the channel `read(name, group)` resolves to (the first match)
+   * is a master. */
+  #isMaster(name: string, group?: string | null): boolean {
+    for (const g of this.groups()) {
+      if (group != null && g.name !== group) continue;
+      const ch = g.channels.find((c) => c.name === name);
+      if (ch) return ch.isMaster;
+    }
+    return false;
   }
 
   /**

@@ -246,8 +246,8 @@ fn decoded_value_to_pyobject(dv: DecodedValue, py: Python) -> PyObject {
 /// unit : Optional[str]
 ///     Engineering unit string, or ``None``.
 /// comment : Optional[str]
-///     Free-form comment, or ``None``. Always ``None`` when obtained via the
-///     index (not stored in `IndexedChannel`).
+///     Free-form comment, or ``None``. ``None`` for an index saved by an older
+///     mf4-rs version (rebuild it to pick comments up).
 /// data_type : DataType
 ///     The MDF data type of the raw samples.
 /// bit_count : int
@@ -297,17 +297,17 @@ impl PyChannelInfo {
             comment: channel.comment()?,
             data_type: PyDataType::from(&block.data_type),
             bit_count: block.bit_count,
-            is_master: block.channel_type == 2,
+            is_master: matches!(block.channel_type, 2 | 3),
             is_vlsd: block.channel_type == 1 && block.data != 0,
         })
     }
 
-    /// Build from an indexed channel (comments are not stored in the index).
+    /// Build from an indexed channel.
     fn from_indexed(channel: &IndexedChannel) -> Self {
         PyChannelInfo {
             name: channel.name.clone(),
             unit: channel.unit.clone(),
-            comment: None,
+            comment: channel.comment.clone(),
             data_type: PyDataType::from(&channel.data_type),
             bit_count: channel.bit_count,
             is_master: channel.is_master(),

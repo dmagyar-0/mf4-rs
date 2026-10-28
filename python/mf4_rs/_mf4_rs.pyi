@@ -47,8 +47,8 @@ class ChannelInfo:
     unit : Optional[str]
         Engineering unit string, or ``None``.
     comment : Optional[str]
-        Free-form comment, or ``None``. Always ``None`` when obtained via the
-        index (not stored in `IndexedChannel`).
+        Free-form comment, or ``None``. ``None`` for an index saved by an older
+        mf4-rs version (rebuild it to pick comments up).
     data_type : DataType
         The MDF data type of the raw samples.
     bit_count : int

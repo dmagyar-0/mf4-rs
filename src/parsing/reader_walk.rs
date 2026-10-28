@@ -38,6 +38,7 @@ pub(crate) struct WalkedChannel {
     pub block: ChannelBlock,
     pub name: Option<String>,
     pub unit: Option<String>,
+    pub comment: Option<String>,
     /// File offset of the channel's `##CC` conversion block (0 = none).
     ///
     /// The walk deliberately does **not** fetch or resolve the conversion
@@ -167,6 +168,7 @@ where
 
                 let name = read_string_block_via_reader(reader, cn.name_addr)?;
                 let unit = read_string_block_via_reader(reader, cn.unit_addr)?;
+                let comment = read_string_block_via_reader(reader, cn.comment_addr)?;
 
                 // Record where the conversion lives, but do not fetch/resolve
                 // it now — that happens lazily on the first value read.
@@ -176,6 +178,7 @@ where
                     block: cn,
                     name,
                     unit,
+                    comment,
                     conversion_addr,
                 });
 
