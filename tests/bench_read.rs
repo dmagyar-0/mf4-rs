@@ -1,6 +1,6 @@
 /// Detailed read performance benchmark for mf4-rs
 /// Tests various channel types and record counts to establish baselines.
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::error::MdfError;
 use mf4_rs::parsing::decoder::DecodedValue;
@@ -18,24 +18,24 @@ fn cleanup(path: &std::path::Path) {
 fn write_f64_file(path: &std::path::Path, n: usize) -> Result<(), MdfError> {
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Time".into());
         ch.bit_count = 64;
     })?;
     w.set_time_channel(&t)?;
-    let a = w.add_channel(&cg, Some(&t), |ch| {
+    let a = w.add_channel_with(&cg, Some(&t), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("A".into());
         ch.bit_count = 64;
     })?;
-    let b = w.add_channel(&cg, Some(&a), |ch| {
+    let b = w.add_channel_with(&cg, Some(&a), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("B".into());
         ch.bit_count = 64;
     })?;
-    w.add_channel(&cg, Some(&b), |ch| {
+    w.add_channel_with(&cg, Some(&b), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("C".into());
         ch.bit_count = 64;
@@ -60,23 +60,23 @@ fn write_f64_file(path: &std::path::Path, n: usize) -> Result<(), MdfError> {
 fn write_mixed_file(path: &std::path::Path, n: usize) -> Result<(), MdfError> {
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let ch1 = w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let ch1 = w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("counter".into());
         ch.bit_count = 32;
     })?;
-    let ch2 = w.add_channel(&cg, Some(&ch1), |ch| {
+    let ch2 = w.add_channel_with(&cg, Some(&ch1), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("measurement".into());
         ch.bit_count = 64;
     })?;
-    let ch3 = w.add_channel(&cg, Some(&ch2), |ch| {
+    let ch3 = w.add_channel_with(&cg, Some(&ch2), |ch| {
         ch.data_type = DataType::SignedIntegerLE;
         ch.name = Some("offset".into());
         ch.bit_count = 64;
     })?;
-    w.add_channel(&cg, Some(&ch3), |ch| {
+    w.add_channel_with(&cg, Some(&ch3), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("flags".into());
         ch.bit_count = 64;
@@ -104,18 +104,18 @@ fn bench_read_f64_100k() -> Result<(), MdfError> {
     write_f64_file(&path, n)?;
 
     // Warmup - read file once
-    let _ = MDF::from_file(path.to_str().unwrap())?;
+    let _ = Mdf::from_file(path.to_str().unwrap())?;
 
     // Benchmark: read all channels
     let iterations = 5;
     let mut times = Vec::new();
     for _ in 0..iterations {
         let start = std::time::Instant::now();
-        let mdf = MDF::from_file(path.to_str().unwrap())?;
+        let mdf = Mdf::from_file(path.to_str().unwrap())?;
         let mut total = 0usize;
         for group in mdf.channel_groups() {
             for channel in group.channels() {
-                total += channel.values()?.len();
+                total += channel.decoded_values()?.len();
             }
         }
         let elapsed = start.elapsed();
@@ -150,11 +150,11 @@ fn bench_read_f64_1m() -> Result<(), MdfError> {
     let mut times = Vec::new();
     for _ in 0..iterations {
         let start = std::time::Instant::now();
-        let mdf = MDF::from_file(path.to_str().unwrap())?;
+        let mdf = Mdf::from_file(path.to_str().unwrap())?;
         let mut total = 0usize;
         for group in mdf.channel_groups() {
             for channel in group.channels() {
-                total += channel.values()?.len();
+                total += channel.decoded_values()?.len();
             }
         }
         let elapsed = start.elapsed();
@@ -188,11 +188,11 @@ fn bench_read_mixed_100k() -> Result<(), MdfError> {
     let mut times = Vec::new();
     for _ in 0..iterations {
         let start = std::time::Instant::now();
-        let mdf = MDF::from_file(path.to_str().unwrap())?;
+        let mdf = Mdf::from_file(path.to_str().unwrap())?;
         let mut total = 0usize;
         for group in mdf.channel_groups() {
             for channel in group.channels() {
-                total += channel.values()?.len();
+                total += channel.decoded_values()?.len();
             }
         }
         let elapsed = start.elapsed();
@@ -223,17 +223,17 @@ fn bench_read_f64_fast_100k() -> Result<(), MdfError> {
     let n = 100_000usize;
     write_f64_file(&path, n)?;
 
-    let _ = MDF::from_file(path.to_str().unwrap())?;
+    let _ = Mdf::from_file(path.to_str().unwrap())?;
 
     let iterations = 5;
     let mut times = Vec::new();
     for _ in 0..iterations {
         let start = std::time::Instant::now();
-        let mdf = MDF::from_file(path.to_str().unwrap())?;
+        let mdf = Mdf::from_file(path.to_str().unwrap())?;
         let mut total = 0usize;
         for group in mdf.channel_groups() {
             for channel in group.channels() {
-                total += channel.values_as_f64()?.len();
+                total += channel.values()?.len();
             }
         }
         let elapsed = start.elapsed();
@@ -268,11 +268,11 @@ fn bench_read_f64_fast_1m() -> Result<(), MdfError> {
     let mut times = Vec::new();
     for _ in 0..iterations {
         let start = std::time::Instant::now();
-        let mdf = MDF::from_file(path.to_str().unwrap())?;
+        let mdf = Mdf::from_file(path.to_str().unwrap())?;
         let mut total = 0usize;
         for group in mdf.channel_groups() {
             for channel in group.channels() {
-                total += channel.values_as_f64()?.len();
+                total += channel.values()?.len();
             }
         }
         let elapsed = start.elapsed();
@@ -307,7 +307,7 @@ fn bench_open_only_1m() -> Result<(), MdfError> {
     let mut times = Vec::new();
     for _ in 0..iterations {
         let start = std::time::Instant::now();
-        let _mdf = MDF::from_file(path.to_str().unwrap())?;
+        let _mdf = Mdf::from_file(path.to_str().unwrap())?;
         let elapsed = start.elapsed();
         times.push(elapsed);
     }

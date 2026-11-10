@@ -13,7 +13,7 @@
 //! The test prints a summary so the diagnostic is visible with `cargo test
 //! -- --nocapture`, and also asserts these invariants.
 
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::block_layout::FileLayout;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::cut::cut_mdf_by_time;
@@ -33,14 +33,14 @@ fn build_source(path: &str) -> Result<Vec<Vec<u8>>, MdfError> {
     w.init_mdf_file()?;
 
     // -- DG 0 / CG 0: Time (master) + VLSD ByteArray "Payload" --
-    let cg0 = w.add_channel_group(None, |_| {})?;
-    let t0 = w.add_channel(&cg0, None, |c| {
+    let cg0 = w.add_channel_group_with(None, |_| {})?;
+    let t0 = w.add_channel_with(&cg0, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".into());
     })?;
     w.set_time_channel(&t0)?;
-    let vlsd_id = w.add_channel(&cg0, Some(&t0), |c| {
+    let vlsd_id = w.add_channel_with(&cg0, Some(&t0), |c| {
         c.data_type = DataType::ByteArray;
         c.bit_count = 64;
         c.channel_type = 1; // VLSD
@@ -67,14 +67,14 @@ fn build_source(path: &str) -> Result<Vec<Vec<u8>>, MdfError> {
     w.finish_data_block(&cg0)?;
 
     // -- DG 1 / CG 1: Time (master) + ValB (f64) --
-    let cg1 = w.add_channel_group(None, |_| {})?;
-    let t1 = w.add_channel(&cg1, None, |c| {
+    let cg1 = w.add_channel_group_with(None, |_| {})?;
+    let t1 = w.add_channel_with(&cg1, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".into());
     })?;
     w.set_time_channel(&t1)?;
-    w.add_channel(&cg1, Some(&t1), |c| {
+    w.add_channel_with(&cg1, Some(&t1), |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("ValB".into());
@@ -201,9 +201,9 @@ fn cut_vlsd_byte_level_diff_across_multi_dg() -> Result<(), MdfError> {
 
     // VLSD payload (SD entry) bytes must match exactly for kept records.
     println!("\n--- DG 0 (VLSD): SD payload comparison ---");
-    let dst_groups = MDF::from_file(out.to_str().unwrap())?;
+    let dst_groups = Mdf::from_file(out.to_str().unwrap())?;
     let dst_payload_chs = dst_groups.channel_groups()[0].channels();
-    let dst_payloads_decoded = dst_payload_chs[1].values()?;
+    let dst_payloads_decoded = dst_payload_chs[1].decoded_values()?;
     assert_eq!(dst_payloads_decoded.len(), 5);
     for (out_i, src_i) in kept_indices.iter().enumerate() {
         match &dst_payloads_decoded[out_i] {

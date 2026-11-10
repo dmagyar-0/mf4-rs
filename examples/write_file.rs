@@ -1,4 +1,4 @@
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::error::MdfError;
 use mf4_rs::parsing::decoder::DecodedValue;
@@ -9,36 +9,36 @@ fn main() -> Result<(), MdfError> {
     let mut writer = MdfWriter::new("example.mf4")?;
     let (_id, _hd) = writer.init_mdf_file()?;
     // -------- Channel Group 1 with 2 channels --------
-    let cg1_id = writer.add_channel_group(None, |_| {})?;
-    let cn1_id = writer.add_channel(&cg1_id, None, |ch| {
+    let cg1_id = writer.add_channel_group_with(None, |_| {})?;
+    let cn1_id = writer.add_channel_with(&cg1_id, None, |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Speed".into());
     })?;
 
-    writer.add_channel(&cg1_id, Some(&cn1_id), |ch| {
+    writer.add_channel_with(&cg1_id, Some(&cn1_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("RPM".into());
     })?;
 
     // -------- Channel Group 2 with 3 channels --------
     // A new data group is created automatically
-    let cg2_id = writer.add_channel_group(None, |_| {})?;
+    let cg2_id = writer.add_channel_group_with(None, |_| {})?;
 
-    let cn3_id = writer.add_channel(&cg2_id, None, |ch| {
+    let cn3_id = writer.add_channel_with(&cg2_id, None, |ch| {
         ch.data_type = DataType::SignedIntegerLE;
         ch.name = Some("Temperature".into());
     })?;
-    let cn4_id = writer.add_channel(&cg2_id, Some(&cn3_id), |ch| {
+    let cn4_id = writer.add_channel_with(&cg2_id, Some(&cn3_id), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Pressure".into());
     })?;
 
-    let cn5_id = writer.add_channel(&cg2_id, Some(&cn4_id), |ch| {
+    let cn5_id = writer.add_channel_with(&cg2_id, Some(&cn4_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Status".into());
     })?;
     let status_map = [(0i64, "OK"), (1i64, "WARN")];
-    writer.add_value_to_text_conversion(&status_map, "UNKNOWN", Some(&cn5_id))?;
+    writer.write_value_to_text_conversion(&status_map, "UNKNOWN", Some(&cn5_id))?;
 
     // -------- Write sample data for both groups --------
     writer.start_data_block_for_cg(&cg1_id, 0)?;
@@ -69,13 +69,13 @@ fn main() -> Result<(), MdfError> {
     writer.finalize()?;
 
     // -------- Verify using the crate parser --------
-    let mdf = MDF::from_file("example.mf4")?;
+    let mdf = Mdf::from_file("example.mf4")?;
     println!("Channel groups: {}", mdf.channel_groups().len());
     for (idx, group) in mdf.channel_groups().iter().enumerate() {
         let chans = group.channels();
         print!("  Group {} has {} channels", idx + 1, chans.len());
         if let Some(ch) = chans.first() {
-            let values = ch.values()?;
+            let values = ch.decoded_values()?;
             println!(" and {} records", values.len());
         } else {
             println!();

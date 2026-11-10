@@ -148,7 +148,7 @@ fn build_fixture() -> Fixture {
     // clustering all structural headers near the front of the file.
     let mut cg_ids = Vec::with_capacity(GROUPS);
     for g in 0..GROUPS {
-        let cg_id = w.add_channel_group(None, |_| {}).unwrap();
+        let cg_id = w.add_channel_group_with(None, |_| {}).unwrap();
         w.set_channel_group_name(&cg_id, &format!("Group {g}")).unwrap();
         w.set_channel_group_comment(&cg_id, &format!("Comment {g}")).unwrap();
         cg_ids.push(cg_id);
@@ -161,7 +161,7 @@ fn build_fixture() -> Fixture {
     let mut first_channel_addr = Vec::with_capacity(GROUPS);
     for (g, cg_id) in cg_ids.iter().enumerate() {
         let time_id = w
-            .add_channel(cg_id, None, |ch| {
+            .add_channel_with(cg_id, None, |ch| {
                 ch.data_type = DataType::FloatLE;
                 ch.bit_count = 64;
                 ch.name = Some(format!("t_{g}"));
@@ -173,7 +173,7 @@ fn build_fixture() -> Fixture {
         let mut prev = time_id;
         for c in 1..CHANNELS_PER_GROUP {
             prev = w
-                .add_channel(cg_id, Some(&prev), |ch| {
+                .add_channel_with(cg_id, Some(&prev), |ch| {
                     ch.data_type = DataType::FloatLE;
                     ch.bit_count = 64;
                     ch.name = Some(format!("ch_{g}_{c}"));
@@ -290,8 +290,8 @@ fn probing_walk_converges_to_full_index() {
     let direct = MdfIndex::from_bytes(fx.bytes.clone()).unwrap();
 
     assert_eq!(built.channel_groups.len(), direct.channel_groups.len());
-    assert_eq!(built.channel_names(), direct.channel_names());
-    assert_eq!(built.channel_names().len(), GROUPS * CHANNELS_PER_GROUP);
+    assert_eq!(built.channel_names().unwrap(), direct.channel_names().unwrap());
+    assert_eq!(built.channel_names().unwrap().len(), GROUPS * CHANNELS_PER_GROUP);
     for (bg, dg) in built.channel_groups.iter().zip(direct.channel_groups.iter()) {
         assert_eq!(bg.name, dg.name);
         assert_eq!(bg.channels.len(), dg.channels.len());

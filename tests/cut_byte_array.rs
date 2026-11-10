@@ -1,4 +1,4 @@
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::error::MdfError;
 use mf4_rs::parsing::decoder::DecodedValue;
@@ -19,19 +19,19 @@ fn cut_preserves_byte_array_channel() -> Result<(), MdfError> {
     // Source file: time + 4-byte ByteArray "tag" channel + uint32 value channel.
     let mut writer = MdfWriter::new(input.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let time_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let time_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Time".into());
     })?;
     writer.set_time_channel(&time_id)?;
-    let tag_id = writer.add_channel(&cg_id, Some(&time_id), |ch| {
+    let tag_id = writer.add_channel_with(&cg_id, Some(&time_id), |ch| {
         ch.data_type = DataType::ByteArray;
         ch.bit_count = 32; // 4 bytes
         ch.name = Some("Tag".into());
     })?;
-    writer.add_channel(&cg_id, Some(&tag_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&tag_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.bit_count = 32;
         ch.name = Some("Val".into());
@@ -63,15 +63,15 @@ fn cut_preserves_byte_array_channel() -> Result<(), MdfError> {
         0.6,
     )?;
 
-    let mdf = MDF::from_file(output.to_str().unwrap())?;
+    let mdf = Mdf::from_file(output.to_str().unwrap())?;
     let groups = mdf.channel_groups();
     assert_eq!(groups.len(), 1);
     let chs = groups[0].channels();
     assert_eq!(chs.len(), 3);
 
-    let times = chs[0].values()?;
-    let tags = chs[1].values()?;
-    let vals = chs[2].values()?;
+    let times = chs[0].decoded_values()?;
+    let tags = chs[1].decoded_values()?;
+    let vals = chs[2].decoded_values()?;
     assert_eq!(times.len(), 4);
     assert_eq!(tags.len(), 4);
     assert_eq!(vals.len(), 4);

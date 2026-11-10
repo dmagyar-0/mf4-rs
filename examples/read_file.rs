@@ -1,11 +1,11 @@
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::error::MdfError;
 
 fn main() -> Result<(), MdfError> {
     // 1) Parse the file (no data is decoded yet)
     // This assumes `write_file` has been run to create the file
     let path = "example.mf4";
-    let mdf = MDF::from_file(path)?;
+    let mdf = Mdf::from_file(path)?;
     println!();
 
     // 2) Walk all ChannelGroups
@@ -68,7 +68,7 @@ fn main() -> Result<(), MdfError> {
                 println!("    Signal Source: <none>");
             }
             // 3) Decode samples *on demand*
-            let samples = channel.values()?;
+            let samples = channel.decoded_values()?;
             let total_samples = samples.len();
             println!("    Samples: {} records", total_samples);
             println!(

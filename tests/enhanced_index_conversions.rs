@@ -3,7 +3,7 @@ use mf4_rs::blocks::common::{DataType, BlockHeader};
 use mf4_rs::blocks::conversion::{ConversionBlock, ConversionType};
 use mf4_rs::parsing::decoder::DecodedValue;
 use mf4_rs::index::{MdfIndex, IndexedChannel, IndexedChannelGroup};
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::error::MdfError;
 use std::fs;
 
@@ -20,10 +20,10 @@ fn test_enhanced_index_with_text_conversions() -> Result<(), MdfError> {
     let mut writer = MdfWriter::new(mdf_path.to_str().unwrap())?;
     writer.init_mdf_file()?;
     
-    let cg_id = writer.add_channel_group(None, |_| {})?;
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
     
     // Create a status channel that will use value-to-text conversion
-    let _status_ch_id = writer.add_channel(&cg_id, None, |ch| {
+    let _status_ch_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Status".to_string());
         ch.bit_count = 8;
@@ -45,11 +45,11 @@ fn test_enhanced_index_with_text_conversions() -> Result<(), MdfError> {
     // Test 1: Create and verify enhanced index
     println!("=== Test 1: Creating Enhanced Index ===");
     let index = MdfIndex::from_file(mdf_path.to_str().unwrap())?;
-    index.save_to_file(index_path.to_str().unwrap())?;
+    index.save(index_path.to_str().unwrap())?;
 
     // Test 2: Load index and verify structure
     println!("=== Test 2: Loading and Verifying Index Structure ===");
-    let loaded_index = MdfIndex::load_from_file(index_path.to_str().unwrap())?;
+    let loaded_index = MdfIndex::load(index_path.to_str().unwrap())?;
     
     assert_eq!(loaded_index.channel_groups.len(), 1);
     
@@ -64,7 +64,7 @@ fn test_enhanced_index_with_text_conversions() -> Result<(), MdfError> {
     // Test 3: Read channel values via enhanced index
     println!("=== Test 3: Reading Values via Enhanced Index ===");
     let mut data = loaded_index.open_file(mdf_path.to_str().unwrap())?;
-    let status_values_via_index = data.values("Status")?;
+    let status_values_via_index = data.decoded_values("Status", None)?;
     
     assert_eq!(status_values_via_index.len(), status_values.len());
     
@@ -80,8 +80,8 @@ fn test_enhanced_index_with_text_conversions() -> Result<(), MdfError> {
 
     // Test 4: Compare with direct MDF reading
     println!("=== Test 4: Comparing with Direct MDF Reading ===");
-    let mdf = MDF::from_file(mdf_path.to_str().unwrap())?;
-    let direct_values = mdf.channel("Status").unwrap().values()?;
+    let mdf = Mdf::from_file(mdf_path.to_str().unwrap())?;
+    let direct_values = mdf.find_channel("Status", None).unwrap().unwrap().decoded_values()?;
     
     assert_eq!(direct_values.len(), status_values_via_index.len());
     
@@ -91,7 +91,7 @@ fn test_enhanced_index_with_text_conversions() -> Result<(), MdfError> {
 
     // Test 5: Test name-based access
     println!("=== Test 5: Testing Name-based Access ===");
-    let status_by_name = data.values("Status")?;
+    let status_by_name = data.decoded_values("Status", None)?;
     assert_eq!(status_by_name.len(), status_values.len());
     
     for (i, (expected, actual)) in status_values.iter().zip(status_by_name.iter()).enumerate() {
@@ -104,7 +104,7 @@ fn test_enhanced_index_with_text_conversions() -> Result<(), MdfError> {
 
     // Test 6: Test byte range calculations
     println!("=== Test 6: Testing Byte Range Calculations ===");
-    let byte_ranges = loaded_index.byte_ranges("Status")?;
+    let byte_ranges = loaded_index.byte_ranges("Status", None)?;
     assert!(!byte_ranges.is_empty(), "Should have at least one byte range");
 
     let total_bytes: u64 = byte_ranges.iter().map(|(_, len)| len).sum();
@@ -287,10 +287,10 @@ fn test_index_serialization_with_resolved_data() -> Result<(), MdfError> {
     };
     
     // Test serialization
-    index.save_to_file(temp_index_path.to_str().unwrap())?;
+    index.save(temp_index_path.to_str().unwrap())?;
     
     // Test deserialization
-    let loaded_index = MdfIndex::load_from_file(temp_index_path.to_str().unwrap())?;
+    let loaded_index = MdfIndex::load(temp_index_path.to_str().unwrap())?;
     
     // Verify the resolved data was preserved
     assert_eq!(loaded_index.channel_groups.len(), 1);

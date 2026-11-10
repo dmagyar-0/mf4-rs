@@ -1,10 +1,10 @@
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::error::MdfError;
 use mf4_rs::parsing::decoder::DecodedValue;
 use mf4_rs::writer::MdfWriter;
 
-/// `cut_mdf_by_utc_ns` should produce the same output as `cut_mdf_by_time`
+/// `cut_mdf_by_utc` should produce the same output as `cut_mdf_by_time`
 /// when given equivalent absolute timestamps anchored at the file's
 /// `HD.abs_time`.
 #[test]
@@ -21,14 +21,14 @@ fn cut_by_utc_ns_matches_relative_cut() -> Result<(), MdfError> {
     // Source: simple time + uint32 channel, 10 records at t = i * 0.1s.
     let mut writer = MdfWriter::new(input.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let time_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let time_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Time".into());
     })?;
     writer.set_time_channel(&time_id)?;
-    writer.add_channel(&cg_id, Some(&time_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&time_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.bit_count = 32;
         ch.name = Some("Val".into());
@@ -49,7 +49,7 @@ fn cut_by_utc_ns_matches_relative_cut() -> Result<(), MdfError> {
     // Read the file's absolute start time so we can build matching UTC ns
     // bounds. Default writer header sets a non-zero abs_time, so this is
     // always Some(_) for files we just wrote.
-    let anchor_ns = MDF::from_file(input.to_str().unwrap())?
+    let anchor_ns = Mdf::from_file(input.to_str().unwrap())?
         .start_time_ns()
         .expect("file should have non-zero abs_time");
 
@@ -65,7 +65,7 @@ fn cut_by_utc_ns_matches_relative_cut() -> Result<(), MdfError> {
         start_rel,
         end_rel,
     )?;
-    mf4_rs::cut::cut_mdf_by_utc_ns(
+    mf4_rs::cut::cut_mdf_by_utc(
         input.to_str().unwrap(),
         out_utc.to_str().unwrap(),
         start_utc_ns,
@@ -73,10 +73,10 @@ fn cut_by_utc_ns_matches_relative_cut() -> Result<(), MdfError> {
     )?;
 
     let read_vals = |path: &std::path::Path| -> Result<Vec<u64>, MdfError> {
-        let mdf = MDF::from_file(path.to_str().unwrap())?;
+        let mdf = Mdf::from_file(path.to_str().unwrap())?;
         let chs = mdf.channel_groups()[0].channels();
         Ok(chs[1]
-            .values()?
+            .decoded_values()?
             .iter()
             .map(|v| match v {
                 Some(DecodedValue::UnsignedInteger(u)) => *u,
@@ -115,8 +115,8 @@ fn cut_by_utc_ns_errors_without_abs_time() -> Result<(), MdfError> {
     // Build a minimal valid file via the normal writer path.
     let mut writer = MdfWriter::new(path.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let time_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let time_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Time".into());
@@ -145,8 +145,8 @@ fn cut_by_utc_ns_errors_without_abs_time() -> Result<(), MdfError> {
     f.write_all(&0u64.to_le_bytes())?;
     drop(f);
 
-    // Now expect an error from cut_mdf_by_utc_ns.
-    let err = mf4_rs::cut::cut_mdf_by_utc_ns(
+    // Now expect an error from cut_mdf_by_utc.
+    let err = mf4_rs::cut::cut_mdf_by_utc(
         path.to_str().unwrap(),
         out.to_str().unwrap(),
         0,
@@ -185,14 +185,14 @@ fn cut_preserves_source_start_time() -> Result<(), MdfError> {
     // Build a small file with a master + value channel.
     let mut writer = MdfWriter::new(input.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let time_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let time_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Time".into());
     })?;
     writer.set_time_channel(&time_id)?;
-    writer.add_channel(&cg_id, Some(&time_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&time_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.bit_count = 32;
         ch.name = Some("Val".into());
@@ -240,10 +240,10 @@ fn cut_preserves_source_start_time() -> Result<(), MdfError> {
 
     // Sanity: the cut actually retained records (so we know the new HD wasn't
     // skipped because of a degenerate code path).
-    let cut_mdf = MDF::from_file(output.to_str().unwrap())?;
+    let cut_mdf = Mdf::from_file(output.to_str().unwrap())?;
     let chs = cut_mdf.channel_groups()[0].channels();
     let vals: Vec<u64> = chs[1]
-        .values()?
+        .decoded_values()?
         .iter()
         .map(|v| match v {
             Some(DecodedValue::UnsignedInteger(u)) => *u,

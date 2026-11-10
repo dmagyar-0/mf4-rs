@@ -1,4 +1,4 @@
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::block_layout::FileLayout;
 use mf4_rs::error::MdfError;
 
@@ -10,7 +10,7 @@ fn main() -> Result<(), MdfError> {
     let layout = FileLayout::from_file(path)?;
 
     // Option 2: build it through an MDF instance you already hold.
-    let mdf = MDF::from_file(path)?;
+    let mdf = Mdf::from_file(path)?;
     let _layout_via_mdf = mdf.file_layout()?;
 
     println!("===== Flat listing =====");

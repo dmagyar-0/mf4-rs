@@ -267,7 +267,7 @@ fn main() -> Result<(), MdfError> {
         // --- channel group -------------------------------------------------
         // add_channel_group(None, ..) starts a fresh ##DG, so every message
         // gets its own data group, exactly as a per-message logger writes it.
-        let cg = writer.add_channel_group(None, |_| {})?;
+        let cg = writer.add_channel_group_with(None, |_| {})?;
         writer.set_channel_group_name(&cg, &message)?;
         writer.set_channel_group_comment(
             &cg,
@@ -275,7 +275,7 @@ fn main() -> Result<(), MdfError> {
         )?;
 
         // --- channels ------------------------------------------------------
-        let master = writer.add_channel(&cg, None, |ch| {
+        let master = writer.add_channel_with(&cg, None, |ch| {
             ch.data_type = DataType::FloatLE;
             ch.bit_count = 64;
             ch.byte_offset = 0;
@@ -293,7 +293,7 @@ fn main() -> Result<(), MdfError> {
             let byte_offset = offsets[i];
             let bits = spec.bytes * 8;
             let dt = spec.data_type.clone();
-            let cn = writer.add_channel(&cg, Some(&prev), move |ch| {
+            let cn = writer.add_channel_with(&cg, Some(&prev), move |ch| {
                 ch.data_type = dt;
                 ch.bit_count = bits;
                 ch.byte_offset = byte_offset;
@@ -339,7 +339,7 @@ fn main() -> Result<(), MdfError> {
             // which emits the text blocks and patches the ##CN link itself.
             match &spec.conv {
                 Conv::ValueToText(mapping, default) => {
-                    writer.add_value_to_text_conversion(mapping, default, Some(cn))?;
+                    writer.write_value_to_text_conversion(mapping, default, Some(cn))?;
                 }
                 other => {
                     let cc_name = write_text(

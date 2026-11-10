@@ -14,7 +14,7 @@
 //! shared-DG source would NOT round-trip through cut with the same
 //! topology — see the README of this test for details.
 
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::block_layout::FileLayout;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::cut::cut_mdf_by_time;
@@ -70,10 +70,10 @@ fn report(label: &str, path: &str) -> Result<(usize, usize, usize, usize, u64), 
     );
     println!("  DG.first_cg targets:  {:?}", dg_first_cg_targets(&layout));
     println!("  CG.next_cg  targets:  {:?}", cg_next_targets(&layout));
-    let mdf = MDF::from_file(path)?;
+    let mdf = Mdf::from_file(path)?;
     for (i, g) in mdf.channel_groups().iter().enumerate() {
         let chs = g.channels();
-        let n = chs.first().and_then(|c| c.values().ok()).map(|v| v.len()).unwrap_or(0);
+        let n = chs.first().and_then(|c| c.decoded_values().ok()).map(|v| v.len()).unwrap_or(0);
         println!("    cg[{}] channels={} records={}", i, chs.len(), n);
     }
     Ok((dg, cg, cn, dt, size))
@@ -84,14 +84,14 @@ fn build_two_dg_one_cg(path: &str) -> Result<(), MdfError> {
     w.init_mdf_file()?;
 
     // DG 0 / CG 0: Time + ValA (u32)
-    let cg0 = w.add_channel_group(None, |_| {})?;
-    let t0 = w.add_channel(&cg0, None, |c| {
+    let cg0 = w.add_channel_group_with(None, |_| {})?;
+    let t0 = w.add_channel_with(&cg0, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".into());
     })?;
     w.set_time_channel(&t0)?;
-    w.add_channel(&cg0, Some(&t0), |c| {
+    w.add_channel_with(&cg0, Some(&t0), |c| {
         c.data_type = DataType::UnsignedIntegerLE;
         c.bit_count = 32;
         c.name = Some("ValA".into());
@@ -109,14 +109,14 @@ fn build_two_dg_one_cg(path: &str) -> Result<(), MdfError> {
     w.finish_data_block(&cg0)?;
 
     // DG 1 / CG 1: Time + ValB (f64)
-    let cg1 = w.add_channel_group(None, |_| {})?;
-    let t1 = w.add_channel(&cg1, None, |c| {
+    let cg1 = w.add_channel_group_with(None, |_| {})?;
+    let t1 = w.add_channel_with(&cg1, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".into());
     })?;
     w.set_time_channel(&t1)?;
-    w.add_channel(&cg1, Some(&t1), |c| {
+    w.add_channel_with(&cg1, Some(&t1), |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("ValB".into());
@@ -172,13 +172,13 @@ fn cut_preserves_multi_dg_topology() -> Result<(), MdfError> {
     }
 
     // Records survived the cut from both groups.
-    let mdf = MDF::from_file(out.to_str().unwrap())?;
+    let mdf = Mdf::from_file(out.to_str().unwrap())?;
     let groups = mdf.channel_groups();
     assert_eq!(groups.len(), 2);
     for g in &groups {
         let chs = g.channels();
         assert_eq!(chs.len(), 2);
-        let times = chs[0].values()?;
+        let times = chs[0].decoded_values()?;
         assert_eq!(times.len(), 4, "expected 4 records in window [0.2, 0.5]");
         if let Some(DecodedValue::Float(t0)) = times[0] {
             assert!((t0 - 0.2).abs() < 1e-6);

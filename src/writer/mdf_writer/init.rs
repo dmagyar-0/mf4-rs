@@ -48,7 +48,7 @@ impl MdfWriter {
     /// HD field offsets touched: 72 (`abs_time` u64), 80 (`tz_offset` i16),
     /// 82 (`daylight_save_time` i16), 84 (`time_flags` u8),
     /// 85 (`time_quality` u8).
-    pub fn set_start_time(
+    pub fn set_start_time_with(
         &mut self,
         abs_time_ns: u64,
         tz_offset_min: i16,
@@ -123,7 +123,7 @@ impl MdfWriter {
     }
 
     /// Adds a channel group and automatically creates a new data group for it.
-    pub fn add_channel_group<F>(
+    pub fn add_channel_group_with<F>(
         &mut self,
         prev_cg_id: Option<&str>,
         configure: F,
@@ -145,13 +145,13 @@ impl MdfWriter {
     }
 
     /// Creates and writes a simple value-to-text conversion block.
-    pub fn add_value_to_text_conversion(
+    pub fn write_value_to_text_conversion(
         &mut self,
         mapping: &[(i64, &str)],
         default_text: &str,
         channel_id: Option<&str>,
     ) -> Result<(String, u64), MdfError> {
-        self.ensure_no_open_data_block("add_value_to_text_conversion")?;
+        self.ensure_no_open_data_block("write_value_to_text_conversion")?;
         let cc_count = self.block_positions.keys().filter(|k| k.starts_with("cc_")).count();
         let cc_id = format!("cc_{}", cc_count);
 
@@ -203,13 +203,13 @@ impl MdfWriter {
 
     /// Creates and writes a linear conversion block (`phys = offset + factor *
     /// raw`), linking it to `channel_id` when given.
-    pub fn add_linear_conversion(
+    pub fn write_linear_conversion(
         &mut self,
         offset: f64,
         factor: f64,
         channel_id: Option<&str>,
     ) -> Result<(String, u64), MdfError> {
-        self.ensure_no_open_data_block("add_linear_conversion")?;
+        self.ensure_no_open_data_block("write_linear_conversion")?;
         let cc_count = self.block_positions.keys().filter(|k| k.starts_with("cc_")).count();
         let cc_id = format!("cc_{}", cc_count);
         let block = ConversionBlock {
@@ -288,7 +288,7 @@ impl MdfWriter {
     }
 
     /// Adds a channel block to the specified channel group and links it.
-    pub fn add_channel<F>(
+    pub fn add_channel_with<F>(
         &mut self,
         cg_id: &str,
         prev_cn_id: Option<&str>,

@@ -21,7 +21,7 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsError};
 
-use crate::api::mdf::MDF;
+use crate::api::mdf::Mdf;
 use crate::blocks::common::DataType;
 use crate::error::MdfError;
 use crate::index::{ByteRangeReader, MdfIndex};
@@ -668,7 +668,7 @@ struct BuildStepJs {
 }
 
 // ---------------------------------------------------------------------------
-// Mdf (reader)
+// MDF (reader)
 // ---------------------------------------------------------------------------
 
 /// Read-only handle to an MDF 4 file parsed from an in-memory byte buffer.
@@ -677,7 +677,7 @@ struct BuildStepJs {
 /// samples are decoded lazily by `values`/`read`.
 #[wasm_bindgen(js_name = Mdf)]
 pub struct WasmMdf {
-    mdf: Box<MDF>,
+    mdf: Box<Mdf>,
 }
 
 impl WasmMdf {
@@ -712,7 +712,7 @@ impl WasmMdf {
     /// Parse an MDF 4 file from an owned byte buffer (e.g. a `Uint8Array`).
     #[wasm_bindgen(constructor)]
     pub fn new(data: &[u8]) -> Result<WasmMdf, JsError> {
-        let mdf = MDF::from_bytes(data.to_vec()).map_err(err_to_js)?;
+        let mdf = Mdf::from_bytes(data.to_vec()).map_err(err_to_js)?;
         Ok(WasmMdf { mdf: Box::new(mdf) })
     }
 
@@ -761,7 +761,7 @@ impl WasmMdf {
             }
             for ch in g.channels() {
                 if ch.name().map_err(err_to_js)?.as_deref() == Some(name) {
-                    return ch.values_as_f64().map_err(err_to_js);
+                    return ch.values().map_err(err_to_js);
                 }
             }
         }
@@ -1504,7 +1504,7 @@ impl WasmMdfWriter {
         let dt = data_type.clone();
         let ch_id = self
             .writer_mut()?
-            .add_channel(&cg_id, prev_channel_id.as_deref(), |ch| {
+            .add_channel_with(&cg_id, prev_channel_id.as_deref(), |ch| {
                 ch.data_type = dt.clone();
                 ch.name = Some(name.to_string());
                 ch.bit_count = bit_count;
@@ -1555,7 +1555,7 @@ impl WasmMdfWriter {
     #[wasm_bindgen(js_name = setStartTime)]
     pub fn set_start_time(&mut self, abs_time_ns: u64) -> Result<(), JsError> {
         self.writer_mut()?
-            .set_start_time(abs_time_ns, 0, 0, 0, 0)
+            .set_start_time_with(abs_time_ns, 0, 0, 0, 0)
             .map_err(err_to_js)?;
         Ok(())
     }
@@ -1563,7 +1563,7 @@ impl WasmMdfWriter {
     /// Append a new channel group. Returns an opaque group ID.
     #[wasm_bindgen(js_name = addChannelGroup)]
     pub fn add_channel_group(&mut self, name: Option<String>) -> Result<String, JsError> {
-        let cg_id = self.writer_mut()?.add_channel_group(None, |_cg| {}).map_err(err_to_js)?;
+        let cg_id = self.writer_mut()?.add_channel_group_with(None, |_cg| {}).map_err(err_to_js)?;
         if let Some(n) = &name {
             self.writer_mut()?.set_channel_group_name(&cg_id, n).map_err(err_to_js)?;
         }
@@ -1618,7 +1618,7 @@ impl WasmMdfWriter {
         let name_owned = name.to_string();
         let ch_id = self
             .writer_mut()?
-            .add_channel(&cg_id, prev_channel_id.as_deref(), |ch| {
+            .add_channel_with(&cg_id, prev_channel_id.as_deref(), |ch| {
                 ch.data_type = DataType::StringUtf8;
                 ch.name = Some(name_owned.clone());
                 ch.channel_type = 1; // VLSD
@@ -1688,7 +1688,7 @@ impl WasmMdfWriter {
     pub fn add_linear_conversion(&mut self, channel_id: &str, offset: f64, factor: f64) -> Result<(), JsError> {
         let ch_id = self.rust_channel_id(channel_id)?;
         self.writer_mut()?
-            .add_linear_conversion(offset, factor, Some(&ch_id))
+            .write_linear_conversion(offset, factor, Some(&ch_id))
             .map_err(err_to_js)?;
         Ok(())
     }
@@ -1714,7 +1714,7 @@ impl WasmMdfWriter {
             ints.push((*v as i64, text.as_str()));
         }
         self.writer_mut()?
-            .add_value_to_text_conversion(&ints, default_text, Some(&ch_id))
+            .write_value_to_text_conversion(&ints, default_text, Some(&ch_id))
             .map_err(err_to_js)?;
         Ok(())
     }

@@ -14,6 +14,7 @@ mod io;
 mod init;
 pub mod data;
 mod vlsd;
+mod simple;
 
 /// Helper structure tracking an open DTBLOCK during writing
 struct OpenDataBlock {

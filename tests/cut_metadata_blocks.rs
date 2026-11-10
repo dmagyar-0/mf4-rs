@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::block_layout::FileLayout;
 use mf4_rs::blocks::common::{BlockHeader, DataType};
 use mf4_rs::blocks::conversion::{ConversionBlock, ConversionType};
@@ -110,7 +110,7 @@ fn build_decorated_source(path: &str) -> Result<(), MdfError> {
     w.init_mdf_file()?;
 
     // ---- DG 0 / CG 0: Time + ValA(u32) with linear conversion ----
-    let cg0 = w.add_channel_group(None, |_| {})?;
+    let cg0 = w.add_channel_group_with(None, |_| {})?;
 
     // Decorate CG 0: acq_name + comment + source.
     let cg0_pos = w.get_block_position(&cg0).expect("cg0 pos");
@@ -121,14 +121,14 @@ fn build_decorated_source(path: &str) -> Result<(), MdfError> {
     let cg0_si_pos = write_si(&mut w, "si_cg0", "ECU-A", "/bus/can0", "primary ECU")?;
     w.update_link(cg0_pos + CG_ACQ_SOURCE, cg0_si_pos)?;
 
-    let t0 = w.add_channel(&cg0, None, |c| {
+    let t0 = w.add_channel_with(&cg0, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".into());
     })?;
     w.set_time_channel(&t0)?;
 
-    let v0 = w.add_channel(&cg0, Some(&t0), |c| {
+    let v0 = w.add_channel_with(&cg0, Some(&t0), |c| {
         c.data_type = DataType::UnsignedIntegerLE;
         c.bit_count = 32;
         c.name = Some("ValA".into());
@@ -158,7 +158,7 @@ fn build_decorated_source(path: &str) -> Result<(), MdfError> {
     w.finish_data_block(&cg0)?;
 
     // ---- DG 1 / CG 1: Time + State(u8) with value-to-text conversion ----
-    let cg1 = w.add_channel_group(None, |_| {})?;
+    let cg1 = w.add_channel_group_with(None, |_| {})?;
 
     // Decorate CG 1.
     let cg1_pos = w.get_block_position(&cg1).expect("cg1 pos");
@@ -167,14 +167,14 @@ fn build_decorated_source(path: &str) -> Result<(), MdfError> {
     let cg1_cmt_pos = write_tx(&mut w, "tx_cg1_cmt", "second acquisition group")?;
     w.update_link(cg1_pos + CG_COMMENT, cg1_cmt_pos)?;
 
-    let t1 = w.add_channel(&cg1, None, |c| {
+    let t1 = w.add_channel_with(&cg1, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".into());
     })?;
     w.set_time_channel(&t1)?;
 
-    let s1 = w.add_channel(&cg1, Some(&t1), |c| {
+    let s1 = w.add_channel_with(&cg1, Some(&t1), |c| {
         c.data_type = DataType::UnsignedIntegerLE;
         c.bit_count = 8;
         c.name = Some("State".into());
@@ -189,7 +189,7 @@ fn build_decorated_source(path: &str) -> Result<(), MdfError> {
 
     // Attach a value-to-text conversion via the writer's helper. This
     // produces one ##CC and (mapping.len() + 1) ##TX blocks.
-    w.add_value_to_text_conversion(
+    w.write_value_to_text_conversion(
         &[(0, "OFF"), (1, "ON"), (2, "ERROR")],
         "UNKNOWN",
         Some(&s1),
@@ -305,7 +305,7 @@ fn cut_preserves_all_metadata_blocks() -> Result<(), MdfError> {
     }
 
     // -------- Semantic round-trip via the parser API --------
-    let mdf = MDF::from_file(out.to_str().unwrap())?;
+    let mdf = Mdf::from_file(out.to_str().unwrap())?;
     let groups = mdf.channel_groups();
     assert_eq!(groups.len(), 2);
 
@@ -331,7 +331,7 @@ fn cut_preserves_all_metadata_blocks() -> Result<(), MdfError> {
     assert_eq!(val_a_src.name.as_deref(), Some("TempSensor"));
     assert_eq!(val_a_src.path.as_deref(), Some("/sensor/temp"));
     // Linear conversion: phys = 10 + 2*raw, raws kept by window [0.2, 0.5] are 2..=5
-    let phys_a = val_a.values()?;
+    let phys_a = val_a.decoded_values()?;
     let phys_a: Vec<f64> = phys_a
         .into_iter()
         .map(|v| match v {
@@ -354,7 +354,7 @@ fn cut_preserves_all_metadata_blocks() -> Result<(), MdfError> {
     assert_eq!(state_src.name.as_deref(), Some("ECU-B"));
     // Value-to-text: raw State = i % 3, kept indices 2..=5 → raws [2, 0, 1, 2]
     // → texts [ERROR, OFF, ON, ERROR].
-    let phys_s = state.values()?;
+    let phys_s = state.decoded_values()?;
     let texts: Vec<String> = phys_s
         .into_iter()
         .map(|v| match v {

@@ -17,7 +17,7 @@
 //! invisible to the existing test suite. This test simulates an offset-based
 //! reader explicitly to lock in the fix.
 
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::block_layout::FileLayout;
 use mf4_rs::blocks::common::{BlockHeader, BlockParse, DataType};
 use mf4_rs::blocks::data_list_block::DataListBlock;
@@ -41,14 +41,14 @@ fn build_vlsd_with_uneven_fragments(path: &str) -> Result<Vec<Vec<u8>>, MdfError
 
     let mut w = MdfWriter::new(path)?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |c| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".into());
     })?;
     w.set_time_channel(&t)?;
-    let vlsd = w.add_channel(&cg, Some(&t), |c| {
+    let vlsd = w.add_channel_with(&cg, Some(&t), |c| {
         c.data_type = DataType::ByteArray;
         c.bit_count = 64;
         c.channel_type = 1; // VLSD
@@ -156,9 +156,9 @@ fn vlsd_multi_fragment_offset_read_round_trip() -> Result<(), MdfError> {
     let payloads = build_vlsd_with_uneven_fragments(path.to_str().unwrap())?;
 
     // Sanity: mf4-rs's sequential reader still produces correct values.
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let chs = mdf.channel_groups()[0].channels();
-    let read = chs[1].values()?;
+    let read = chs[1].decoded_values()?;
     assert_eq!(read.len(), payloads.len());
     for (i, v) in read.iter().enumerate() {
         match v {

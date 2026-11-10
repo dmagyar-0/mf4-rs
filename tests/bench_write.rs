@@ -16,24 +16,24 @@ fn cleanup(path: &std::path::Path) {
 fn setup_f64_writer(path: &std::path::Path) -> Result<(MdfWriter, String), MdfError> {
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Time".into());
         ch.bit_count = 64;
     })?;
     w.set_time_channel(&t)?;
-    let a = w.add_channel(&cg, Some(&t), |ch| {
+    let a = w.add_channel_with(&cg, Some(&t), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("A".into());
         ch.bit_count = 64;
     })?;
-    let b = w.add_channel(&cg, Some(&a), |ch| {
+    let b = w.add_channel_with(&cg, Some(&a), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("B".into());
         ch.bit_count = 64;
     })?;
-    w.add_channel(&cg, Some(&b), |ch| {
+    w.add_channel_with(&cg, Some(&b), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("C".into());
         ch.bit_count = 64;
@@ -45,24 +45,24 @@ fn setup_f64_writer(path: &std::path::Path) -> Result<(MdfWriter, String), MdfEr
 fn setup_u64_writer(path: &std::path::Path) -> Result<(MdfWriter, String), MdfError> {
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Time".into());
         ch.bit_count = 64;
     })?;
     w.set_time_channel(&t)?;
-    let a = w.add_channel(&cg, Some(&t), |ch| {
+    let a = w.add_channel_with(&cg, Some(&t), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("A".into());
         ch.bit_count = 64;
     })?;
-    let b = w.add_channel(&cg, Some(&a), |ch| {
+    let b = w.add_channel_with(&cg, Some(&a), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("B".into());
         ch.bit_count = 64;
     })?;
-    w.add_channel(&cg, Some(&b), |ch| {
+    w.add_channel_with(&cg, Some(&b), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("C".into());
         ch.bit_count = 64;
@@ -499,23 +499,23 @@ fn bench_write_columns_mixed_1m() -> Result<(), MdfError> {
         cleanup(&path);
         let mut w = MdfWriter::new(path.to_str().unwrap())?;
         w.init_mdf_file()?;
-        let cg = w.add_channel_group(None, |_| {})?;
-        let ch1 = w.add_channel(&cg, None, |ch| {
+        let cg = w.add_channel_group_with(None, |_| {})?;
+        let ch1 = w.add_channel_with(&cg, None, |ch| {
             ch.data_type = DataType::UnsignedIntegerLE;
             ch.name = Some("counter".into());
             ch.bit_count = 64;
         })?;
-        let ch2 = w.add_channel(&cg, Some(&ch1), |ch| {
+        let ch2 = w.add_channel_with(&cg, Some(&ch1), |ch| {
             ch.data_type = DataType::FloatLE;
             ch.name = Some("measurement".into());
             ch.bit_count = 64;
         })?;
-        let ch3 = w.add_channel(&cg, Some(&ch2), |ch| {
+        let ch3 = w.add_channel_with(&cg, Some(&ch2), |ch| {
             ch.data_type = DataType::SignedIntegerLE;
             ch.name = Some("offset".into());
             ch.bit_count = 64;
         })?;
-        w.add_channel(&cg, Some(&ch3), |ch| {
+        w.add_channel_with(&cg, Some(&ch3), |ch| {
             ch.data_type = DataType::UnsignedIntegerLE;
             ch.name = Some("flags".into());
             ch.bit_count = 64;
@@ -552,7 +552,7 @@ fn bench_write_columns_mixed_1m() -> Result<(), MdfError> {
 
 #[test]
 fn verify_write_columns_f64_correctness() -> Result<(), MdfError> {
-    use mf4_rs::api::mdf::MDF;
+    use mf4_rs::api::mdf::Mdf;
 
     let n = 1000usize;
     let path = temp_path("verify_col_f64");
@@ -571,16 +571,16 @@ fn verify_write_columns_f64_correctness() -> Result<(), MdfError> {
     }
 
     // Read back and verify
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let groups: Vec<_> = mdf.channel_groups().into_iter().collect();
     assert_eq!(groups.len(), 1);
     let channels: Vec<_> = groups[0].channels().into_iter().collect();
     assert_eq!(channels.len(), 4);
 
-    let vals0 = channels[0].values_as_f64()?;
-    let vals1 = channels[1].values_as_f64()?;
-    let vals2 = channels[2].values_as_f64()?;
-    let vals3 = channels[3].values_as_f64()?;
+    let vals0 = channels[0].values()?;
+    let vals1 = channels[1].values()?;
+    let vals2 = channels[2].values()?;
+    let vals3 = channels[3].values()?;
 
     assert_eq!(vals0.len(), n);
     assert_eq!(vals1.len(), n);
@@ -598,7 +598,7 @@ fn verify_write_columns_f64_correctness() -> Result<(), MdfError> {
 
 #[test]
 fn verify_write_records_f64_correctness() -> Result<(), MdfError> {
-    use mf4_rs::api::mdf::MDF;
+    use mf4_rs::api::mdf::Mdf;
 
     let n = 1000usize;
     let path = temp_path("verify_rec_f64");
@@ -619,13 +619,13 @@ fn verify_write_records_f64_correctness() -> Result<(), MdfError> {
         w.finalize()?;
     }
 
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let groups: Vec<_> = mdf.channel_groups().into_iter().collect();
     assert_eq!(groups.len(), 1);
     let channels: Vec<_> = groups[0].channels().into_iter().collect();
     assert_eq!(channels.len(), 4);
 
-    let vals = channels[0].values_as_f64()?;
+    let vals = channels[0].values()?;
     assert_eq!(vals.len(), n);
     for i in 0..n {
         let expected = i as f64 * 0.001;

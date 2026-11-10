@@ -1,7 +1,7 @@
 //! Record- and time-window reads through the index, master self-timestamps,
 //! virtual masters and channel comments.
 
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::error::MdfError;
 use mf4_rs::index::{ByteRangeReader, FileRangeReader, MdfIndex};
@@ -29,16 +29,16 @@ fn write_file(name: &str, n: u64) -> String {
     let path = path.to_str().unwrap().to_string();
     let mut w = MdfWriter::new(&path).unwrap();
     w.init_mdf_file().unwrap();
-    let cg = w.add_channel_group(None, |_| {}).unwrap();
+    let cg = w.add_channel_group_with(None, |_| {}).unwrap();
     let t = w
-        .add_channel(&cg, None, |ch| {
+        .add_channel_with(&cg, None, |ch| {
             ch.data_type = DataType::FloatLE;
             ch.name = Some("Time".into());
             ch.bit_count = 64;
         })
         .unwrap();
     w.set_time_channel(&t).unwrap();
-    w.add_channel(&cg, Some(&t), |ch| {
+    w.add_channel_with(&cg, Some(&t), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("V".into());
         ch.bit_count = 64;
@@ -69,17 +69,17 @@ fn record_window_matches_full_read_across_blocks() {
     let n = 600_000; // 16-byte records -> several 4 MB ##DT blocks
     let path = write_file("index_window_records.mf4", n);
     let index = MdfIndex::from_file(&path).unwrap();
-    assert!(index.groups()[0].data_blocks.len() > 1);
+    assert!(index.channel_groups[0].data_blocks.len() > 1);
     let mut r = index.open(FileRangeReader::new(&path).unwrap());
 
     let start = 262_000; // straddles the first block boundary
-    let sig = r.signal_records("V", start, 1000).unwrap();
+    let sig = r.read_with("V", &mf4_rs::ReadOptions::new().records(start, 1000)).unwrap();
     assert_eq!(uints(&sig.values), (start..start + 1000).collect::<Vec<_>>());
     assert_eq!(sig.timestamps.len(), 1000);
     assert!((sig.timestamps[0] - start as f64 * 0.01).abs() < 1e-9);
 
-    assert!(r.signal_records("V", n - 1, 2).is_err());
-    assert_eq!(r.signal_records("V", n, 0).unwrap().values.len(), 0);
+    assert!(r.read_with("V", &mf4_rs::ReadOptions::new().records(n - 1, 2)).is_err());
+    assert_eq!(r.read_with("V", &mf4_rs::ReadOptions::new().records(n, 0)).unwrap().values.len(), 0);
 }
 
 #[test]
@@ -89,7 +89,7 @@ fn time_window_reads_only_a_small_part() {
     let index = MdfIndex::from_file(&path).unwrap();
     let mut r = index.open(Counting { inner: FileRangeReader::new(&path).unwrap(), bytes: 0 });
 
-    let sig = r.signal_between("V", Some(100.0), Some(100.5)).unwrap();
+    let sig = r.read_with("V", &mf4_rs::ReadOptions::new().time(Some(100.0), Some(100.5))).unwrap();
     // 0.01 s spacing: records 10000..=10050 (float rounding may shift an edge)
     let got = uints(&sig.values);
     assert!(got.first().unwrap().abs_diff(10_000) <= 1, "{:?}", got.first());
@@ -100,15 +100,15 @@ fn time_window_reads_only_a_small_part() {
     assert!(r.reader_mut().bytes < 64 * 1024, "read {} bytes", r.reader_mut().bytes);
 
     // Open-ended windows and an empty window.
-    let tail = r.signal_between("V", Some(5999.9), None).unwrap();
+    let tail = r.read_with("V", &mf4_rs::ReadOptions::new().time(Some(5999.9), None)).unwrap();
     assert_eq!(uints(&tail.values).last(), Some(&(n - 1)));
-    let head = r.signal_between("V", None, Some(0.025)).unwrap();
+    let head = r.read_with("V", &mf4_rs::ReadOptions::new().time(None, Some(0.025))).unwrap();
     assert_eq!(uints(&head.values), vec![0, 1, 2]);
-    assert!(r.signal_between("V", Some(1e9), None).unwrap().values.is_empty());
-    assert!(r.signal_between("V", Some(5.0), Some(4.0)).unwrap().values.is_empty());
+    assert!(r.read_with("V", &mf4_rs::ReadOptions::new().time(Some(1e9), None)).unwrap().values.is_empty());
+    assert!(r.read_with("V", &mf4_rs::ReadOptions::new().time(Some(5.0), Some(4.0))).unwrap().values.is_empty());
 
     // Time window on the master itself (its values are the time axis).
-    let m = r.signal_between("Time", Some(1.0), Some(1.02)).unwrap();
+    let m = r.read_with("Time", &mf4_rs::ReadOptions::new().time(Some(1.0), Some(1.02))).unwrap();
     assert_eq!(m.values.len(), 3);
     assert!(m.timestamps.is_empty());
 }
@@ -121,15 +121,15 @@ fn virtual_master_reads_record_index() {
     let path = path.to_str().unwrap().to_string();
     let mut w = MdfWriter::new(&path).unwrap();
     w.init_mdf_file().unwrap();
-    let cg = w.add_channel_group(None, |_| {}).unwrap();
+    let cg = w.add_channel_group_with(None, |_| {}).unwrap();
     let v = w
-        .add_channel(&cg, None, |ch| {
+        .add_channel_with(&cg, None, |ch| {
             ch.data_type = DataType::UnsignedIntegerLE;
             ch.name = Some("V".into());
             ch.bit_count = 32;
         })
         .unwrap();
-    w.add_channel(&cg, Some(&v), |ch| {
+    w.add_channel_with(&cg, Some(&v), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("t".into());
         // The writer still reserves record bytes for it; a virtual channel's
@@ -147,15 +147,15 @@ fn virtual_master_reads_record_index() {
     w.finalize().unwrap();
 
     let index = MdfIndex::from_file(&path).unwrap();
-    assert!(index.groups()[0].channel("t").unwrap().is_master());
+    assert!(index.channel_groups[0].channel("t").unwrap().is_master());
     let mut r = index.open(FileRangeReader::new(&path).unwrap());
-    assert_eq!(r.values_f64("t").unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
-    let sig = r.signal("V").unwrap();
+    assert_eq!(r.values("t").unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
+    let sig = r.read("V").unwrap();
     assert_eq!(sig.timestamps, vec![0.0, 1.0, 2.0, 3.0]);
-    assert_eq!(uints(&r.signal_between("V", Some(1.0), Some(2.0)).unwrap().values), vec![10, 20]);
+    assert_eq!(uints(&r.read_with("V", &mf4_rs::ReadOptions::new().time(Some(1.0), Some(2.0))).unwrap().values), vec![10, 20]);
 
-    let mdf = MDF::from_file(&path).unwrap();
-    assert_eq!(mdf.signal("V").unwrap().unwrap().timestamps, vec![0.0, 1.0, 2.0, 3.0]);
+    let mdf = Mdf::from_file(&path).unwrap();
+    assert_eq!(mdf.read("V").unwrap().timestamps, vec![0.0, 1.0, 2.0, 3.0]);
 }
 
 #[test]
@@ -165,9 +165,9 @@ fn channel_comment_is_indexed_locally_and_remotely() {
     let path = path.to_str().unwrap().to_string();
     let mut w = MdfWriter::new(&path).unwrap();
     w.init_mdf_file().unwrap();
-    let cg = w.add_channel_group(None, |_| {}).unwrap();
+    let cg = w.add_channel_group_with(None, |_| {}).unwrap();
     let t = w
-        .add_channel(&cg, None, |ch| {
+        .add_channel_with(&cg, None, |ch| {
             ch.data_type = DataType::FloatLE;
             ch.name = Some("Time".into());
             ch.bit_count = 64;
@@ -183,18 +183,18 @@ fn channel_comment_is_indexed_locally_and_remotely() {
     w.finalize().unwrap();
 
     let local = MdfIndex::from_file(&path).unwrap();
-    assert_eq!(local.channel("Time").unwrap().comment.as_deref(), Some("seconds since start"));
+    assert_eq!(local.indexed_channel("Time", None).unwrap().comment.as_deref(), Some("seconds since start"));
 
     let size = std::fs::metadata(&path).unwrap().len();
     let mut reader = FileRangeReader::new(&path).unwrap();
     let remote = MdfIndex::from_range_reader(&mut reader, size).unwrap();
-    assert_eq!(remote.channel("Time").unwrap().comment.as_deref(), Some("seconds since start"));
+    assert_eq!(remote.indexed_channel("Time", None).unwrap().comment.as_deref(), Some("seconds since start"));
 
     // Old JSON without the field still loads.
     let mut v: serde_json::Value = serde_json::from_str(&local.to_json().unwrap()).unwrap();
     v["channel_groups"][0]["channels"][0].as_object_mut().unwrap().remove("comment").unwrap();
     let json = v.to_string();
-    assert!(MdfIndex::from_json(&json).unwrap().channel("Time").unwrap().comment.is_none());
+    assert!(MdfIndex::from_json(&json).unwrap().indexed_channel("Time", None).unwrap().comment.is_none());
 }
 
 #[test]
@@ -203,24 +203,24 @@ fn writer_linear_conversion_is_applied() {
     let path = path.to_str().unwrap().to_string();
     let mut w = MdfWriter::new(&path).unwrap();
     w.init_mdf_file().unwrap();
-    let cg = w.add_channel_group(None, |_| {}).unwrap();
+    let cg = w.add_channel_group_with(None, |_| {}).unwrap();
     let v = w
-        .add_channel(&cg, None, |ch| {
+        .add_channel_with(&cg, None, |ch| {
             ch.data_type = DataType::UnsignedIntegerLE;
             ch.name = Some("V".into());
             ch.bit_count = 16;
         })
         .unwrap();
-    w.add_linear_conversion(-40.0, 0.5, Some(&v)).unwrap();
+    w.write_linear_conversion(-40.0, 0.5, Some(&v)).unwrap();
     w.start_data_block_for_cg(&cg, 0).unwrap();
     w.write_record(&cg, &[DecodedValue::UnsignedInteger(100)]).unwrap();
     w.finish_data_block(&cg).unwrap();
     w.finalize().unwrap();
 
-    let mdf = MDF::from_file(&path).unwrap();
+    let mdf = Mdf::from_file(&path).unwrap();
     let group = &mdf.channel_groups()[0];
     let ch = &group.channels()[0];
-    assert_eq!(ch.values_as_f64().unwrap(), vec![10.0]);
+    assert_eq!(ch.values().unwrap(), vec![10.0]);
     assert_eq!(ch.conversion().unwrap().unwrap().cc_val, vec![-40.0, 0.5]);
 }
 
@@ -230,7 +230,7 @@ fn window_reads_verify_block_headers() {
     let n = 300_000; // two data blocks
     let path = write_file("index_window_headers.mf4", n);
     let index = MdfIndex::from_file(&path).unwrap();
-    let blocks = index.groups()[0].data_blocks.clone();
+    let blocks = index.channel_groups[0].data_blocks.clone();
     assert!(blocks.len() > 1);
     let bytes = std::fs::read(&path).unwrap();
 
@@ -241,9 +241,9 @@ fn window_reads_verify_block_headers() {
     dz[second..second + 4].copy_from_slice(b"##DZ");
     let mut r = index.open(SliceRangeReader::new(dz));
     let first_rec_of_second = (blocks[0].size - 24) / 16;
-    assert!(r.signal_records("V", first_rec_of_second, 10).is_err());
-    assert!(r.signal_records("V", first_rec_of_second + 5, 10).is_err());
-    assert!(r.signal_records("V", 0, 10).is_ok(), "first block is intact");
+    assert!(r.read_with("V", &mf4_rs::ReadOptions::new().records(first_rec_of_second, 10)).is_err());
+    assert!(r.read_with("V", &mf4_rs::ReadOptions::new().records(first_rec_of_second + 5, 10)).is_err());
+    assert!(r.read_with("V", &mf4_rs::ReadOptions::new().records(0, 10)).is_ok(), "first block is intact");
 
     // A header shorter than the index expects (stale index / other file).
     let mut short = bytes.clone();
@@ -251,7 +251,7 @@ fn window_reads_verify_block_headers() {
     let real = u64::from_le_bytes(short[len_pos..len_pos + 8].try_into().unwrap());
     short[len_pos..len_pos + 8].copy_from_slice(&(real - 16 * 100).to_le_bytes());
     let mut r = index.open(SliceRangeReader::new(short));
-    let err = r.signal_records("V", n - 10, 10).unwrap_err().to_string();
+    let err = r.read_with("V", &mf4_rs::ReadOptions::new().records(n - 10, 10)).unwrap_err().to_string();
     assert!(err.contains("rebuild the index"), "{err}");
 }
 
@@ -264,7 +264,7 @@ fn virtual_read_is_bounded_by_the_data() {
     v["channel_groups"][0]["channels"][1]["channel_type"] = serde_json::json!(6);
     index = MdfIndex::from_json(&v.to_string()).unwrap();
     let mut r = index.open(FileRangeReader::new(&path).unwrap());
-    assert!(r.values("V").is_err());
+    assert!(r.decoded_values("V", None).is_err());
 }
 
 #[test]
@@ -272,17 +272,17 @@ fn writer_conversion_after_start_data_block_is_refused() {
     let path = std::env::temp_dir().join("index_window_late_conv.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap()).unwrap();
     w.init_mdf_file().unwrap();
-    let cg = w.add_channel_group(None, |_| {}).unwrap();
+    let cg = w.add_channel_group_with(None, |_| {}).unwrap();
     let v = w
-        .add_channel(&cg, None, |ch| {
+        .add_channel_with(&cg, None, |ch| {
             ch.data_type = DataType::UnsignedIntegerLE;
             ch.name = Some("V".into());
             ch.bit_count = 8;
         })
         .unwrap();
     w.start_data_block_for_cg(&cg, 0).unwrap();
-    assert!(w.add_linear_conversion(0.0, 1.0, Some(&v)).is_err());
-    assert!(w.add_value_to_text_conversion(&[(1, "one")], "x", Some(&v)).is_err());
+    assert!(w.write_linear_conversion(0.0, 1.0, Some(&v)).is_err());
+    assert!(w.write_value_to_text_conversion(&[(1, "one")], "x", Some(&v)).is_err());
 }
 
 #[test]
@@ -293,9 +293,9 @@ fn column_virtual_master_is_bounded_by_its_signal_groups() {
     let out = std::env::temp_dir().join("index_window_colvirt_out.mf4");
     let mut w = MdfWriter::new(src.to_str().unwrap()).unwrap();
     w.init_mdf_file().unwrap();
-    let cg = w.add_channel_group(None, |_| {}).unwrap();
+    let cg = w.add_channel_group_with(None, |_| {}).unwrap();
     let t = w
-        .add_channel(&cg, None, |ch| {
+        .add_channel_with(&cg, None, |ch| {
             ch.data_type = DataType::UnsignedIntegerLE;
             ch.name = Some("t".into());
             ch.channel_type = 3;
@@ -303,7 +303,7 @@ fn column_virtual_master_is_bounded_by_its_signal_groups() {
             ch.bit_count = 0;
         })
         .unwrap();
-    w.add_channel(&cg, Some(&t), |ch| {
+    w.add_channel_with(&cg, Some(&t), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("V".into());
         ch.bit_count = 32;
@@ -318,10 +318,10 @@ fn column_virtual_master_is_bounded_by_its_signal_groups() {
     mf4_rs::column::to_column_oriented(&src, &out, &Default::default()).unwrap();
 
     let index = MdfIndex::from_file(out.to_str().unwrap()).unwrap();
-    let time_group = index.groups().iter().position(|g| g.channel("t").is_some()).unwrap();
-    assert!(index.groups()[time_group].data_blocks.is_empty(), "time group stores no bytes");
+    let time_group = index.channel_groups.iter().position(|g| g.channel("t").is_some()).unwrap();
+    assert!(index.channel_groups[time_group].data_blocks.is_empty(), "time group stores no bytes");
     let mut r = index.open(FileRangeReader::new(out.to_str().unwrap()).unwrap());
-    let sig = r.signal("V").unwrap();
+    let sig = r.read("V").unwrap();
     assert_eq!(sig.values.len(), 50);
     assert_eq!(sig.timestamps, (0..50).map(|i| i as f64).collect::<Vec<_>>());
 
@@ -330,5 +330,5 @@ fn column_virtual_master_is_bounded_by_its_signal_groups() {
     v["channel_groups"][time_group]["record_count"] = serde_json::json!(u64::MAX / 2);
     let forged = MdfIndex::from_json(&v.to_string()).unwrap();
     let mut r = forged.open(FileRangeReader::new(out.to_str().unwrap()).unwrap());
-    assert!(r.values("t").is_err());
+    assert!(r.decoded_values("t", None).is_err());
 }

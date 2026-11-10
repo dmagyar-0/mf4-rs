@@ -160,9 +160,9 @@ fn write_many_channel_file(groups: usize, records: usize) -> Vec<u8> {
     let mut w = MdfWriter::new(path).unwrap();
     w.init_mdf_file().unwrap();
     for g in 0..groups {
-        let cg = w.add_channel_group(None, |_| {}).unwrap();
+        let cg = w.add_channel_group_with(None, |_| {}).unwrap();
         let time = w
-            .add_channel(&cg, None, |c| {
+            .add_channel_with(&cg, None, |c| {
                 c.data_type = DataType::FloatLE;
                 c.bit_count = 64;
                 c.name = Some(format!("Time_{g}"));
@@ -172,7 +172,7 @@ fn write_many_channel_file(groups: usize, records: usize) -> Vec<u8> {
         let mut prev = time;
         for c in 0..15 {
             prev = w
-                .add_channel(&cg, Some(&prev), |ch| {
+                .add_channel_with(&cg, Some(&prev), |ch| {
                     ch.data_type = DataType::FloatLE;
                     ch.bit_count = 32;
                     ch.name = Some(format!("Signal_{g}_{c}"));
@@ -201,9 +201,9 @@ fn write_single_group_file(records: usize) -> Vec<u8> {
     let path = path.to_str().unwrap();
     let mut w = MdfWriter::new(path).unwrap();
     w.init_mdf_file().unwrap();
-    let cg = w.add_channel_group(None, |_| {}).unwrap();
+    let cg = w.add_channel_group_with(None, |_| {}).unwrap();
     let time = w
-        .add_channel(&cg, None, |c| {
+        .add_channel_with(&cg, None, |c| {
             c.data_type = DataType::FloatLE;
             c.bit_count = 64;
             c.name = Some("Time".into());
@@ -211,13 +211,13 @@ fn write_single_group_file(records: usize) -> Vec<u8> {
         .unwrap();
     w.set_time_channel(&time).unwrap();
     let v = w
-        .add_channel(&cg, Some(&time), |c| {
+        .add_channel_with(&cg, Some(&time), |c| {
             c.data_type = DataType::FloatLE;
             c.bit_count = 64;
             c.name = Some("Value".into());
         })
         .unwrap();
-    w.add_channel(&cg, Some(&v), |c| {
+    w.add_channel_with(&cg, Some(&v), |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Extra".into());
@@ -252,8 +252,8 @@ fn many_channel_build_is_bounded_and_correct() {
 
     // Correctness: identical to a direct build, with every name resolved.
     let eager = MdfIndex::from_bytes(bytes.clone()).unwrap();
-    assert_eq!(stats.index.channel_names(), eager.channel_names());
-    assert_eq!(stats.index.channel_names().len(), 185 * 16);
+    assert_eq!(stats.index.channel_names().unwrap(), eager.channel_names().unwrap());
+    assert_eq!(stats.index.channel_names().unwrap().len(), 185 * 16);
     assert!(stats.index.channel_names().iter().all(|n| !n.is_empty()));
 
     // The whole point of the fix: a handful of requests, not one per block.
@@ -275,7 +275,7 @@ fn contiguous_metadata_build_fetches_little() {
     let stats = incremental_build(&bytes);
 
     let eager = MdfIndex::from_bytes(bytes.clone()).unwrap();
-    assert_eq!(stats.index.channel_names(), eager.channel_names());
+    assert_eq!(stats.index.channel_names().unwrap(), eager.channel_names().unwrap());
 
     // Metadata sits at the front; the build should read a small fraction only.
     assert!(

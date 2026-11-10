@@ -255,7 +255,7 @@ pub fn merge_files(output: &str, first: &str, second: &str) -> Result<(), MdfErr
 
     let mut writer = MdfWriter::new(output)?;
     writer.init_mdf_file()?;
-    writer.set_start_time(
+    writer.set_start_time_with(
         mdf1.header.abs_time,
         mdf1.header.tz_offset,
         mdf1.header.daylight_save_time,
@@ -269,7 +269,7 @@ pub fn merge_files(output: &str, first: &str, second: &str) -> Result<(), MdfErr
     let mut caches: [HashMap<u64, u64>; 2] = [HashMap::new(), HashMap::new()];
 
     for group in groups {
-        let cg_id = writer.add_channel_group(None, |_| {})?;
+        let cg_id = writer.add_channel_group_with(None, |_| {})?;
         let src_mmap = mmaps[group.src_file];
         let cache = &mut caches[group.src_file];
         let mut last_cn: Option<String> = None;

@@ -15,7 +15,7 @@ use pyo3_stub_gen::derive::{
 use pyo3_stub_gen::define_stub_info_gatherer;
 use std::collections::HashMap;
 
-use crate::api::mdf::MDF;
+use crate::api::mdf::Mdf;
 use crate::writer::{MdfWriter, ColumnData};
 use crate::index::{IndexedChannel, MdfIndex};
 use crate::blocks::common::DataType;
@@ -527,7 +527,7 @@ fn signal_to_series(
 #[gen_stub_pyclass]
 #[pyclass(name = "Mdf")]
 pub struct PyMDF {
-    mdf: Box<MDF>,
+    mdf: Box<Mdf>,
     path: String,
 }
 
@@ -575,7 +575,7 @@ impl PyMDF {
     ///     unsupported version, or contains malformed blocks.
     #[new]
     fn new(path: &str) -> PyResult<Self> {
-        let mdf = Box::new(MDF::from_file(path)?);
+        let mdf = Box::new(Mdf::from_file(path)?);
         Ok(PyMDF { mdf, path: path.to_string() })
     }
 
@@ -718,7 +718,7 @@ impl PyMDF {
     fn values<'py>(&self, py: Python<'py>, name: &str, group: Option<&str>) -> PyResult<PyObject> {
         let (g, idx) = self.find_group_channel(group, name)?;
         // Decode without holding the GIL so other Python threads can run.
-        let values = py.allow_threads(|| g.channels()[idx].values_as_f64())?;
+        let values = py.allow_threads(|| g.channels()[idx].values())?;
         Ok(PyArray1::from_vec_bound(py, values).into())
     }
 
@@ -767,10 +767,10 @@ impl PyMDF {
 /// -------
 /// >>> w = mf4_rs.MdfWriter("demo.mf4")
 /// >>> w.init_mdf_file()
-/// >>> cg = w.add_channel_group("group_0")
+/// >>> cg = w.add_channel_group_with("group_0")
 /// >>> t = w.add_time_channel(cg, "Time")
 /// >>> y = w.add_float_channel(cg, "Speed")
-/// >>> w.start_data_block(cg)
+/// >>> w.start_data_block_with(cg)
 /// >>> for i in range(100):
 /// ...     w.write_record(cg, [
 /// ...         mf4_rs.create_float_value(i * 0.01),
@@ -798,7 +798,7 @@ impl PyMdfWriter {
                 .and_then(|py_id| self.channels.get(py_id))
                 .cloned();
             let rust_data_type = DataType::from(data_type);
-            let ch_id = writer.add_channel(cg_id, prev_channel_id.as_ref().map(|s| s.as_str()), |ch| {
+            let ch_id = writer.add_channel_with(cg_id, prev_channel_id.as_ref().map(|s| s.as_str()), |ch| {
                 ch.data_type = rust_data_type.clone();
                 ch.name = Some(name.to_string());
                 ch.bit_count = bit_count;
@@ -871,7 +871,7 @@ impl PyMdfWriter {
     ///     ``add_channel`` / ``write_record`` / ``finish_data_block`` calls.
     fn add_channel_group(&mut self, name: Option<String>) -> PyResult<String> {
         if let Some(ref mut writer) = self.writer {
-            let cg_id = writer.add_channel_group(None, |_cg| {})?;
+            let cg_id = writer.add_channel_group_with(None, |_cg| {})?;
             if let Some(n) = &name {
                 writer.set_channel_group_name(&cg_id, n)?;
             }
@@ -1006,7 +1006,7 @@ impl PyMdfWriter {
             let prev_channel_id = self.last_channels.get(group_id)
                 .and_then(|py_id| self.channels.get(py_id))
                 .cloned();
-            let ch_id = writer.add_channel(cg_id, prev_channel_id.as_ref().map(|s| s.as_str()), |ch| {
+            let ch_id = writer.add_channel_with(cg_id, prev_channel_id.as_ref().map(|s| s.as_str()), |ch| {
                 ch.data_type = DataType::StringUtf8;
                 ch.name = Some(name.to_string());
                 ch.channel_type = 1; // VLSD
@@ -1286,7 +1286,7 @@ impl PyMdfIndex {
     /// values via :py:meth:`open`.
     #[staticmethod]
     fn load(path: &str) -> PyResult<Self> {
-        Ok(PyMdfIndex { index: MdfIndex::load_from_file(path)? })
+        Ok(PyMdfIndex { index: MdfIndex::load(path)? })
     }
 
     /// Build an index from an MDF file served over HTTP / S3 using range
@@ -1316,7 +1316,7 @@ impl PyMdfIndex {
 
     /// Serialize the index to JSON at ``path`` (dependency-free).
     fn save(&self, path: &str) -> PyResult<()> {
-        self.index.save_to_file(path)?;
+        self.index.save(path)?;
         Ok(())
     }
 
@@ -1540,9 +1540,9 @@ impl PyMdfIndex {
         match value {
             None => self.index.source = None,
             Some(v) if v.starts_with("http://") || v.starts_with("https://") => {
-                self.index.set_url(v);
+                self.index.set_source(v);
             }
-            Some(v) => self.index.set_file(v),
+            Some(v) => self.index.set_source(v),
         }
     }
 }
@@ -1923,7 +1923,7 @@ impl From<crate::column::ColumnReport> for PyColumnReport {
 ///
 /// Each signal gets its own channel group whose data blocks are written back
 /// to back, so one HTTP range request fetches the whole signal. Timestamps are
-/// stored once per source group and shared by all its signals through the MDF
+/// stored once per source group and shared by all its signals through the Mdf
 /// 4.2 *remote master* link (and, with ``share_identical_time``, shared across
 /// source groups that have identical time axes). All metadata blocks sit at
 /// the front of the file, so building an :class:`MdfIndex` over HTTP needs a
@@ -2068,7 +2068,7 @@ fn cut_mdf_by_utc(
 ) -> PyResult<()> {
     let start_ns = coerce_to_unix_ns(py, start_utc)?;
     let end_ns = coerce_to_unix_ns(py, end_utc)?;
-    crate::cut::cut_mdf_by_utc_ns(input_path, output_path, start_ns, end_ns)?;
+    crate::cut::cut_mdf_by_utc(input_path, output_path, start_ns, end_ns)?;
     Ok(())
 }
 

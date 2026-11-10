@@ -15,6 +15,7 @@ pub mod cut;
 pub mod merge;
 pub mod index;
 pub mod signal;
+pub mod types;
 pub mod block_layout;
 pub mod column;
 
@@ -33,6 +34,27 @@ pub mod api {
     pub mod channel_group;
     pub mod channel;
 }
+
+// ---------------------------------------------------------------------------
+// The cross-language API contract, re-exported at the crate root.
+// Keep this list in step with `docs/api-contract.json` (checked by
+// `tests/api_contract.rs`).
+// ---------------------------------------------------------------------------
+
+pub use api::mdf::Mdf;
+pub use block_layout::FileLayout;
+pub use blocks::common::DataType;
+pub use column::{to_column_oriented, ColumnOptions, ColumnReport};
+#[cfg(not(target_arch = "wasm32"))]
+pub use cut::{cut_mdf_by_time, cut_mdf_by_utc};
+pub use error::MdfError;
+pub use index::{ByteRangeReader, MdfIndex, MdfReader, Source};
+#[cfg(not(target_arch = "wasm32"))]
+pub use merge::merge_files;
+pub use parsing::decoder::DecodedValue;
+pub use signal::Signal;
+pub use types::{ChannelInfo, ConversionInfo, GroupInfo, ReadOptions, TimeRange};
+pub use writer::{ColumnData, MdfWriter};
 
 // Python bindings module
 #[cfg(feature = "pyo3")]
@@ -70,10 +92,10 @@ use pyo3::prelude::*;
 ///
 ///     w = mf4_rs.MdfWriter("out.mf4")
 ///     w.init_mdf_file()
-///     cg = w.add_channel_group("Engine")
+///     cg = w.add_channel_group_with("Engine")
 ///     t  = w.add_time_channel(cg, "Time")
 ///     y  = w.add_float_channel(cg, "Speed")
-///     w.start_data_block(cg)
+///     w.start_data_block_with(cg)
 ///     w.write_record(cg, [
 ///         mf4_rs.create_float_value(0.0),
 ///         mf4_rs.create_float_value(123.4),

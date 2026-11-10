@@ -5,7 +5,7 @@
 /// - FileRangeReader (DecodedValue + f64 fast path)
 /// - MmapRangeReader (DecodedValue + f64 fast path)
 /// - Direct MDF read for comparison
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::error::MdfError;
 use mf4_rs::index::{FileRangeReader, MmapRangeReader, MdfIndex};
@@ -25,24 +25,24 @@ fn cleanup(path: &std::path::Path) {
 fn write_f64_file(path: &std::path::Path, n: usize) -> Result<(), MdfError> {
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Time".into());
         ch.bit_count = 64;
     })?;
     w.set_time_channel(&t)?;
-    let a = w.add_channel(&cg, Some(&t), |ch| {
+    let a = w.add_channel_with(&cg, Some(&t), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("A".into());
         ch.bit_count = 64;
     })?;
-    let b = w.add_channel(&cg, Some(&a), |ch| {
+    let b = w.add_channel_with(&cg, Some(&a), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("B".into());
         ch.bit_count = 64;
     })?;
-    w.add_channel(&cg, Some(&b), |ch| {
+    w.add_channel_with(&cg, Some(&b), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("C".into());
         ch.bit_count = 64;
@@ -84,7 +84,7 @@ fn bench_index_all_paths_100k() -> Result<(), MdfError> {
         let mut data = index.open(FileRangeReader::new(p)?);
         let mut total = 0usize;
         for ch in CHANNELS {
-            total += data.values(ch)?.len();
+            total += data.decoded_values(ch, None)?.len();
         }
         assert_eq!(total, n * 4);
         times.push(start.elapsed());
@@ -99,7 +99,7 @@ fn bench_index_all_paths_100k() -> Result<(), MdfError> {
         let mut data = index.open(MmapRangeReader::new(p)?);
         let mut total = 0usize;
         for ch in CHANNELS {
-            total += data.values(ch)?.len();
+            total += data.decoded_values(ch, None)?.len();
         }
         assert_eq!(total, n * 4);
         times.push(start.elapsed());
@@ -114,7 +114,7 @@ fn bench_index_all_paths_100k() -> Result<(), MdfError> {
         let mut data = index.open(FileRangeReader::new(p)?);
         let mut total = 0usize;
         for ch in CHANNELS {
-            total += data.values_f64(ch)?.len();
+            total += data.values(ch)?.len();
         }
         assert_eq!(total, n * 4);
         times.push(start.elapsed());
@@ -129,7 +129,7 @@ fn bench_index_all_paths_100k() -> Result<(), MdfError> {
         let mut data = index.open(MmapRangeReader::new(p)?);
         let mut total = 0usize;
         for ch in CHANNELS {
-            total += data.values_f64(ch)?.len();
+            total += data.values(ch)?.len();
         }
         assert_eq!(total, n * 4);
         times.push(start.elapsed());
@@ -141,11 +141,11 @@ fn bench_index_all_paths_100k() -> Result<(), MdfError> {
     let mut times = Vec::new();
     for _ in 0..iterations {
         let start = std::time::Instant::now();
-        let mdf = MDF::from_file(p)?;
+        let mdf = Mdf::from_file(p)?;
         let mut total = 0usize;
         for group in mdf.channel_groups() {
             for channel in group.channels() {
-                total += channel.values()?.len();
+                total += channel.decoded_values()?.len();
             }
         }
         assert_eq!(total, n * 4);
@@ -158,11 +158,11 @@ fn bench_index_all_paths_100k() -> Result<(), MdfError> {
     let mut times = Vec::new();
     for _ in 0..iterations {
         let start = std::time::Instant::now();
-        let mdf = MDF::from_file(p)?;
+        let mdf = Mdf::from_file(p)?;
         let mut total = 0usize;
         for group in mdf.channel_groups() {
             for channel in group.channels() {
-                total += channel.values_as_f64()?.len();
+                total += channel.values()?.len();
             }
         }
         assert_eq!(total, n * 4);
@@ -203,7 +203,7 @@ fn bench_index_all_paths_1m() -> Result<(), MdfError> {
         let mut data = index.open(FileRangeReader::new(p)?);
         let mut total = 0usize;
         for ch in CHANNELS {
-            total += data.values(ch)?.len();
+            total += data.decoded_values(ch, None)?.len();
         }
         assert_eq!(total, n * 4);
         times.push(start.elapsed());
@@ -218,7 +218,7 @@ fn bench_index_all_paths_1m() -> Result<(), MdfError> {
         let mut data = index.open(MmapRangeReader::new(p)?);
         let mut total = 0usize;
         for ch in CHANNELS {
-            total += data.values_f64(ch)?.len();
+            total += data.values(ch)?.len();
         }
         assert_eq!(total, n * 4);
         times.push(start.elapsed());
@@ -230,11 +230,11 @@ fn bench_index_all_paths_1m() -> Result<(), MdfError> {
     let mut times = Vec::new();
     for _ in 0..iterations {
         let start = std::time::Instant::now();
-        let mdf = MDF::from_file(p)?;
+        let mdf = Mdf::from_file(p)?;
         let mut total = 0usize;
         for group in mdf.channel_groups() {
             for channel in group.channels() {
-                total += channel.values_as_f64()?.len();
+                total += channel.values()?.len();
             }
         }
         assert_eq!(total, n * 4);
@@ -273,10 +273,10 @@ fn test_index_read_paths_consistency() -> Result<(), MdfError> {
     let mut mmap_f64 = index.open(MmapRangeReader::new(p)?);
 
     for ch in CHANNELS {
-        let vals_file = file_data.values(ch)?;
-        let vals_mmap = mmap_data.values(ch)?;
-        let f64_file = file_f64.values_f64(ch)?;
-        let f64_mmap = mmap_f64.values_f64(ch)?;
+        let vals_file = file_data.decoded_values(ch, None)?;
+        let vals_mmap = mmap_data.decoded_values(ch, None)?;
+        let f64_file = file_f64.values(ch)?;
+        let f64_mmap = mmap_f64.values(ch)?;
 
         assert_eq!(vals_file.len(), n);
         assert_eq!(vals_mmap.len(), n);

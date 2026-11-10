@@ -1,4 +1,4 @@
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::error::MdfError;
 use mf4_rs::parsing::decoder::DecodedValue;
@@ -23,14 +23,14 @@ fn cut_preserves_vlsd_byte_channel() -> Result<(), MdfError> {
     // library iterates SD entries sequentially regardless of slot value).
     let mut writer = MdfWriter::new(input.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let time_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let time_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Time".into());
     })?;
     writer.set_time_channel(&time_id)?;
-    let vlsd_id = writer.add_channel(&cg_id, Some(&time_id), |ch| {
+    let vlsd_id = writer.add_channel_with(&cg_id, Some(&time_id), |ch| {
         ch.data_type = DataType::ByteArray;
         ch.bit_count = 64;
         ch.channel_type = 1; // VLSD
@@ -65,10 +65,10 @@ fn cut_preserves_vlsd_byte_channel() -> Result<(), MdfError> {
 
     // Sanity check: the source file's VLSD channel reads back correctly.
     {
-        let mdf = MDF::from_file(input.to_str().unwrap())?;
+        let mdf = Mdf::from_file(input.to_str().unwrap())?;
         let groups = mdf.channel_groups();
         let chs = groups[0].channels();
-        let read_payloads = chs[1].values()?;
+        let read_payloads = chs[1].decoded_values()?;
         assert_eq!(read_payloads.len(), 10);
         for (i, v) in read_payloads.iter().enumerate() {
             match v {
@@ -86,14 +86,14 @@ fn cut_preserves_vlsd_byte_channel() -> Result<(), MdfError> {
         0.6,
     )?;
 
-    let mdf = MDF::from_file(output.to_str().unwrap())?;
+    let mdf = Mdf::from_file(output.to_str().unwrap())?;
     let groups = mdf.channel_groups();
     assert_eq!(groups.len(), 1);
     let chs = groups[0].channels();
     assert_eq!(chs.len(), 2);
 
-    let times = chs[0].values()?;
-    let read_payloads = chs[1].values()?;
+    let times = chs[0].decoded_values()?;
+    let read_payloads = chs[1].decoded_values()?;
     assert_eq!(times.len(), 5, "expected 5 kept records");
     assert_eq!(read_payloads.len(), 5);
 
@@ -148,14 +148,14 @@ fn cut_rewrites_vlsd_inline_offsets() -> Result<(), MdfError> {
 
     let mut writer = MdfWriter::new(input.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let time_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let time_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Time".into());
     })?;
     writer.set_time_channel(&time_id)?;
-    let vlsd_id = writer.add_channel(&cg_id, Some(&time_id), |ch| {
+    let vlsd_id = writer.add_channel_with(&cg_id, Some(&time_id), |ch| {
         ch.data_type = DataType::StringUtf8;
         ch.bit_count = 64;
         ch.channel_type = 1; // VLSD
@@ -195,9 +195,9 @@ fn cut_rewrites_vlsd_inline_offsets() -> Result<(), MdfError> {
     )?;
 
     // Sanity: mf4-rs still reads the cut file correctly.
-    let mdf = MDF::from_file(output.to_str().unwrap())?;
+    let mdf = Mdf::from_file(output.to_str().unwrap())?;
     let chs = mdf.channel_groups()[0].channels();
-    let read_payloads = chs[1].values()?;
+    let read_payloads = chs[1].decoded_values()?;
     assert_eq!(read_payloads.len(), 4);
     let expected: Vec<Vec<u8>> = (2u64..=5u64)
         .map(|i| format!("msg-{}-{}", i, "x".repeat(i as usize)).into_bytes())
@@ -267,14 +267,14 @@ fn cut_preserves_empty_vlsd_payloads() -> Result<(), MdfError> {
 
     let mut writer = MdfWriter::new(input.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let time_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let time_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Time".into());
     })?;
     writer.set_time_channel(&time_id)?;
-    let vlsd_id = writer.add_channel(&cg_id, Some(&time_id), |ch| {
+    let vlsd_id = writer.add_channel_with(&cg_id, Some(&time_id), |ch| {
         ch.data_type = DataType::ByteArray;
         ch.bit_count = 64;
         ch.channel_type = 1;
@@ -306,9 +306,9 @@ fn cut_preserves_empty_vlsd_payloads() -> Result<(), MdfError> {
         0.4,
     )?;
 
-    let mdf = MDF::from_file(output.to_str().unwrap())?;
+    let mdf = Mdf::from_file(output.to_str().unwrap())?;
     let chs = mdf.channel_groups()[0].channels();
-    let read_payloads = chs[1].values()?;
+    let read_payloads = chs[1].decoded_values()?;
     assert_eq!(read_payloads.len(), 4);
     let expected = [
         payloads[1].clone(),

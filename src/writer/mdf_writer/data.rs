@@ -178,7 +178,7 @@ fn encode_record(dt: &mut super::OpenDataBlock, values: &[DecodedValue]) -> Resu
 
 impl MdfWriter {
     /// Start writing a DTBLOCK for the given data group.
-    pub fn start_data_block(
+    pub fn start_data_block_with(
         &mut self,
         dg_id: &str,
         cg_id: &str,
@@ -331,7 +331,7 @@ impl MdfWriter {
     ) -> Result<(), MdfError> {
         let dg = self.cg_to_dg.get(cg_id).ok_or_else(|| MdfError::BlockSerializationError("unknown channel group".into()))?.clone();
         let channels = self.cg_channels.get(cg_id).ok_or_else(|| MdfError::BlockSerializationError("no channels for channel group".into()))?.clone();
-        self.start_data_block(&dg, cg_id, record_id_len, &channels)
+        self.start_data_block_with(&dg, cg_id, record_id_len, &channels)
     }
 
     /// Open a DT block for raw byte-level record writing.

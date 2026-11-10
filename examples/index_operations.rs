@@ -17,20 +17,20 @@ fn main() -> Result<(), MdfError> {
     // Step 2: Create enhanced index that resolves all conversion dependencies
     println!("📇 Creating enhanced index with resolved conversions...");
     let index = MdfIndex::from_file(mdf_file)?;
-    index.save_to_file(index_file)?;
+    index.save(index_file)?;
 
     println!("   ✅ Index created and saved to '{}'", index_file);
 
     // Step 3: Load the index and demonstrate self-contained conversion capability
     println!("🔄 Loading index and testing self-contained conversions...");
-    let loaded_index = MdfIndex::load_from_file(index_file)?;
+    let loaded_index = MdfIndex::load(index_file)?;
 
     // Step 4: Read and convert data using only the index + a bound data source.
     println!("📊 Reading channel values via enhanced index...");
 
     // List available channels by navigating the index by name
     println!("\nAvailable channels:");
-    for channel in &loaded_index.groups()[0].channels {
+    for channel in &loaded_index.channel_groups[0].channels {
         println!(
             "  {} ({:?})",
             channel.name.as_deref().unwrap_or("<unnamed>"),
@@ -40,7 +40,7 @@ fn main() -> Result<(), MdfError> {
 
     // Bind the data source once, then read by channel name.
     let mut data = loaded_index.open_file(mdf_file)?;
-    let values = data.values("Time")?;
+    let values = data.decoded_values("Time", None)?;
 
     println!("\nChannel values read from enhanced index:");
     for (i, value) in values.iter().enumerate().take(10) {
@@ -52,7 +52,7 @@ fn main() -> Result<(), MdfError> {
 
     // Step 5: Demonstrate byte range efficiency
     println!("\n🎯 Byte Range Analysis (Partial Reading):");
-    let byte_ranges = loaded_index.byte_ranges("Time")?;
+    let byte_ranges = loaded_index.byte_ranges("Time", None)?;
     let total_bytes: u64 = byte_ranges.iter().map(|(_, len)| len).sum();
 
     println!("  Total bytes needed: {}", total_bytes);
@@ -61,12 +61,12 @@ fn main() -> Result<(), MdfError> {
 
     // Step 6: Read another channel by name
     println!("\n🏷️  Reading 'Temperature' by name:");
-    let temp_values = data.values("Temperature")?;
+    let temp_values = data.decoded_values("Temperature", None)?;
     println!("  Read {} values for channel 'Temperature'", temp_values.len());
 
     // Step 7: Show resolved conversion information
     println!("\n🔧 Conversion Resolution Status:");
-    let group = &loaded_index.groups()[0];
+    let group = &loaded_index.channel_groups[0];
     for (i, channel) in group.channels.iter().enumerate() {
         println!(
             "  Channel {}: {}",
@@ -108,10 +108,10 @@ fn create_test_mdf_file(path: &str) -> Result<(), MdfError> {
     let mut writer = MdfWriter::new(path)?;
     writer.init_mdf_file()?;
 
-    let cg_id = writer.add_channel_group(None, |_| {})?;
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
 
     // Create a time channel (master)
-    let time_ch_id = writer.add_channel(&cg_id, None, |ch| {
+    let time_ch_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Time".to_string());
         ch.bit_count = 64;
@@ -119,14 +119,14 @@ fn create_test_mdf_file(path: &str) -> Result<(), MdfError> {
     writer.set_time_channel(&time_ch_id)?;
 
     // Create a temperature channel with linear conversion
-    writer.add_channel(&cg_id, Some(&time_ch_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&time_ch_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Temperature".to_string());
         ch.bit_count = 16;
     })?;
 
     // Create a status channel (could be enhanced with text conversion later)
-    writer.add_channel(&cg_id, Some(&time_ch_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&time_ch_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Status".to_string());
         ch.bit_count = 8;
