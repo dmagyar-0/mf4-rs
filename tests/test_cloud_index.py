@@ -54,9 +54,9 @@ def build_fixture(path: str) -> None:
     for g, cg in enumerate(cg_ids):
         w.start_data_block(cg)
         for r in range(RECORDS):
-            record = [mf4_rs.create_float_value(r * 0.01)]
+            record = [r * 0.01]
             for j in range(1, CHANNELS_PER_GROUP):
-                record.append(mf4_rs.create_float_value(float(g * 100 + r * j)))
+                record.append(float(g * 100 + r * j))
             w.write_record(cg, record)
         w.finish_data_block(cg)
 
@@ -158,7 +158,7 @@ def main() -> int:
             assert len(groups) == GROUPS, f"got {len(groups)} groups, want {GROUPS}"
             for i, g in enumerate(groups):
                 assert g.name == f"Group {i}", f"group {i} name = {g.name!r}"
-                assert g.channel_count == CHANNELS_PER_GROUP
+                assert len(g.channels) == CHANNELS_PER_GROUP
 
             # The index built over HTTP remembers its URL source.
             assert idx.source == url, f"index source = {idx.source!r}"
@@ -191,7 +191,7 @@ def main() -> int:
             idx.save(str(json_path))
             idx2 = mf4_rs.MdfIndex.load(str(json_path))
             assert idx2.source is None, "source should not be persisted in JSON"
-            idx2.source = url
+            idx2.set_source(url)
             vals_a = idx.values("ch_2_4").tolist()
             vals_b = idx2.values("ch_2_4").tolist()
             assert vals_a == vals_b, "JSON round-trip changed decoded values"

@@ -45,9 +45,9 @@ def bench_mf4rs_record_at_a_time(path, n_records, n_channels=4, iterations=3):
         start = time.perf_counter()
         for i in range(n_records):
             t = float(i) * 0.001
-            values = [mf4_rs.PyDecodedValue.Float(value=t)]
+            values = [t]
             for j in range(n_channels):
-                values.append(mf4_rs.PyDecodedValue.Float(value=t * (j + 2)))
+                values.append(t * (j + 2))
             w.write_record(cg, values)
         elapsed = time.perf_counter() - start
         times.append(elapsed)
@@ -79,7 +79,7 @@ def bench_mf4rs_columns_f64(path, n_records, n_channels=4, iterations=3):
         w.start_data_block(cg)
 
         start = time.perf_counter()
-        w.write_columns_f64(cg, cols)
+        w.write_columns(cg, cols)
         elapsed = time.perf_counter() - start
         times.append(elapsed)
 
@@ -156,12 +156,12 @@ def verify_columns_correctness():
     w.add_float_channel(cg, "ch_0")
     w.add_float_channel(cg, "ch_1")
     w.start_data_block(cg)
-    w.write_columns_f64(cg, [timestamps, ch0, ch1])
+    w.write_columns(cg, [timestamps, ch0, ch1])
     w.finish_data_block(cg)
     w.finalize()
 
     # Read back with mf4-rs
-    reader = mf4_rs.Mdf(path)
+    reader = mf4_rs.Mdf.from_file(path)
     vals = reader.values("ch_0")
     assert vals is not None, "Channel ch_0 not found"
     assert len(vals) == n, f"Expected {n} values, got {len(vals)}"

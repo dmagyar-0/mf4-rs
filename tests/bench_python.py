@@ -50,9 +50,9 @@ def create_test_file_mf4rs(path, n_records, n_float_channels=4):
     w.start_data_block(cg)
     for i in range(n_records):
         t = float(i) * 0.001
-        values = [mf4_rs.PyDecodedValue.Float(value=t)]
+        values = [t]
         for j in range(n_float_channels):
-            values.append(mf4_rs.PyDecodedValue.Float(value=t * (j + 2)))
+            values.append(t * (j + 2))
         w.write_record(cg, values)
     w.finish_data_block(cg)
     w.finalize()
@@ -64,7 +64,7 @@ def bench_read_mf4rs(path, channel_names, iterations=5):
     total_values = 0
     for _ in range(iterations):
         start = time.perf_counter()
-        reader = mf4_rs.Mdf(path)
+        reader = mf4_rs.Mdf.from_file(path)
         for name in channel_names:
             arr = reader.values(name)
             if arr is not None:

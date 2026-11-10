@@ -26,12 +26,12 @@ def p(n): return os.path.join(D, n)
 
 # ---------- helpers ----------
 def rust_vals(path, ch, group=None):
-    m = mf4_rs.Mdf(path)
+    m = mf4_rs.Mdf.from_file(path)
     return m.values(ch, group)
 
 def rust_series(path, ch, group=None):
-    m = mf4_rs.Mdf(path)
-    return m.read(ch, group)
+    m = mf4_rs.Mdf.from_file(path)
+    return m.read(ch, group).to_series()
 
 def idx_vals(path, ch, group=None):
     ix = mf4_rs.MdfIndex.from_file(path)
@@ -39,7 +39,7 @@ def idx_vals(path, ch, group=None):
 
 def idx_series(path, ch, group=None):
     ix = mf4_rs.MdfIndex.from_file(path)
-    return ix.read(ch, group)
+    return ix.read(ch, group).to_series()
 
 def idx_roundtrip_vals(path, ch, group=None):
     """index -> json -> reload -> read (tests serialization of resolved conversions)"""
@@ -276,18 +276,18 @@ def gen_rust_file():
     w.add_float_channel(cg, "F64")
     w.add_float32_channel(cg, "F32")
     w.add_int_channel(cg, "I64")
-    w.add_channel(cg, "U64", mf4_rs.create_data_type_uint_le())
+    w.add_channel(cg, "U64", "UnsignedIntegerLE")
     w.add_string_channel(cg, "Str")  # VLSD; fixed-length strings now raise
     w.start_data_block(cg)
     n = 2000
     for i in range(n):
         w.write_record(cg, [
-            mf4_rs.create_float_value(i * 0.01),
-            mf4_rs.create_float_value(i * 1.5 - 100),
-            mf4_rs.create_float_value(i * 0.25),
-            mf4_rs.create_uint_value(i * 2),  # add_int_channel is documented unsigned
-            mf4_rs.create_uint_value(i * 3),
-            mf4_rs.create_string_value(f"s{i:04d}" + "y" * (i % 10)),
+            i * 0.01,
+            i * 1.5 - 100,
+            i * 0.25,
+            i * 2,  # add_int_channel is documented unsigned
+            i * 3,
+            f"s{i:04d}" + "y" * (i % 10),
         ])
     w.finish_data_block(cg)
     w.finalize()
@@ -324,7 +324,7 @@ def t_columns_write():
     w.start_data_block(cg)
     n = 100000
     tt = np.arange(n) * 0.001; a = np.sin(tt); b = np.cos(tt)
-    w.write_columns_f64(cg, [tt, a, b])
+    w.write_columns(cg, [tt, a, b])
     w.finish_data_block(cg)
     w.finalize()
     m = MDF(p("b_cols.mf4"))
@@ -339,7 +339,7 @@ def t_mixed_dtypes_columns():
     w.init_mdf_file()
     cg = w.add_channel_group(None)
     tc = w.add_time_channel(cg, "Time"); w.set_time_channel(tc)
-    w.add_channel(cg, "U", mf4_rs.create_data_type_uint_le())
+    w.add_channel(cg, "U", "UnsignedIntegerLE")
     w.add_int_channel(cg, "I")
     w.add_float_channel(cg, "F")
     w.start_data_block(cg)
@@ -348,7 +348,7 @@ def t_mixed_dtypes_columns():
     u = (np.arange(n) * 7).astype(np.uint64)
     ii = (np.arange(n) * 11).astype(np.uint64)
     f = np.arange(n) * 0.5
-    w.write_columns(cg, [tt, u, ii, f], ["f64", "u64", "u64", "f64"])
+    w.write_columns(cg, [tt, u, ii, f])
     w.finish_data_block(cg)
     w.finalize()
     m = MDF(p("b_mixed.mf4"))

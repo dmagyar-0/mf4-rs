@@ -36,7 +36,7 @@ def w_mf4rs_cols():
     tc = w.add_time_channel(cg, "Time"); w.set_time_channel(tc)
     for name in chans: w.add_float_channel(cg, name)
     w.start_data_block(cg)
-    w.write_columns_f64(cg, [t] + list(chans.values()))
+    w.write_columns(cg, [t] + list(chans.values()))
     w.finish_data_block(cg); w.finalize()
 
 def w_asammdf():
@@ -65,11 +65,11 @@ print(f"SIZE   mf4-rs: {os.path.getsize(p('w_cols.mf4'))/1e6:.1f} MB   asammdf: 
 # ---- READ (same mf4-rs-written file for both; then asammdf-written file) ----
 for src_label, path in [("mf4-rs-file", p("w_cols.mf4")), ("asammdf-file", p("w_amdf.mf4"))]:
     def r_mf4rs_values():
-        m = mf4_rs.Mdf(path)
+        m = mf4_rs.Mdf.from_file(path)
         return [m.values(f"ch{i}") for i in range(4)]
     def r_mf4rs_read():
-        m = mf4_rs.Mdf(path)
-        return [m.read(f"ch{i}") for i in range(4)]
+        m = mf4_rs.Mdf.from_file(path)
+        return [m.read(f"ch{i}").to_series() for i in range(4)]
     def r_index_values():
         ix = mf4_rs.MdfIndex.from_file(path)
         return [ix.values(f"ch{i}") for i in range(4)]

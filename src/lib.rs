@@ -68,56 +68,51 @@ pub mod wasm;
 #[cfg(feature = "pyo3")]
 use pyo3::prelude::*;
 
-/// Python bindings for the ``mf4-rs`` crate: a minimal reader/writer for
-/// ASAM MDF 4 measurement files.
+/// Python bindings for the ``mf4-rs`` crate: a reader/writer for ASAM MDF 4
+/// measurement files.
 ///
-/// Everything is addressed by **name** — channel-group and channel names —
-/// never by numeric index.
+/// The API is the same in Rust, Python and TypeScript (see ``docs/API.md``).
+/// Everything is addressed by **name** — channel-group and channel names.
 ///
-/// Quick tour
-/// ----------
-///
-/// Read — ``read`` returns a ``pandas.Series`` (values indexed by the master
-/// time axis); ``values`` returns a plain numpy array::
+/// Read — ``read`` returns a :class:`Signal` (values + timestamps), ``values``
+/// a plain numpy ``float64`` array::
 ///
 ///     import mf4_rs
-///     mdf = mf4_rs.Mdf("recording.mf4")
+///     mdf = mf4_rs.Mdf.from_file("recording.mf4")
 ///     for g in mdf.groups:
 ///         print(g.name, g.record_count, g.channel_names)
-///     speed = mdf["Speed"]                 # pandas Series, datetime index
-///     rpm   = mdf.read("RPM", group="Engine")
-///     raw   = mdf.values("Speed")          # numpy.ndarray[float64], no index
+///     speed = mdf.read("Speed")                    # Signal
+///     speed.to_series()                            # pandas Series, datetime index
+///     rpm = mdf.values("RPM", group="Engine")      # numpy.ndarray[float64]
+///     part = mdf.read("Speed", start_time=1.0, end_time=2.5)
+///
+/// Read lazily / remotely — :class:`MdfIndex` has the same reading API, but
+/// fetches only the bytes a call needs from its ``source`` (file or URL)::
+///
+///     idx = mf4_rs.MdfIndex.from_url("https://host/recording.mf4")  # metadata only
+///     speed = idx.read("Speed")                    # range requests happen now
+///     idx.save("recording.idx.json")
+///     idx = mf4_rs.MdfIndex.load("recording.idx.json")
+///     idx.set_source("recording.mf4")              # re-attach a source after load
 ///
 /// Write::
 ///
 ///     w = mf4_rs.MdfWriter("out.mf4")
 ///     w.init_mdf_file()
-///     cg = w.add_channel_group_with("Engine")
-///     t  = w.add_time_channel(cg, "Time")
-///     y  = w.add_float_channel(cg, "Speed")
-///     w.start_data_block_with(cg)
-///     w.write_record(cg, [
-///         mf4_rs.create_float_value(0.0),
-///         mf4_rs.create_float_value(123.4),
-///     ])
-///     w.finish_data_block(cg)
+///     g = w.add_channel_group("Engine")
+///     t = w.add_time_channel(g, "Time")
+///     y = w.add_float_channel(g, "Speed")
+///     w.start_data_block(g)
+///     w.write_record(g, [0.0, 123.4])
+///     w.finish_data_block(g)
 ///     w.finalize()
 ///
-/// Index (HTTP-friendly random access) — the index remembers its source and
-/// reads lazily (range requests happen on ``read``/``values``, not at build)::
+/// File tools: :func:`to_column_oriented` (cloud-friendly MDF 4.20 layout),
+/// :func:`cut_mdf_by_time`, :func:`cut_mdf_by_utc`, :func:`merge_files` and
+/// the :class:`FileLayout` block inspector.
 ///
-///     idx = mf4_rs.MdfIndex.from_url("https://host/recording.mf4")  # only metadata fetched
-///     speed = idx.read("Speed")            # pandas Series; range request happens now
-///     idx.save("recording.idx.json")
-///     idx = mf4_rs.MdfIndex.load("recording.idx.json")
-///     idx.source = "recording.mf4"         # re-attach a source after load
-///     raw = idx.values("Speed")            # numpy, lazy
-///
-/// Other utilities: :func:`merge_files`, :func:`cut_mdf_by_time`,
-/// :func:`cut_mdf_by_utc`, and the :class:`FileLayout` block-layout
-/// inspector.
-///
-/// All errors raised by this module are subclasses of :class:`MdfException`.
+/// Every error is an :class:`MdfException`; a missing channel raises its
+/// subclass :class:`ChannelNotFoundError`.
 #[cfg(feature = "pyo3")]
 #[pymodule]
 fn _mf4_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
