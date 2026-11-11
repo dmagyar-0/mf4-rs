@@ -133,7 +133,9 @@ const lazySpeed = await index.read("Speed");               // range requests hap
 
 Pass a time window **or** a record window, not both. On `MdfIndex` a window
 fetches only the selected records; a time window is located by searching the
-master channel with a handful of single-record reads.
+master channel with a handful of single-record reads. (Exception:
+variable-length channels — text and byte arrays — are fetched whole and then
+cut to the window.)
 
 How `options` is passed:
 
@@ -196,13 +198,14 @@ column-oriented group), `channels` (list of `ChannelInfo`).
 **`ChannelInfo`** — `name`, `unit`, `comment`, `data_type`, `bit_count`,
 `is_master`, `is_vlsd`, `has_conversion`.
 
-`data_type` is a string, the same in every language and the same one
-`MdfWriter.add_channel` accepts: `FloatLE`, `FloatBE`, `UnsignedIntegerLE`,
+`data_type` is a string, the same in every language: `FloatLE`, `FloatBE`, `UnsignedIntegerLE`,
 `UnsignedIntegerBE`, `SignedIntegerLE`, `SignedIntegerBE`, `StringUtf8`,
 `StringLatin1`, `StringUtf16LE`, `StringUtf16BE`, `ByteArray` (plus, when
 reading, `MimeSample`, `MimeStream`, `CanOpenDate`, `CanOpenTime`, `ComplexLE`,
-`ComplexBE`, `Unknown`). In Rust `ChannelInfo.data_type` is this string and
-the writer takes the `DataType` enum whose variants carry the same names.
+`ComplexBE`, `Unknown`). `MdfWriter.add_channel` takes the same names (the
+writable subset is listed under [Writing](#writing-mdfwriter)). In Rust
+`ChannelInfo.data_type` is this string and the writer takes the `DataType`
+enum whose variants carry the same names.
 
 **`ConversionInfo`** — `type` (`Identity`, `Linear`, `Rational`, `Algebraic`,
 `TableLookupInterp`, `TableLookupNoInterp`, `RangeLookup`, `ValueToText`,
@@ -234,7 +237,7 @@ and `finalize()` closes it. TypeScript runs in wasm without a filesystem:
 | | `add_float_channel` / `add_float32_channel` | 64 / 32-bit float. |
 | | `add_int_channel` / `add_sint_channel` | 64-bit **unsigned** / **signed** integer. |
 | | `add_string_channel` | Variable-length UTF-8 text. |
-| | `add_channel(group, name, data_type)` | Any data type by name. Integers and floats get **32 bits**; text types and `ByteArray` become variable-length channels, text in the type's own encoding. |
+| | `add_channel(group, name, data_type)` | A channel by data-type name: `FloatLE`, `UnsignedIntegerLE`, `SignedIntegerLE` (each **32 bits** wide), a text type or `ByteArray` (variable-length channels; text in the type's own encoding). Other types, including the big-endian ones, can be read but not written and are refused. |
 | | `set_time_channel(channel)` | Mark an existing channel as the master. |
 | | `add_linear_conversion(channel, offset, factor)` | `physical = offset + factor * raw`. |
 | | `add_value_to_text_conversion(channel, mapping, default_text)` | `mapping` is a list of `(raw integer, text)` pairs. |
@@ -256,7 +259,9 @@ same values (the rules live once, in the Rust core):
 - text channels take text only, `ByteArray` channels bytes only;
 - booleans are refused.
 
-A refused value is an error; nothing is ever silently truncated. Columns are `numpy` arrays (`float64`, `float32`,
+A refused value is an error. Integers are never silently truncated, on any
+write path (`write_record` and `write_columns` alike); a float written to a
+32-bit float channel is rounded to `float32` as usual. Columns are `numpy` arrays (`float64`, `float32`,
 `uint64`, `int64`), typed arrays (`Float64Array`, `Float32Array`,
 `BigUint64Array`, `BigInt64Array`) or `ColumnData` slices.
 

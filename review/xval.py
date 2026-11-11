@@ -47,7 +47,7 @@ def idx_roundtrip_vals(path, ch, group=None):
     jp = p("tmp_index.json")
     ix.save(jp)
     ix2 = mf4_rs.MdfIndex.load(jp)
-    ix2.source = path
+    ix2.set_source(path)
     return ix2.values(ch, group)
 
 def eq_arrays(a, b, name, exact=False):

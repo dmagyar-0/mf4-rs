@@ -1291,8 +1291,14 @@ fn record_value(v: &JsValue, dt: &DataType, i: usize) -> Result<DecodedValue, Js
         match (i64::try_from(b.clone()), u64::try_from(b.clone())) {
             (Ok(n), _) => PlainValue::Int(n as i128),
             (_, Ok(n)) => PlainValue::Int(n as i128),
-            // Outside the 64-bit range: out of range for every channel.
-            _ => PlainValue::Int(i128::MAX),
+            // Outside the 64-bit range: too big for any integer channel, but
+            // a float channel takes it like any other number.
+            _ => PlainValue::Float(
+                b.to_string(10)
+                    .ok()
+                    .and_then(|s| String::from(s).parse::<f64>().ok())
+                    .unwrap_or(f64::NAN),
+            ),
         }
     } else if let Some(f) = v.as_f64() {
         PlainValue::Float(f)

@@ -22,6 +22,21 @@ import type {
 /** Initial prefix fetched before the build loop — metadata usually starts at
  * the front of the file, so seeding this often completes the build in one or
  * two round-trips. */
+/**
+ * Read `[offset, offset + length)` and insist on getting all of it: a short
+ * read would otherwise look like a gap that never closes.
+ */
+async function readExact(source: RangeSource, offset: number, length: number): Promise<Uint8Array> {
+  const bytes = await source.read(offset, length);
+  if (bytes.length < length) {
+    throw new Error(
+      `MdfIndex: the source returned ${bytes.length} of the ${length} bytes requested at offset ` +
+        `${offset}; it may be truncated or not match the index.`,
+    );
+  }
+  return bytes;
+}
+
 const BUILD_SEED_BYTES = 256 * 1024;
 /** Base bytes fetched per build round-trip, and the window the read-ahead
  * heuristic falls back to whenever the walk jumps to a new metadata cluster
@@ -598,7 +613,7 @@ export class MdfIndex {
       if (step.done) return (step.conversion ?? null) as ConversionInfo | null;
       const source = this.#requireSource({});
       const spans = coalesceNeeded(step.needed!, lookahead, lookahead, this.fileSize());
-      const fetched = await Promise.all(spans.map(([o, l]) => source.read(o, l)));
+      const fetched = await Promise.all(spans.map(([o, l]) => readExact(source, o, l)));
       spans.forEach(([offset], i) => {
         ranges.push([offset, fetched[i]!.length]);
         fragments.push(fetched[i]!);
@@ -646,7 +661,7 @@ export class MdfIndex {
       const spans = coalesceNeeded(result.needed!, WINDOW_BRIDGE_BYTES, 0, size);
       const fetched = await Promise.all(
         spans.map(async ([offset, length]): Promise<[ByteRange, Uint8Array]> => {
-          const bytes = await source.read(offset, length);
+          const bytes = await readExact(source, offset, length);
           return [[offset, bytes.length], bytes];
         }),
       );
@@ -692,7 +707,7 @@ export class MdfIndex {
       );
       const fetched = await Promise.all(
         spans.map(async ([offset, length]): Promise<[ByteRange, Uint8Array]> => {
-          const bytes = await source.read(offset, length);
+          const bytes = await readExact(source, offset, length);
           return [[offset, bytes.length], bytes];
         }),
       );

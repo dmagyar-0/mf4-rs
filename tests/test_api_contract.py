@@ -22,6 +22,10 @@ try:
     import numpy as np
     import mf4_rs
 except ImportError as exc:  # pragma: no cover
+    # Skipping is fine on a developer machine, never in CI: a contract test
+    # that silently does not run guards nothing.
+    if os.environ.get("CI"):
+        raise
     print(f"SKIP: {exc}")
     sys.exit(0)
 
@@ -232,6 +236,34 @@ def test_write_columns_matches_write_record():
         assert list(mdf.values("F32")) == [1.5, 2.5, 3.5]
         assert list(mdf.values("U64")) == [7.0, 8.0, 9.0]
         assert list(mdf.values("I64")) == [-7.0, -8.0, -9.0]
+
+        # Columns are range-checked like records: nothing is truncated.
+        w = mf4_rs.MdfWriter(os.path.join(tmp, "narrow.mf4"))
+        w.init_mdf_file()
+        g = w.add_channel_group()
+        w.add_channel(g, "U32", "UnsignedIntegerLE")
+        w.add_channel(g, "I32", "SignedIntegerLE")
+        w.start_data_block(g)
+        w.write_columns(g, [np.array([2**32 - 1], np.uint64), np.array([-(2**31)], np.int64)])
+        for columns in (
+            [np.array([2**32], np.uint64), np.array([0], np.int64)],
+            [np.array([0], np.uint64), np.array([2**31], np.int64)],
+            [np.array([0.0]), np.array([0], np.int64)],
+        ):
+            try:
+                w.write_columns(g, columns)
+            except mf4_rs.MdfException:
+                pass
+            else:
+                raise AssertionError(f"write_columns accepted {columns}")
+        # Types the writer cannot encode are refused up front.
+        for data_type in ("FloatBE", "UnsignedIntegerBE", "SignedIntegerBE", "NoSuchType"):
+            try:
+                w.add_channel(g, "x", data_type)
+            except mf4_rs.MdfException:
+                pass
+            else:
+                raise AssertionError(f"add_channel accepted {data_type}")
 
 
 # ---------------------------------------------------------------------------

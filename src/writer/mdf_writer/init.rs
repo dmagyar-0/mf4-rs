@@ -300,7 +300,7 @@ impl MdfWriter {
         self.add_channel_impl(cg_id, prev_cn_id, configure, true)
     }
 
-    /// Like [`add_channel`], but never auto-assigns `byte_offset`: the value
+    /// Like [`add_channel_with`](Self::add_channel_with), but never auto-assigns `byte_offset`: the value
     /// set by `configure` — including a legitimate `0` on a channel that is
     /// not first in the record — is written verbatim. Use when cloning
     /// channels whose record layout is copied from another file and must be

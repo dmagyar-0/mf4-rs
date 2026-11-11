@@ -622,3 +622,48 @@ fn type_methods_match_the_contract() {
         );
     }
 }
+
+#[test]
+fn integers_are_never_truncated() -> Result<(), MdfError> {
+    use mf4_rs::ColumnData;
+    let dir = tempfile::tempdir().map_err(MdfError::IOError)?;
+    let mut w = MdfWriter::new(dir.path().join("narrow.mf4").to_str().unwrap())?;
+    w.init_mdf_file()?;
+    let g = w.add_channel_group(None)?;
+    w.add_channel(&g, "U32", DataType::UnsignedIntegerLE)?;
+    w.add_channel(&g, "I32", DataType::SignedIntegerLE)?;
+    // Types the writer cannot encode are refused up front.
+    for data_type in [DataType::FloatBE, DataType::UnsignedIntegerBE, DataType::SignedIntegerBE] {
+        assert!(matches!(w.add_channel(&g, "x", data_type), Err(MdfError::InvalidArgument(_))));
+    }
+    w.start_data_block(&g)?;
+    let ok = [DecodedValue::UnsignedInteger(u32::MAX as u64), DecodedValue::SignedInteger(i32::MIN as i64)];
+    w.write_record(&g, &ok)?;
+    w.write_columns(&g, &[ColumnData::U64(&[u32::MAX as u64]), ColumnData::I64(&[i32::MIN as i64])])?;
+    let too_big = [DecodedValue::UnsignedInteger(1 << 32), DecodedValue::SignedInteger(0)];
+    assert!(matches!(w.write_record(&g, &too_big), Err(MdfError::InvalidArgument(_))));
+    let too_small = [DecodedValue::UnsignedInteger(0), DecodedValue::SignedInteger(i32::MIN as i64 - 1)];
+    assert!(matches!(w.write_record(&g, &too_small), Err(MdfError::InvalidArgument(_))));
+    let columns = [ColumnData::U64(&[1 << 32]), ColumnData::I64(&[0])];
+    assert!(matches!(w.write_columns(&g, &columns), Err(MdfError::InvalidArgument(_))));
+    let columns = [ColumnData::U64(&[0]), ColumnData::I64(&[1 << 31])];
+    assert!(matches!(w.write_columns(&g, &columns), Err(MdfError::InvalidArgument(_))));
+    w.finish_data_block(&g)?;
+
+    // An all-unsigned group through the u64 fast path, and an odd bit width.
+    let g = w.add_channel_group(None)?;
+    w.add_channel_with(&g, None, |ch| {
+        ch.data_type = DataType::UnsignedIntegerLE;
+        ch.name = Some("U12".to_string());
+        ch.bit_count = 12;
+    })?;
+    w.start_data_block(&g)?;
+    w.write_record_u64(&g, &[4095])?;
+    assert!(matches!(w.write_record_u64(&g, &[4096]), Err(MdfError::InvalidArgument(_))));
+    assert!(matches!(
+        w.write_record(&g, &[DecodedValue::UnsignedInteger(5000)]),
+        Err(MdfError::InvalidArgument(_))
+    ));
+    w.finish_data_block(&g)?;
+    w.finalize()
+}

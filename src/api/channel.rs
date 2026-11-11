@@ -66,7 +66,7 @@ impl<'a> Channel<'a> {
         Ok(Some(conversion))
     }
 
-    /// This channel's metadata as a plain [`ChannelInfo`].
+    /// This channel's metadata as a plain [`ChannelInfo`](crate::types::ChannelInfo).
     pub fn info(&self) -> Result<crate::types::ChannelInfo, MdfError> {
         Ok(crate::types::ChannelInfo {
             name: self.name()?,

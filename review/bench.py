@@ -91,7 +91,7 @@ print(f"INDEX  build: {d5:.4f}s   load-json: {d6:.4f}s   json size: {os.path.get
 
 # single-channel partial read (the index's design win)
 def one_ch_index():
-    ix2 = mf4_rs.MdfIndex.load(p("ix.json")); ix2.source = p("w_cols.mf4")
+    ix2 = mf4_rs.MdfIndex.load(p("ix.json")); ix2.set_source(p("w_cols.mf4"))
     return ix2.values("ch0")
 def one_ch_asammdf():
     m = MDF(p("w_cols.mf4")); s = m.get("ch0").samples; m.close(); return s

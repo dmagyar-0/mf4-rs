@@ -222,6 +222,23 @@ test("writeColumns matches writeRecord", () => {
   assert.deepEqual(Array.from(mdf.values("I64")), [-7, -8, -9]);
   assert.throws(() => w.writeRecord(g, [0, 0, 0, 0]));
   mdf.dispose();
+
+  // Columns are range-checked like records: nothing is truncated.
+  const narrow = new MdfWriter();
+  narrow.initMdfFile();
+  const n = narrow.addChannelGroup();
+  narrow.addChannel(n, "U32", "UnsignedIntegerLE");
+  narrow.addChannel(n, "I32", "SignedIntegerLE");
+  narrow.startDataBlock(n);
+  narrow.writeColumns(n, [new BigUint64Array([2n ** 32n - 1n]), new BigInt64Array([-(2n ** 31n)])]);
+  assert.throws(() => narrow.writeColumns(n, [new BigUint64Array([2n ** 32n]), new BigInt64Array([0n])]));
+  assert.throws(() => narrow.writeColumns(n, [new BigUint64Array([0n]), new BigInt64Array([2n ** 31n])]));
+  assert.throws(() => narrow.writeColumns(n, [new Float64Array([0]), new BigInt64Array([0n])]));
+  // Types the writer cannot encode are refused up front.
+  for (const dataType of ["FloatBE", "UnsignedIntegerBE", "SignedIntegerBE", "NoSuchType"]) {
+    assert.throws(() => narrow.addChannel(n, "x", dataType), dataType);
+  }
+  narrow.dispose();
 });
 
 // ---------------------------------------------------------------------------

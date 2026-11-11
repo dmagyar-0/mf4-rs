@@ -165,7 +165,7 @@ impl<'a> ChannelGroup<'a> {
         })
     }
 
-    /// This group's metadata as a plain [`GroupInfo`].
+    /// This group's metadata as a plain [`GroupInfo`](crate::types::GroupInfo).
     pub fn info(&self) -> Result<crate::types::GroupInfo, MdfError> {
         let mut channels = Vec::new();
         for ch in self.channels() {

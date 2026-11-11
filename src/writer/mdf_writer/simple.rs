@@ -12,6 +12,7 @@ use crate::parsing::decoder::DecodedValue;
 
 /// A record value as a dynamically typed binding (Python, JavaScript) hands
 /// it over, before it is matched against its channel's data type.
+#[cfg_attr(not(any(feature = "pyo3", feature = "wasm")), allow(dead_code))]
 pub(crate) enum PlainValue<'a> {
     /// An integer (`int`, `bigint`).
     Int(i128),
@@ -34,6 +35,7 @@ pub(crate) enum PlainValue<'a> {
 ///   are in range — never fractions, `NaN` or (for unsigned) negatives;
 /// * text channels take text, `ByteArray` channels take bytes;
 /// * booleans are refused.
+#[cfg_attr(not(any(feature = "pyo3", feature = "wasm")), allow(dead_code))]
 pub(crate) fn record_value(value: PlainValue<'_>, data_type: &DataType, index: usize) -> Result<DecodedValue, MdfError> {
     let refuse = |expected: &str| {
         MdfError::InvalidArgument(format!(
@@ -42,12 +44,12 @@ pub(crate) fn record_value(value: PlainValue<'_>, data_type: &DataType, index: u
         ))
     };
     match data_type {
-        DataType::FloatLE | DataType::FloatBE => match value {
+        DataType::FloatLE => match value {
             PlainValue::Float(f) => Ok(DecodedValue::Float(f)),
             PlainValue::Int(i) => Ok(DecodedValue::Float(i as f64)),
             _ => Err(refuse("a number")),
         },
-        DataType::UnsignedIntegerLE | DataType::UnsignedIntegerBE => {
+        DataType::UnsignedIntegerLE => {
             let expected = "a non-negative integer";
             match value {
                 PlainValue::Int(i) => u64::try_from(i).map(DecodedValue::UnsignedInteger).map_err(|_| refuse(expected)),
@@ -57,7 +59,7 @@ pub(crate) fn record_value(value: PlainValue<'_>, data_type: &DataType, index: u
                 _ => Err(refuse(expected)),
             }
         }
-        DataType::SignedIntegerLE | DataType::SignedIntegerBE => {
+        DataType::SignedIntegerLE => {
             let expected = "an integer";
             match value {
                 PlainValue::Int(i) => i64::try_from(i).map(DecodedValue::SignedInteger).map_err(|_| refuse(expected)),
@@ -71,10 +73,11 @@ pub(crate) fn record_value(value: PlainValue<'_>, data_type: &DataType, index: u
             PlainValue::Text(s) => Ok(DecodedValue::String(s.to_string())),
             _ => Err(refuse("a string")),
         },
-        _ => match value {
+        DataType::ByteArray => match value {
             PlainValue::Bytes(b) => Ok(DecodedValue::ByteArray(b.to_vec())),
             _ => Err(refuse("bytes")),
         },
+        _ => Err(refuse("left out: the writer cannot encode values")),
     }
 }
 
@@ -103,13 +106,21 @@ impl MdfWriter {
     /// floats (use `add_float_channel` / `add_int_channel` / `add_sint_channel`
     /// for 64-bit channels); a value that does not fit is refused by
     /// `write_record`. Text types and `ByteArray` are written as
-    /// variable-length channels, text in the type's own encoding.
+    /// variable-length channels, text in the type's own encoding. Big-endian
+    /// and other types the writer cannot encode are refused.
     ///
     /// Channels are laid out in the order they are added; `write_record`
     /// expects one value per channel in that order.
     pub fn add_channel(&mut self, group_id: &str, name: &str, data_type: DataType) -> Result<String, MdfError> {
         if data_type.is_string() || data_type == DataType::ByteArray {
             return self.add_vlsd_channel(group_id, name, data_type);
+        }
+        if !matches!(data_type, DataType::FloatLE | DataType::UnsignedIntegerLE | DataType::SignedIntegerLE) {
+            return Err(MdfError::InvalidArgument(format!(
+                "cannot write {} channels: the writer supports FloatLE, UnsignedIntegerLE, \
+                 SignedIntegerLE, the text types and ByteArray",
+                data_type.name()
+            )));
         }
         let bits = data_type.default_bits();
         self.add_fixed_channel(group_id, name, data_type, bits)

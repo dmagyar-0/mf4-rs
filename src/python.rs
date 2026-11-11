@@ -880,10 +880,16 @@ impl PyMdfWriter {
 /// rules live in the Rust core (`simple::record_value`), shared with wasm.
 fn record_value(value: &Bound<'_, PyAny>, data_type: &DataType, index: usize) -> PyResult<DecodedValue> {
     use crate::writer::mdf_writer::simple::{record_value, PlainValue};
-    use pyo3::types::{PyBool, PyBytes, PyFloat, PyString};
+    use pyo3::types::{PyBool, PyByteArray, PyBytes, PyFloat, PyString};
 
-    let text;
-    let plain = if value.is_instance_of::<PyBool>() {
+    let (text, byte_array);
+    // numpy.bool_ is not a Python bool, but is one for our purposes.
+    let is_numpy_bool = || {
+        let ty = value.get_type();
+        let attr = |name: &str| ty.getattr(name).and_then(|v| v.extract::<String>()).unwrap_or_default();
+        attr("__module__") == "numpy" && attr("__name__").starts_with("bool")
+    };
+    let plain = if value.is_instance_of::<PyBool>() || is_numpy_bool() {
         PlainValue::Bool
     } else if value.is_instance_of::<PyFloat>() {
         PlainValue::Float(value.extract()?)
@@ -892,6 +898,9 @@ fn record_value(value: &Bound<'_, PyAny>, data_type: &DataType, index: usize) ->
         PlainValue::Text(&text)
     } else if let Ok(b) = value.downcast::<PyBytes>() {
         PlainValue::Bytes(b.as_bytes())
+    } else if let Ok(b) = value.downcast::<PyByteArray>() {
+        byte_array = b.to_vec();
+        PlainValue::Bytes(&byte_array)
     } else if let Ok(i) = value.extract::<i128>() {
         PlainValue::Int(i)
     } else if let Ok(f) = value.extract::<f64>() {

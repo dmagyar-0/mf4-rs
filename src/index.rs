@@ -986,7 +986,7 @@ impl ByteRangeReader for HttpRangeReader {
 impl MdfIndex {
     /// Create an index from an MDF file on disk.
     ///
-    /// Not available on `wasm32-unknown-unknown`; use [`from_bytes`] instead.
+    /// Not available on `wasm32-unknown-unknown`; use [`from_bytes`](Self::from_bytes) instead.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_file(file_path: &str) -> Result<Self, MdfError> {
         let mdf = Mdf::from_file(file_path)?;
@@ -1689,7 +1689,7 @@ impl MdfIndex {
 
     /// Save the index to a JSON file.
     ///
-    /// Not available on `wasm32-unknown-unknown`; use [`to_json`] instead.
+    /// Not available on `wasm32-unknown-unknown`; use [`to_json`](Self::to_json) instead.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn save(&self, index_path: &str) -> Result<(), MdfError> {
         let json = self.to_json()?;
@@ -1700,7 +1700,7 @@ impl MdfIndex {
 
     /// Load an index from a JSON file.
     ///
-    /// Not available on `wasm32-unknown-unknown`; use [`from_json`] instead.
+    /// Not available on `wasm32-unknown-unknown`; use [`from_json`](Self::from_json) instead.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load(index_path: &str) -> Result<Self, MdfError> {
         let json = std::fs::read_to_string(index_path)
@@ -1727,7 +1727,7 @@ impl MdfIndex {
 
     /// Validate structural invariants of the index.
     ///
-    /// Called from [`Self::from_json`] / [`Self::load_from_file`] so that
+    /// Called from [`Self::from_json`] / [`Self::load`] so that
     /// malformed (hostile or stale) index data returns an error instead of
     /// causing panics, integer underflow, or huge allocations during reads.
     pub fn validate(&self) -> Result<(), MdfError> {
@@ -2983,11 +2983,21 @@ impl MdfIndex {
 
     /// Resolve the attached [`Source`], erroring with a helpful message if none.
     fn require_source(&self) -> Result<&Source, MdfError> {
-        self.source.as_ref().ok_or_else(|| {
+        let source = self.source.as_ref().ok_or_else(|| {
             MdfError::BlockSerializationError(
                 "no data source attached to index; build with from_file/from_url or call set_source".to_string(),
             )
-        })
+        })?;
+        #[cfg(not(feature = "http"))]
+        {
+            let Source::File(path) = source;
+            if path.starts_with("http://") || path.starts_with("https://") {
+                return Err(MdfError::InvalidArgument(format!(
+                    "'{path}' is a URL, but mf4-rs was built without the `http` feature"
+                )));
+            }
+        }
+        Ok(source)
     }
 
     /// Read one channel's decoded values lazily through the attached source.
