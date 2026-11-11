@@ -404,21 +404,22 @@ def test_data_block_splitting_cross_read():
 
 def test_value_to_text_conversion_cross_read():
     """asammdf correctly applies value-to-text conversions from mf4-rs files."""
-    # This uses the Rust example file which has value-to-text conversions
     path = tmp("v2t")
     try:
-        # Write file with value-to-text conversion using Rust API via cargo
-        os.system(
-            f'cd /home/user/mf4-rs && cargo run --release --example write_file 2>/dev/null'
-        )
-        example_path = "/home/user/mf4-rs/example.mf4"
-        if not os.path.exists(example_path):
-            print("    (SKIP: example.mf4 not found)")
-            return
+        w = mf4_rs.MdfWriter(path)
+        w.init_mdf_file()
+        cg = w.add_channel_group("Group")
+        w.add_time_channel(cg, "Time")
+        status_id = w.add_int_channel(cg, "Status")
+        w.add_value_to_text_conversion(status_id, [(0, "OK"), (1, "WARN")], "UNKNOWN")
+        w.start_data_block(cg)
+        for i in range(100):
+            w.write_record(cg, [i * 0.1, i % 2])
+        w.finish_data_block(cg)
+        w.finalize()
 
-        mdf = AsamMDF(example_path)
-        # Group 1 has Status channel with value-to-text conversion
-        status = mdf.get("Status", group=1)
+        mdf = AsamMDF(path)
+        status = mdf.get("Status")
         assert status is not None, "Status channel not found"
         # With conversions applied, values should be byte strings
         assert status.samples[0] == b"OK" or status.samples[0] == "OK", \
@@ -428,18 +429,20 @@ def test_value_to_text_conversion_cross_read():
 
         # Check the conversion type - find Status channel by name
         status_ch = None
-        for ch in mdf.groups[1].channels:
+        for ch in mdf.groups[0].channels:
             if ch.name == "Status":
                 status_ch = ch
                 break
-        assert status_ch is not None, "Status channel not found in group 1"
+        assert status_ch is not None, "Status channel not found"
         assert status_ch.conversion is not None, "expected conversion block"
         assert status_ch.conversion.conversion_type == 7, \
             f"expected conversion type 7 (ValueToText), got {status_ch.conversion.conversion_type}"
+
+        # mf4-rs reads its own conversion back the same way.
+        assert list(mf4_rs.Mdf.from_file(path).read("Status").values[:3]) == ["OK", "WARN", "OK"]
         mdf.close()
     finally:
         cleanup(path)
-        cleanup("/home/user/mf4-rs/example.mf4")
 
 
 def test_units_and_comments_readable():

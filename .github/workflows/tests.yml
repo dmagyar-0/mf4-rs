@@ -1,0 +1,71 @@
+name: Tests
+
+# Runs the Rust, Python and TypeScript test suites on every PR. Each suite
+# includes the API-contract test for its language (docs/api-contract.json),
+# so a change that makes the three bindings drift apart fails here.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features http
+
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install maturin numpy pandas asammdf
+      - name: Build and install the wheel
+        run: |
+          maturin build --release -o dist
+          pip install --no-deps dist/*.whl
+      - name: Stubs are up to date
+        run: |
+          cargo run --features pyo3 --bin stub_gen
+          git diff --exit-code -- python/mf4_rs/
+      - run: python tests/test_api_contract.py
+      - run: python tests/test_asammdf_interop.py
+      - run: python tests/test_cloud_index.py
+      - run: python tests/test_column_oriented.py
+
+  typescript:
+    name: TypeScript
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: js
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cargo install wasm-pack --locked
+      - run: npm ci
+      - run: npm run build:wasm
+      - run: npm run build:wasm:web
+      - run: npm run build
+      - run: npm run build:web
+      - run: npm test

@@ -60,6 +60,8 @@ asammdf_*.mf4
 !js/tsconfig.json
 !js/tsconfig.web.json
 !js/package-lock.json
+# ...and so must the cross-language API contract.
+!docs/api-contract.json
 
 # Benchmark Data
 # Generated test data and results (optional - remove if you want to commit test data)

@@ -48,11 +48,33 @@ The pipeline takes the **highest** bump implied by any commit since the last tag
 3. **Never hand-edit the `version` fields** in `Cargo.toml`, `pyproject.toml`, or `js/package.json` / `js/package-lock.json`, and never manually edit `CHANGELOG.md` to add release sections — the release workflow owns those. Editing them by hand will cause merge conflicts the next time the workflow runs.
 4. When committing within a PR branch, individual commit subjects don't need to be conventional (the squash uses the PR title), but matching the convention still helps reviewers.
 
+## Cross-Language API Contract (MUST FOLLOW)
+
+The Rust crate, the Python package and the TypeScript package expose **one API**: the same classes (`Mdf`, `MdfIndex`, `MdfWriter`), methods, types and behaviour. It is specified in `docs/API.md` (human-readable) and `docs/api-contract.json` (machine-readable, snake_case; TypeScript camelCases it).
+
+Three tests fail when a binding and the contract disagree — each also checks that `Mdf` and `MdfIndex` give identical answers for the same file:
+
+| Language | Test | Run |
+|---|---|---|
+| Rust | `tests/api_contract.rs` | `cargo test --test api_contract` |
+| Python | `tests/test_api_contract.py` | `python tests/test_api_contract.py` |
+| TypeScript | `js/test/contract.test.ts` | `cd js && npm test` |
+
+`.github/workflows/tests.yml` runs the full Rust, Python and TypeScript suites on every PR.
+
+### Rules for Claude sessions
+
+1. **Never add, rename or remove a public method, property, type field, function or export in one language only.** Change `docs/api-contract.json` and `docs/API.md` first, then implement it in Rust (`src/api/mdf.rs`, `src/index.rs`, `src/writer/mdf_writer/simple.rs`, `src/types.rs`), in `src/python.rs` (regenerate stubs) and in `src/wasm.rs` + `js/src/`, then run all three contract tests.
+2. A name that can only exist in one language (e.g. Rust `read_with`, TypeScript `dispose`, Python `Signal.to_series`) must be listed under that language's `extra` in the contract — that makes it a deliberate extension rather than drift.
+3. **The bindings are thin shells.** Behaviour (lookups, windows, conversions, the writer's channel bookkeeping) lives in the Rust core; `src/python.rs` and `src/wasm.rs` only convert arguments and results. Do not reimplement logic in a binding.
+4. The vocabulary is fixed: `read` → `Signal` (values + timestamps); `values` → plain `f64` numbers (`NaN` for invalid / non-numeric); `group` is always an option, never a positional index or a `_in` suffix; metadata lookups (`group`, `channel`) return nothing for an unknown name, data operations fail with *channel not found* (`MdfError::ChannelNotFound` / `ChannelNotFoundError`).
+5. Rust has no optional arguments: `group` is `Option<&str>`, and `read` / `values` have `read_with` / `values_with` taking `&ReadOptions`. Zero-argument accessors are methods in Rust and TypeScript, properties in Python.
+
 ## Project Overview
 
 `mf4-rs` is a Rust library for working with ASAM MDF 4 (Measurement Data Format) files. It implements a subset of the MDF 4.1 specification sufficient for data logging and inspection tasks. The library supports reading existing MDF files, writing new ones, creating lightweight JSON indexes for fast random access, time-based file cutting, file merging, and streaming conversion to column-oriented MDF 4.20 files optimised for cloud reads. Optional Python bindings are available via PyO3 (published to PyPI), and optional WebAssembly bindings via wasm-bindgen are wrapped by a TypeScript package in `js/` (published to npm as `mf4-rs`).
 
-**Key stats:** ~15,000 lines of Rust across ~52 source files, plus a TypeScript wrapper package in `js/`. Rust edition 2024, MIT licensed. The version in `Cargo.toml` / `pyproject.toml` / `js/package.json` is managed by the release workflow — never edit it by hand.
+**Key stats:** ~16,000 lines of Rust across ~54 source files, plus a TypeScript wrapper package in `js/`. Rust edition 2024, MIT licensed. The version in `Cargo.toml` / `pyproject.toml` / `js/package.json` is managed by the release workflow — never edit it by hand.
 
 ## Build and Test Commands
 
@@ -126,20 +148,19 @@ npm test
 
 The codebase is organized into distinct layers. The module structure is defined inline in `src/lib.rs` (not via `mod.rs` files for the top-level `api` and `parsing` modules).
 
-### 1. API Layer (`src/api/`)
-- **High-level user-facing API** - what external users interact with
-- `MDF` (`mdf.rs`) - Entry point; wraps `MdfFile`, provides `channel_groups()` and `start_time_ns()`
-- `ChannelGroup` (`channel_group.rs`) - Borrows from `RawDataGroup`, `RawChannelGroup`, and the mmap; provides `name()`, `comment()`, `source()`, `channels()`, `master_channel()` (local master, or the MDF 4.2 remote master via `cg_cg_master` — needs the file's other groups, so build groups through `MDF::channel_groups()`; `ChannelGroup::new` has none)
-- `MDF::signal_in(group, name)` searches **every** group with that name (column-oriented files have one group per signal, all named after the source group); `MDF::group(name)` still returns only the first
-- `Channel` (`channel.rs`) - Borrows from `ChannelBlock` and raw types; provides `name()`, `unit()`, `comment()`, `source()`, `values()`
-- All API types carry lifetime `'a` tied to the memory-mapped file owned by `MDF`
-
-**Note:** `src/api/mod.rs` exists but is **not used** - `lib.rs` declares the `api` module inline, so `mod.rs` is dead code. Its re-exports (`pub use mdf_file::MDF` and `pub use source_info::SourceInfo`) reference modules that don't exist under `api/`.
+### 1. API Layer (`src/api/`, `src/types.rs`, `src/signal.rs`)
+- **High-level user-facing API** - what external users interact with. The contract types and classes are re-exported at the crate root (`use mf4_rs::{Mdf, MdfIndex, MdfWriter, ReadOptions, Signal, …}`).
+- `Mdf` (`mdf.rs`) - Whole-file reader; wraps `MdfFile`. Contract methods: `from_file` / `from_bytes` / `from_url` (`http` feature), `groups()`, `group(name)`, `channel(name, group)`, `channel_names()`, `start_time_ns()`, `read` / `read_with`, `values` / `values_with`, `time_range(name, group)`, `conversion(name, group)`, `file_layout()`. Lookups with a group search **every** group carrying that name (column-oriented files have one group per signal, all named after the source group).
+- `src/types.rs` - the contract's plain data types: `GroupInfo`, `ChannelInfo`, `ConversionInfo` (`From<&ConversionBlock>`), `TimeRange`, `ReadOptions` (builder: `.group()`, `.time()`, `.records()`), plus the crate-internal `Window` (validated `ReadOptions`), `resolve_records` and `slice_signal`. All bindings serialise these same structs.
+- `Signal` (`src/signal.rs`) - `{ name, unit, timestamps: Vec<f64>, values: Vec<Option<DecodedValue>> }`, with `values_f64()` / `has_timestamps()`.
+- Underneath the contract (Rust-only block access): `Mdf::channel_groups()` → `ChannelGroup` (`channel_group.rs`: `name()`, `comment()`, `source()`, `channels()`, `master_channel()` — local master, or the MDF 4.2 remote master via `cg_cg_master` — `read(name)`, `info()`) → `Channel` (`channel.rs`: `name()`, `unit()`, `comment()`, `source()`, `conversion()`, `decoded_values()` → `Vec<Option<DecodedValue>>`, `values()` → `Vec<f64>`, `info()`). `Mdf::find_channel(name, group)` returns a `Channel`.
+- All block-wrapper types carry lifetime `'a` tied to the memory-mapped file owned by `Mdf`
 
 ### 2. Writer Module (`src/writer/mdf_writer/`)
-- Split into three files: `init.rs` (structure creation and linking), `data.rs` (record encoding and DT block management), `io.rs` (low-level file I/O, alignment, link patching)
+- Split into `init.rs` (structure creation and linking), `data.rs` (record encoding and DT block management), `io.rs` (low-level file I/O, alignment, link patching), `vlsd.rs` and `simple.rs`
 - Guarantees: little-endian encoding, 8-byte alignment, zero-padding
-- Closure-based builder pattern for channel/channel group configuration
+- `simple.rs` holds the **contract writer API** (name-based, shared by all three languages): `set_start_time(ns)`, `add_channel_group(name)`, `add_channel(group, name, DataType)`, `add_time_channel` / `add_float_channel` / `add_float32_channel` / `add_int_channel` / `add_sint_channel` / `add_string_channel`, `add_linear_conversion(channel, offset, factor)`, `add_value_to_text_conversion(channel, mapping, default)`, `start_data_block(group)`. Channel linking is tracked by the writer itself (`cg_channel_ids`), so the bindings keep no ID maps.
+- Underneath: the closure-based building blocks `add_channel_group_with(prev, |cg| …)`, `add_channel_with(cg, prev, |ch| …)`, `set_start_time_with(…)`, `write_linear_conversion` / `write_value_to_text_conversion`, `start_data_block_with(dg, cg, record_id_len, channels)` / `start_data_block_for_cg(cg, record_id_len)`
 - Maintains `block_positions: HashMap<String, u64>` for updating block links after writing
 - Auto-splits data blocks when they exceed `MAX_DT_BLOCK_SIZE` (4MB), creating `DataListBlock` chains
 - Supports two I/O backends: `BufWriter<File>` (default, 1MB buffer) and `MmapMut` (via `new_mmap`)
@@ -200,17 +221,15 @@ The codebase is organized into distinct layers. The module structure is defined 
 - `IndexedChannel` - Channel metadata including fully resolved `ConversionBlock` (serializable via serde)
 - `ByteRangeReader` trait - Abstraction for data sources: `read_range(offset, length) -> Vec<u8>`
 - `FileRangeReader` - Built-in local file implementation
-- Public API is **name-based**; positional `(group_index, channel_index)` reads exist only as `pub(crate)` internals.
-- The index remembers its data `Source` (`File(path)` / `Url(url)`), set by `from_file` / `from_url`. The source is **not** serialized (`#[serde(skip)]`) — re-attach after `load_from_file` with `set_file()` / `set_url()` / `set_source()`. Building an index never reads sample data; byte-range reads happen lazily on `read()`.
+- Public API is **name-based** and mirrors `Mdf` (the contract): `groups()`, `group(name)`, `channel(name, group)`, `channel_names()`, `start_time_ns()`, `file_size()`, `read` / `read_with`, `values` / `values_with`, `time_range(name, group)`, `conversion(name, group)` → `ConversionInfo`. Positional `(group_index, channel_index)` reads exist only as `pub(crate)` internals (`locate_opt` / `locate_checked`). The raw indexed structures stay reachable through the public `channel_groups` field, `indexed_channel(name, group)` and `conversion_block(name, group)`.
+- The index remembers its data `Source` (`File(path)` / `Url(url)`), set by `from_file` / `from_url`. The source is **not** serialized (`#[serde(skip)]`) — re-attach after `load` with `set_source(path_or_url)` (`impl From<&str> for Source` autodetects `http(s)://`); `clear_source()` detaches it. Building an index never reads sample data; byte-range reads happen lazily on `read()`.
 - Key capabilities:
-  - `from_file()` / `from_bytes()` / `from_range_reader()` / `from_url()` (http) / `save_to_file()` / `load_from_file()` / `to_json()` / `from_json()` - Create, persist, and reload JSON indexes
-  - Metadata navigation: `groups()`, `group(name)`, `channel(name)`, `channel_in(group, name)`, `channel_names()`, `find_channels(name)`; `IndexedChannelGroup::channel(name)` / `channel_names()` / `master_channel()`; `IndexedChannel::is_master()` / `is_vlsd()`
-  - Lazy reads via the attached source: `read(name)` / `read_in(group, name)` return a [`Signal`](src/signal.rs) (values paired with the group master/time axis); `source()` / `set_file()` / `set_url()` / `set_source()` manage the source
-  - Explicit/custom readers: bind with `open(reader)` / `open_file(path)` → returns an `MdfReader` with `values(name)` / `values_in()` / `values_f64()` / `signal(name)` / `signal_in()`; windowed reads `signal_records(_in)(name, start, count)` and `signal_between(_in)(name, t_start, t_end)` (the time window is found by a 16-way search over single master records, `MdfIndex::record_window_for_time`, then only the window's records are read); `reader_mut()` / `into_inner()` expose the underlying `ByteRangeReader`
+  - `from_file()` / `from_bytes()` / `from_range_reader()` / `from_url()` (http) / `save()` / `load()` / `to_json()` / `from_json()` / `validate()` - Create, persist, and reload JSON indexes
+  - Lazy reads via the attached source: `read` / `values` (whole channel) and `read_with` / `values_with` with `ReadOptions` (group filter, time window or record window). A window goes through `MdfIndex::resolve_window` (the time window is found by a 16-way search over single master records, `record_window_for_time`) and reads only the window's records via the private `SourceReader` enum
+  - Explicit/custom readers: bind with `open(reader)` / `open_file(path)` → returns an `MdfReader` with the same `read` / `read_with` / `values` / `values_with` / `time_range` methods (plus `decoded_values(name, group)`); `reader_mut()` / `into_inner()` expose the underlying `ByteRangeReader`
   - `IndexedChannel.comment` holds the channel comment (read by both local and remote builds; `#[serde(default)]` so older JSON loads). Virtual channels (`cn_type` 3 master / 6 data, `IndexedChannel::is_virtual`) read as the record index through their conversion, in the index and in `api::Channel`; `is_master()` includes `cn_type` 3
-  - Byte ranges (power-user / partial reads): `byte_ranges(name)`, `byte_ranges_in(group, name)`, `byte_ranges_for_records(name, start, count)` — refused for VLSD channels, whose offset indirection a static range cannot express (use `read()` / `values()` instead)
-  - Conversions: local builds (`from_file` / `from_bytes`) resolve them eagerly into `IndexedChannel.conversion`, so reads can apply them with empty `file_data` (`&[]`). Remote / range-reader builds (`from_url` / `from_range_reader`) **defer** resolution — they record only `IndexedChannel.conversion_addr` and fetch + resolve the conversion block lazily on the first value read (so building an index never pays for conversion blocks you never read). Read paths prefer a resolved `conversion` and otherwise resolve via `conversion_addr` through the reader; `MdfIndex::conversion(name)` resolves one on demand via the attached source. `CachingRangeReader` in bypass mode now serves reads already covered by cached metadata chunks, so a lazily-resolved conversion block that was pulled in during the walk stays free.
-- `Signal` (`src/signal.rs`) is the Rust equivalent of a pandas `Series`: `{ name, unit, timestamps: Vec<f64>, values: Vec<Option<DecodedValue>> }`, with `values_f64()` / `has_timestamps()`. Produced by `MDF::signal()`, `ChannelGroup::signal()`, `MdfReader::signal()`, and `MdfIndex::read()`.
+  - Byte ranges (power-user / partial reads): `byte_ranges(name, group)`, `byte_ranges_for_records(name, start, count, group)` — refused for VLSD channels, whose offset indirection a static range cannot express (use `read()` / `values()` instead)
+  - Conversions: local builds (`from_file` / `from_bytes`) resolve them eagerly into `IndexedChannel.conversion`, so reads can apply them with empty `file_data` (`&[]`). Remote / range-reader builds (`from_url` / `from_range_reader`) **defer** resolution — they record only `IndexedChannel.conversion_addr` and fetch + resolve the conversion block lazily on the first value read (so building an index never pays for conversion blocks you never read). Read paths prefer a resolved `conversion` and otherwise resolve via `conversion_addr` through the reader; `MdfIndex::conversion(name, group)` resolves one on demand via the attached source. `CachingRangeReader` in bypass mode now serves reads already covered by cached metadata chunks, so a lazily-resolved conversion block that was pulled in during the walk stays free.
 
 ### 6. File Operations
 - `column.rs` - `to_column_oriented(input, output, &ColumnOptions)` (also `to_column_oriented_with(reader, sink, opts)` over any `ByteRangeReader` + `ColumnSink`, and `to_column_oriented_bytes`): rewrites any uncompressed MDF 4 file (sorted or unsorted) as a column-oriented **MDF 4.20** file — one DG/CG/CN per signal, the source group's master written once into its own "time group" and referenced via the remote-master link (byte-identical time axes across groups are merged when `share_identical_time`), every non-data block at the front (attachments at the end), each signal's `##DV` (`##DT` when it carries an invalidation byte) blocks back to back with whole records, a payload that is a multiple of 8 (no padding between blocks), and **always** an equal-length `##DL` (even for one block) so block sizes are derivable from metadata. Two phases: plan + lay out everything from metadata, then stream the source once (record-aligned chunks; records may straddle blocks) into per-channel buffers flushed to precomputed offsets. Raw bytes are copied (no decoding); VLSD `##SD` streams are copied verbatim as one `##SD` right after the signal's records so inline offsets stay valid. Skips `##CA` array channels and VLSD-CG channels (reported in `ColumnReport::skipped_channels`); rejects `##DZ`
@@ -219,6 +238,8 @@ The codebase is organized into distinct layers. The module structure is defined 
 
 ### 7. Error Handling (`src/error.rs`)
 - `MdfError` enum using `thiserror`:
+  - `ChannelNotFound { name, group }` - Raised by every data operation for an unknown channel (the contract's one error rule); build with `MdfError::channel_not_found(name, group)`
+  - `InvalidArgument` - Unusable `ReadOptions` (mixed windows, record window past the end) or an unknown data-type name
   - `TooShortBuffer` - Insufficient bytes for parsing (includes file/line for debugging)
   - `FileIdentifierError` / `FileVersioningError` - Invalid MDF file header
   - `BlockIDError` - Wrong block type encountered
@@ -229,26 +250,28 @@ The codebase is organized into distinct layers. The module structure is defined 
 ### 8. Python Bindings (`src/python.rs`)
 - Built only when `pyo3` feature is enabled (configured in `pyproject.toml` via `[tool.maturin] features = ["pyo3"]`)
 - Uses PyO3 0.21 with extension-module feature
-- The Python-visible names drop the `Py` prefix (set via `#[pyclass(name = "…")]`); the Rust struct names keep the `Py` prefix internally. **All navigation is by name — there are no `(group_index, channel_index)` arguments in the Python API.**
-- **`read(name, group=None)` returns a `pandas.Series`** (channel values, conversions applied, indexed by the group master converted to a `DatetimeIndex`). **`values(name, group=None)` returns a plain numpy `float64` array** (no timestamps, pandas-free; conversions applied, invalid samples are NaN — identical semantics to `MdfIndex.values`). `__getitem__` is `read`.
-- Main classes:
-  - `Mdf` (struct `PyMDF`) - Wraps `MDF`; `groups` property (each `GroupInfo` carries its `channels`), `group(name)`, `channel(name)`, `channel_names`; reads: `read()` → Series, `values()` → numpy, `__getitem__`, `file_layout()`
-  - `MdfWriter` (struct `PyMdfWriter`) - Wraps `MdfWriter`; manages ID mapping between Python and Rust IDs; provides `add_time_channel()`, `add_float_channel()`, `add_int_channel()` convenience methods (writer API unchanged in the redesign)
-  - `to_column_oriented(input_path, output_path, block_size=None, memory_budget=None, share_identical_time=None)` → `ColumnReport` (GIL released)
-  - `MdfIndex` (struct `PyMdfIndex`) - Wraps `MdfIndex`; `from_file()` / `load()` / `from_url()` / `save()`; navigation (`groups`, `group`, `channel`, `channel_names`, `groups_with_channel`); **carries its data `source`** (settable `source` property, autodetecting `http(s)://` URLs vs file paths, plus `set_source()`); **lazy** `read()` → Series and `values()` → numpy (range request happens on read, GIL released); `byte_ranges()` / `byte_ranges_for_records()`; `conversion_info(name)`. (There is no separate `MdfData` class — the index *is* the bound reader.)
-  - `ChannelInfo`, `GroupInfo`, `DecodedValue`, `DataType`, `FileLayout`/`BlockInfo`/`LinkInfo`/`GapInfo` - Data transfer / inspection types
-- Helper functions: `create_float_value()`, `create_uint_value()`, `create_int_value()`, `create_string_value()`, `create_data_type_*()` factory functions
-- Custom `MdfException` Python exception type
-- Returns native Python types (float, int, str, bytes) via `decoded_value_to_pyobject()` for zero-copy efficiency
-- Pandas DatetimeIndex support: converts relative master channel times to absolute timestamps using the MDF file's start time
+- A **thin shell over the Rust contract API** — every class and method is one entry of `docs/api-contract.json`. The Python-visible names drop the `Py` prefix (set via `#[pyclass(name = "…")]`).
+- Classes:
+  - `Mdf` (struct `PyMDF`) - `from_file` / `from_bytes` / `from_url` (static; there is no constructor), properties `groups` / `channel_names` / `start_time_ns`, `group(name)`, `channel(name, group=None)`, `read(name, group=None, start_time=None, end_time=None, start_record=None, record_count=None)` → `Signal`, `values(...)` → numpy `float64`, `__getitem__` (= `read`), `time_range(name, group=None)` → `(start, end)`, `conversion(name, group=None)` → dict, `file_layout()`
+  - `MdfIndex` (struct `PyMdfIndex`) - the same reading API, plus `from_json` / `load` / `to_json` / `save` / `validate`, properties `file_size` / `source` (read-only; change with `set_source(path_or_url_or_None)`), `byte_ranges(name, group=None)`, `byte_ranges_for_records(name, start_record, record_count, group=None)`. Reads release the GIL.
+  - `MdfWriter` (struct `PyMdfWriter`) - delegates to the Rust contract writer; IDs are the Rust ids. `write_record(group, values)` takes **plain Python values** coerced per channel data type (`record_value`); `write_columns(group, columns)` infers each numpy array's dtype (`float64` / `float32` / `uint64` / `int64`). Also `set_start_time`, `add_linear_conversion`, `add_value_to_text_conversion`. `add_channel(group, name, data_type)` takes the canonical data-type **string** (`DataType::from_name`).
+  - `Signal` (struct `PySignal`) - `name`, `unit`, `timestamps` (numpy `float64`), `values` (numpy `float64`, or an `object` array for text/bytes), `__len__`, `to_series()` (pandas Series; `DatetimeIndex` from a Rust-computed `datetime64[ns]` array when the file has a start time)
+  - `GroupInfo`, `ChannelInfo` (`data_type` is a string), `ColumnReport`, `FileLayout`/`BlockInfo`/`LinkInfo`/`GapInfo`
+- Functions: `to_column_oriented(input_path, output_path, block_size=None, memory_budget=None, share_identical_time=None)` → `ColumnReport` (GIL released), `cut_mdf_by_time`, `cut_mdf_by_utc`, `merge_files`
+- Exceptions: `MdfException` (base) and `ChannelNotFoundError(MdfException)`, mapped in `impl From<MdfError> for PyErr`
+- There are **no** `DecodedValue` / `DataType` wrapper classes and no `create_*` helper functions any more.
+- pyo3-stub-gen 0.7 cannot handle `#[pyo3(signature = …)]` defaults, so trailing `Option<T>` arguments rely on PyO3 0.21's implicit `None` default and `src/bin/stub_gen.rs` post-processes the stub to add `= None` and the exception classes.
 
 ### 9. WebAssembly / TypeScript Bindings (`src/wasm.rs` + `js/`)
 - `src/wasm.rs` is built only when the `wasm` feature is enabled (wasm-bindgen + js-sys + serde-wasm-bindgen); it also compiles on native targets for IDE friendliness
-- Mirrors the **name-based** API philosophy of the Python bindings: `Mdf` (in-memory reader from bytes), `MdfIndex` (self-contained index + fragment-based reads), `MdfWriter` (in-memory writer producing a `Uint8Array`)
+- A thin shell over the Rust contract API, like the Python bindings: `Mdf` (in-memory reader from bytes), `MdfIndex` (self-contained index + fragment-based reads), `MdfWriter` (in-memory writer producing a `Uint8Array`, delegating to the Rust contract writer). Contract types (`GroupInfo`, `ChannelInfo`, `ConversionInfo`, `TimeRange`) are serialised straight from `src/types.rs` via `to_js`
 - Column-oriented conversion: `toColumnOriented(bytes, options)` → `{ bytes, report }` and `toColumnOrientedStream(size, read, write, options)` over **synchronous** JS callbacks (`JsCallbackReader` / `JsCallbackSink`); the TS wrapper (`js/src/column.ts`) adds `toColumnOrientedFile` (Node, sync `fs` I/O, only in the `.` entry)
 - The wasm module has no filesystem/network access — I/O lives on the JS side. `MdfIndex` exposes `signalByteRanges()` + `valuesFromFragments()`/`readFromFragments()` so callers fetch bytes themselves and pass fragments in, and `readWindowStep()` (record/time windows, driven by a gap-reporting loop like `conversionRangesStep`)
-- The TS `MdfIndex` **remembers its source** (`fromUrl`/`fromRangeSource`/`fromBytes`/`fromFile` bind it; `setSource()` / `fromJson(json, source)`), so `values(name)` / `read(name)` need no source; both also accept a `ReadOptions` object (`group`, `source`, `startTime`/`endTime` or `startRecord`/`recordCount`). `timeRange(name)` reads two records. `conversionInfo(name)` (TS `Mdf` and `MdfIndex`) returns the resolved conversion as `{ type, values, precision, flags, physicalRange?, formula?, texts?, refs?, default? }` (`ConversionInfoJs` in `src/wasm.rs`; map keys are stringified `cc_ref` indices); the index side is driven by the wasm `conversionStep` gap loop. The TS writer has `addLinearConversion` / `addValueToTextConversion` (Rust `MdfWriter::add_linear_conversion` / `add_value_to_text_conversion`); `api::Channel::conversion()` returns a channel's resolved conversion
-- **No `node:` imports in modules reachable from `src/web.ts`** — webpack 5 fails on them even inside dynamic `import()`. Node-only code lives in `node-platform.ts` (registers the `fs` reader behind `Mdf.fromFile`/`MdfIndex.fromFile` via `platform.ts`), `file-range-source.ts` and `column-file.ts`, imported only by `src/index.ts`; `test/window.test.ts` enforces this
+- The TS classes implement the contract in camelCase. `Mdf` and `MdfIndex` share `groups()` / `group(name)` / `channel(name, group?)` / `channelNames()` / `startTimeNs()` / `read(name, options?)` / `values(name, options?)` / `timeRange(name, group?)` / `conversion(name, group?)`; `options` is a `ReadOptions` object (`group`, `startTime`/`endTime` or `startRecord`/`recordCount`, and on `MdfIndex` a per-call `source`). There are **no positional group/source arguments**. `Mdf` windows are sliced in Rust (`read_options` → `Mdf::read_with`); `MdfIndex` windows go through the wasm `readWindowStep` gap loop, which validates via the same `ReadOptions::window()`.
+- The TS `MdfIndex` **remembers its source** (`fromUrl`/`fromRangeSource`/`fromBytes`/`fromFile` bind it; `source()` / `setSource()` / `fromJson(json, source)` / `load(path, source)`); `save(path)` / `load(path)` are Node-only (via `platform.ts`). `conversion(name)` on the index is driven by the wasm `conversionStep` gap loop. Map keys of `ConversionInfo.texts` / `refs` are stringified `cc_ref` indices.
+- `js/src/errors.ts`: `ChannelNotFoundError`, and `guard()` which maps the core's "Channel '…' not found" message to it; `MdfIndex` checks the channel up front (`#requireChannel`).
+- The TS writer has every contract method including `setChannelGroupComment` and `writeColumns` (typed arrays: `Float64Array` / `Float32Array` / `BigUint64Array` / `BigInt64Array`); `addChannel` takes canonical data-type names only (`DataType::from_name`) and writes text types as VLSD.
+- **No `node:` imports in modules reachable from `src/web.ts`** — webpack 5 fails on them even inside dynamic `import()`. Node-only code lives in `node-platform.ts` (registers the `fs` reader/writer behind `Mdf.fromFile`/`MdfIndex.fromFile`/`load`/`save` via `platform.ts`), `file-range-source.ts` and `column-file.ts`, imported only by `src/index.ts`; `test/window.test.ts` enforces this
 - `js/` is the npm package (`mf4-rs`): a typed TypeScript wrapper (`js/src/`) over the generated wasm-bindgen module, adding convenience constructors (`Mdf.fromFile`, `Mdf.fromUrl`, `MdfIndex.fromFile`, `MdfIndex.fromRangeSource`, `MdfIndex.fromUrl`) and the pluggable `RangeSource` abstraction (`FetchRangeSource`, `FileRangeSource`, `BytesRangeSource`) for lazy remote reads. `MdfIndex.fromUrl`/`fromRangeSource` build the index **fetching only metadata** (never the sample data), mirroring the native `MdfIndex::from_url`: the wasm `MdfIndex.buildIndexStep` runs the native `from_range_reader` walk against a record-replay reader and reports the next byte range it needs, and the JS wrapper loops fetching those ranges (seed prefix + look-ahead) until the index is built
 - Two entry points share the same wrapper classes: `mf4-rs` (the `.` export) loads the synchronous `pkg-node/` (`--target nodejs`) build via `src/wasm-module-node.ts`; `mf4-rs/web` (the `./web` export, `src/web.ts`) loads the async `pkg-web/` (`--target web`) build and adds an `init()` that must be awaited once before use. The shared `src/wasm-module.ts` holds no target-specific loader (`getWasmModule()` + `registerWasmLoader`/`setWasmModule`) so bundling the web entry never pulls in the Node `require` of `pkg-node`. The web ESM output is post-processed (`scripts/fix-web-esm.mjs`) to carry explicit `.js` extensions so it runs natively (browser/Deno) as well as through bundlers
 - Built with `wasm-pack build --target nodejs` **and** `--target web` (see `js/package.json` scripts); tests run with Node's built-in test runner (`npm test`, Node >= 18), including a headless run of the `mf4-rs/web` build
@@ -260,15 +283,15 @@ The codebase is organized into distinct layers. The module structure is defined 
 The parser never loads entire files into memory. `MdfFile` uses `memmap2::Mmap` (created with `unsafe { Mmap::map(&file) }`). All parsing operates on `&[u8]` slices into the mmap. The `MdfFile` struct owns the `Mmap`; `RawDataGroup`, `RawChannelGroup`, and API types borrow from it.
 
 ### Lazy Evaluation
-Channel groups, channels, and values are lightweight wrappers holding references. `Channel::values()` is the only method that actually decodes sample data - it iterates over raw records and calls the decoder. Don't break this pattern by eagerly loading data.
+Channel groups, channels, and values are lightweight wrappers holding references. `read` / `values` (and underneath them `Channel::decoded_values()` / `Channel::values()`) are the only calls that decode sample data — `groups()` and the other metadata calls never do. Don't break this pattern by eagerly loading data.
 
 ### Block Linking
 MDF files use absolute file offsets as addresses between blocks (e.g., `HeaderBlock.first_dg_addr` points to the first data group). The writer uses a `HashMap<String, u64>` mapping logical IDs (like `"dg_0"`, `"cg_1"`, `"cn_3"`) to file positions, and patches links after blocks are written using `update_block_link()` which seeks back and writes the target address.
 
 ### Builder Pattern for Writer
-Channels and channel groups are configured using closures that receive a mutable reference to a default block:
+The contract writer methods (`add_float_channel(&cg, "Temperature")`, …) cover the common cases. Underneath, the `*_with` building blocks configure channels and channel groups using closures that receive a mutable reference to a default block:
 ```rust
-writer.add_channel(&cg, parent, |ch| {
+writer.add_channel_with(&cg, parent, |ch| {
     ch.data_type = DataType::FloatLE;
     ch.name = Some("Temperature".to_string());
     ch.bit_count = 64;
@@ -321,10 +344,10 @@ Channels with `channel_type == 1` and a non-zero `data` field store variable-len
 ## Important Implementation Notes
 
 ### Module System Quirk
-`src/lib.rs` declares `api` and `parsing` modules inline (lines 14-27), which **overrides** any `mod.rs` files in those directories. The `src/api/mod.rs` file exists but is dead code - its re-exports reference non-existent modules. When adding new modules to `api` or `parsing`, add them to `lib.rs`, not to `mod.rs` files.
+`src/lib.rs` declares the `api` and `parsing` modules inline, so there are no `mod.rs` files in those directories. When adding new modules to `api` or `parsing`, add them to `lib.rs`. The crate-root `pub use` list in `lib.rs` is part of the contract (`module_exports.rust` in `docs/api-contract.json`).
 
 ### When Modifying the Parser
-- Maintain lifetime `'a` relationships: `MDF` owns `MdfFile` which owns `Mmap`; `ChannelGroup<'a>` and `Channel<'a>` borrow from it
+- Maintain lifetime `'a` relationships: `Mdf` owns `MdfFile` which owns `Mmap`; `ChannelGroup<'a>` and `Channel<'a>` borrow from it
 - Block addresses are absolute file offsets (u64); address 0 means "null/none"
 - Channel names and conversions are resolved lazily during `MdfFile::parse_from_file()` - conversions are resolved per-channel via `resolve_conversion()`, names are not resolved until explicitly requested
 
@@ -358,11 +381,11 @@ Channels with `channel_type == 1` and a non-zero `data` field store variable-len
 - When adding new conversion types, update both the `ConversionType` enum and the dispatcher in `logic.rs`
 
 ### Python Bindings
-- All Python wrapper types are prefixed with `Py` (e.g., `PyMDF`, `PyMdfWriter`, `PyMdfIndex`)
-- `PyMdfWriter` maintains its own ID mapping (`channel_groups`, `channels`, `last_channels` HashMaps) separate from the Rust writer's internal IDs
-- Values cross the Python boundary as native types via `decoded_value_to_pyobject()` for efficiency
-- The `PyMDF` class boxes the `MDF` to avoid lifetime issues (`mdf: Box<MDF>`)
-- Pandas integration: `create_datetime_index()` converts relative times to absolute timestamps using `pd.to_datetime()` and `pd.Timedelta`
+- All Python wrapper structs are prefixed with `Py` (e.g., `PyMDF`, `PyMdfWriter`, `PyMdfIndex`, `PySignal`)
+- Keep them thin: convert arguments (`ReadOptions::from_parts`), call the Rust contract method, convert the result (`PySignal::new`, `conversion_to_py`, `time_range_to_py`). No lookup or decoding logic belongs here.
+- `PyMdfWriter` keeps only a per-group cache of channel data types (`record_types`, filled by `start_data_block`) to coerce plain Python values in `write_record`
+- The `PyMDF` class boxes the `Mdf` to avoid lifetime issues (`mdf: Box<Mdf>`)
+- After changing a signature or docstring, regenerate and commit the stubs (`cargo run --features pyo3 --bin stub_gen`); CI fails when they are stale
 
 ## Dependencies
 
@@ -399,7 +422,10 @@ source .venv/bin/activate
 pip install asammdf pandas numpy
 maturin develop --release
 
-# Run 14 cross-library tests (asammdf <-> mf4-rs)
+# API contract (public names + Mdf/MdfIndex parity) — run after ANY binding change
+python tests/test_api_contract.py
+
+# Run the cross-library tests (asammdf <-> mf4-rs)
 python tests/test_asammdf_interop.py
 ```
 The Python tests exit 0 if dependencies are missing (so CI won't fail without asammdf installed). When dependencies are available, all 14 tests must pass.
@@ -415,6 +441,7 @@ npm test             # Node built-in test runner over js/test/*.test.ts (compile
 These same steps run automatically (via `prepublishOnly`) in the release workflow's `publish-npm` job — a failing js test aborts the npm publish.
 
 ### Integration Tests (`tests/`)
+- `api_contract.rs` - **Cross-language contract guard**: public methods of `Mdf` / `MdfIndex` / `MdfWriter`, contract type fields and crate-root exports must equal `docs/api-contract.json`; `Mdf`, `MdfIndex` (fresh and from JSON) and `MdfReader` must give identical metadata, signals, windows, time ranges, conversions and errors. Python twin: `tests/test_api_contract.py`; TypeScript twin: `js/test/contract.test.ts`
 - `api.rs` - Writer/parser round-trip, data writing, bulk records, block positions, time-based cutting
 - `blocks.rs` - Serialization round-trips for all major block types
 - `index.rs` - Index creation, JSON persistence, metadata queries, byte range calculations, name-based lookups
@@ -422,7 +449,7 @@ These same steps run automatically (via `prepublishOnly`) in the release workflo
 - `test_invalidation_bits.rs` - Invalidation flag shortcuts, bit position checking, flag priority, edge cases
 - `cross_compatibility.rs` - **Spec-compliance and regression tests** (10 tests): float32/float64 roundtrip, signed/unsigned integer boundary values, multi-group with master channels, data block splitting (##DL) for 300K records, value-to-text conversions, performance (100K records < 10s), file identification block validation, master channel type/sync verification
 - `enhanced_index_conversions.rs` - Index with text conversions, conversion dependency resolution, index persistence with resolved data
-- `column.rs` - Column-oriented conversion: round-trips via `MDF`, local/range-reader/JSON indexes, layout invariants (metadata prefix, contiguous blocks), tiny memory budget, sharing on/off, re-conversion of a 4.20 file, hand-built unsorted input, `##DZ` rejection, range-request/byte counts (`CountingReader`) and a real-HTTP `from_url` test (`http` feature)
+- `column.rs` - Column-oriented conversion: round-trips via `Mdf`, local/range-reader/JSON indexes, layout invariants (metadata prefix, contiguous blocks), tiny memory budget, sharing on/off, re-conversion of a 4.20 file, hand-built unsorted input, `##DZ` rejection, range-request/byte counts (`CountingReader`) and a real-HTTP `from_url` test (`http` feature)
 
 ### Python Column-Oriented Tests (`tests/test_column_oriented.py`)
 asammdf-built sources (incl. a VLSD string and a linear conversion) → `to_column_oriented` → asammdf reads the 4.20 output identically (independent check of the remote-master encoding), `Mdf`/`MdfIndex` read identically, HTTP `from_url` request counts. Exits 0 when asammdf/numpy are missing.
@@ -450,10 +477,11 @@ asammdf-built sources (incl. a VLSD string and a linear conversion) → `to_colu
 
 1. **Don't eagerly load data** - Respect the lazy evaluation pattern; `channel.values()` is the decode trigger
 2. **Block alignment** - Writer must maintain 8-byte alignment; `write_block()` handles this automatically
-3. **Lifetime management** - API types borrow from `MdfFile`'s mmap; don't try to return them from functions that don't hold the `MDF`
+3. **Lifetime management** - API types borrow from `MdfFile`'s mmap; don't try to return them from functions that don't hold the `Mdf`
 4. **Address updates** - When modifying writer, ensure block links are updated correctly; forgetting to patch a link produces a broken file
 5. **Endianness** - The library enforces little-endian encoding for writing; reading supports both LE and BE data types
-6. **Module declarations** - `api` and `parsing` modules are declared inline in `lib.rs`; don't modify `api/mod.rs` expecting it to take effect
+6. **Module declarations** - `api` and `parsing` modules are declared inline in `lib.rs`; add new modules there
+10. **API drift** - never change the public surface of one language alone; see *Cross-Language API Contract* at the top
 7. **Conversion resolution** - When creating indexes, conversions must be resolved with the file's mmap available; after serialization, they work without file data
 8. **Data block splitting** - Don't assume a single DT block per channel group; the writer may create multiple fragments linked by a DL block
 9. **Record ID** - Many simple files use `record_id_len = 0`, but the code must handle non-zero values (used when multiple channel groups share a data group)
@@ -474,7 +502,7 @@ This section documents tested interoperability and differences between `mf4-rs` 
 |--------|--------|---------|
 | **Default float precision** | 32-bit (`default_bits()` returns 32 for FloatLE) | 64-bit (uses numpy float64) |
 | **Master channel** | User-created channel marked as master via `set_time_channel()` | Auto-generates a separate lowercase `time` channel per group |
-| **Channel group name** | `PyMdfWriter.add_channel_group(name)` accepts a name parameter but **does not write it** to the file (the closure `\|_cg\| {}` ignores it) | Writes `comment` and `acq_name` to `##CG` metadata block |
+| **Channel group name** | `add_channel_group(name)` writes the name as the `##CG` acquisition name (`##TX`); `set_channel_group_comment` writes the comment | Writes `comment` and `acq_name` to `##CG` metadata block |
 | **File header timestamp** | Set to current time by `init_mdf_file` (override with `set_start_time`) | Sets to current time at file creation |
 | **File history (`##FH`)** | Not written | Writes `##FH` block with tool info |
 | **Metadata blocks (`##MD`)** | Not written | Writes XML `##MD` blocks for group comments |
@@ -504,9 +532,9 @@ This section documents tested interoperability and differences between `mf4-rs` 
 
 | Class | mf4-rs | asammdf |
 |-------|--------|---------|
-| Reader | `Mdf` - name-based (`groups`, `group`, `channel`, `read`→Series, `values`→numpy, `__getitem__`) | `MDF` - 58+ methods |
-| Writer | `MdfWriter` - 11 methods | `MDF.append()` + `Signal` (numpy-based) |
-| Index | `MdfIndex` - name-based, source-aware (`from_url`/`source`), lazy `read`→Series / `values`→numpy | No equivalent |
+| Reader | `Mdf` - name-based contract API (`groups`, `group`, `channel`, `read`→`Signal`, `values`→numpy, `time_range`, `conversion`, `__getitem__`) | `MDF` - 58+ methods |
+| Writer | `MdfWriter` - 19 contract methods | `MDF.append()` + `Signal` (numpy-based) |
+| Index | `MdfIndex` - name-based, source-aware (`from_url`/`source`), lazy `read`→`Signal` / `values`→numpy, windowed reads | No equivalent |
 
 ### Performance (100K records, 4 x f64 channels)
 
@@ -525,13 +553,13 @@ Measured 2026-07 with 1M records × 4 f64 channels + time (see `review/bench.py`
 
 | Operation | mf4-rs Python bindings | asammdf |
 |-----------|------------------------|---------|
-| Write bulk (`write_columns_f64` / `append+save`) | ~0.06s | ~0.3-0.5s |
+| Write bulk (`write_columns` / `append+save`) | ~0.06s | ~0.3-0.5s |
 | Write record-at-a-time loop | ~1.2-1.4 µs/record | n/a |
 | Read 4 channels → numpy (`values` / `.samples`) | ~0.03-0.05s | ~0.1s |
-| Read 4 channels → pandas Series (`read`, DatetimeIndex) | ~0.15-0.19s | n/a (raw seconds only) |
+| Read 4 channels → pandas Series (`read().to_series()`, DatetimeIndex) | ~0.15-0.19s | n/a (raw seconds only) |
 | Cold single-channel read (JSON index vs open+get) | ~0.007s | ~0.03s |
 
-`read()` builds numeric Series through a numpy fast path and constructs the
+`read()` builds numeric signals through a numpy fast path and `to_series()` constructs the
 DatetimeIndex from a Rust-computed `datetime64[ns]` array; only channels with
 text/bytes values fall back to per-object conversion. `Mdf.read`/`Mdf.values`
 release the GIL during decoding.
@@ -539,7 +567,6 @@ release the GIL during decoding.
 ### Recommended Improvements Based on Comparison
 
 1. **Compression support**: Add `##DZ` block reading (deflate decompression) - this is the most impactful missing feature for reading real-world MDF files
-2. **64-bit float default**: The Python `add_float_channel()` writes 64-bit; the generic `add_channel` with `create_data_type_float_le()` still defaults to 32 bits via `default_bits()`
-3. **Channel group metadata**: The `add_channel_group(name)` parameter is silently ignored - either implement it or remove the parameter
-4. **File history block**: Write a `##FH` block for tool identification and traceability (the header timestamp is now written; `##FH` is still absent)
-5. **Unsorted files via index**: index-based VLSD reads are now supported (string/byte-array VLSD channels resolve through `read()` / `values()`; `byte_ranges()` still refuses them). Unsorted data groups are still refused with a clear error; implementing them would unlock CANedge-style bus logs
+2. **64-bit float default**: `add_float_channel()` writes 64-bit; the generic `add_channel` with `FloatLE` still defaults to 32 bits via `default_bits()`
+3. **File history block**: Write a `##FH` block for tool identification and traceability (the header timestamp is now written; `##FH` is still absent)
+4. **Unsorted files via index**: index-based VLSD reads are now supported (string/byte-array VLSD channels resolve through `read()` / `values()`; `byte_ranges()` still refuses them). Unsorted data groups are still refused with a clear error; implementing them would unlock CANedge-style bus logs

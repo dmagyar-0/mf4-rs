@@ -4,6 +4,10 @@ Ergonomic TypeScript wrapper over the `mf4-rs` WebAssembly bindings for
 reading and writing ASAM MDF 4 (Measurement Data Format) files — the format
 used by CANedge, Vector, ETAS, and most automotive/industrial data loggers.
 
+**The API is the same as the Rust crate and the Python package** — the same
+classes, methods and types, in `camelCase`. It is specified in
+[`docs/API.md`](../docs/API.md) and enforced by `test/contract.test.ts`.
+
 This package sits on top of a generated `wasm-bindgen` module (`pkg-node/`)
 and adds:
 
@@ -82,7 +86,7 @@ const mdf = await Mdf.fromFile("./measurement.mf4");
 
 console.log(mdf.channelNames());
 for (const group of mdf.groups()) {
-  console.log(group.name, group.recordCount, group.channels.map((c) => c.name));
+  console.log(group.name, group.recordCount, group.channelNames);
 }
 
 // Plain numeric array (fast path, conversions applied, invalid -> NaN)
@@ -91,6 +95,9 @@ const speed = mdf.values("VehicleSpeed");
 // Values paired with the group's time axis
 const signal = mdf.read("VehicleSpeed");
 console.log(signal.timestamps, signal.values);
+
+// Narrow by group and/or read only a time or record window
+mdf.read("VehicleSpeed", { group: "Group1", startTime: 1.0, endTime: 2.5 });
 
 mdf.dispose();
 ```
@@ -106,9 +113,8 @@ writer.initMdfFile();
 writer.setStartTime(BigInt(Date.now()) * 1_000_000n); // ns since epoch
 
 const group = writer.addChannelGroup("Group1");
-const time = writer.addTimeChannel(group, "Time");
+writer.addTimeChannel(group, "Time");          // master channel, add it first
 writer.addFloatChannel(group, "VehicleSpeed");
-writer.setTimeChannel(time);
 
 writer.startDataBlock(group);
 for (let i = 0; i < 1000; i++) {
@@ -137,11 +143,11 @@ const indexJson = index.toJson(); // ship this to the client
 index.dispose();
 
 // --- Client (only has a URL and the JSON index) ---
-const clientIndex = MdfIndex.fromJson(indexJson);
 const source = new FetchRangeSource("https://example.com/measurement.mf4");
+const clientIndex = MdfIndex.fromJson(indexJson, source);   // or .setSource(source)
 
-const speed = await clientIndex.values("VehicleSpeed", source, "Group1");
-const signal = await clientIndex.read("VehicleSpeed", source, "Group1");
+const speed = await clientIndex.values("VehicleSpeed", { group: "Group1" });
+const signal = await clientIndex.read("VehicleSpeed", { group: "Group1" });
 ```
 
 `MdfIndex.values`/`read` compute the byte ranges the requested channel
@@ -181,10 +187,12 @@ use `fromUrl` when a client wants to open an arbitrary remote file directly.
 
 ```ts
 index.startTimeNs();             // bigint ns since the Unix epoch, or undefined
-index.groups();                  // [{ name, comment, recordCount, masterChannel,
-                                 //    channels: [{ name, unit, comment, dataType,
-                                 //    bitCount, isMaster, isVlsd, hasConversion }] }]
-index.channel("VehicleSpeed");   // one channel's metadata
+index.groups();                  // [{ name, comment, recordCount, channelNames,
+                                 //    masterChannel, channels: [{ name, unit,
+                                 //    comment, dataType, bitCount, isMaster,
+                                 //    isVlsd, hasConversion }] }]
+index.group("Engine");           // one group's metadata, or undefined
+index.channel("VehicleSpeed");   // one channel's metadata, or undefined
 
 // Start/end time of a channel's group (reads just two records):
 const { start, end } = (await index.timeRange("VehicleSpeed"))!;
@@ -200,16 +208,17 @@ const head = await index.values("VehicleSpeed", { startRecord: 0, recordCount: 1
 await index.read("Speed", { group: "Engine", startTime: 10 });
 ```
 
-`Mdf.read` / `Mdf.values` accept the same window options (sliced in memory),
-and `Mdf.timeRange(name)` returns a group's start/end time.
+`Mdf` has exactly the same methods (synchronous, sliced in memory): the
+metadata calls, `read` / `values` with the same options, `timeRange` and
+`conversion`.
 
-Conversions are applied by `values`/`read`; `conversionInfo(name)` shows
+Conversions are applied by `values`/`read`; `conversion(name, group?)` shows
 which one (`null` when the channel has none):
 
 ```ts
-await index.conversionInfo("EngineTemp");
+await index.conversion("EngineTemp");
 // { type: "Linear", values: [-40, 0.5], precision: 0, flags: 0 }
-await index.conversionInfo("Gear");
+await index.conversion("Gear");
 // { type: "ValueToText", values: [0, 1, 2],
 //   texts: { "0": "N", "1": "D", "2": "R", "3": "?" }, ... }
 ```
@@ -217,8 +226,11 @@ await index.conversionInfo("Gear");
 `texts` / nested `refs` are keyed by position in the block's reference list
 (for `ValueToText`, `values[i]` ↔ `texts[i]`, and index `values.length` is
 the default); `formula` holds an `Algebraic` expression. An index built over
-the network fetches the conversion block on demand; `Mdf.conversionInfo` is
+the network fetches the conversion block on demand; `Mdf.conversion` is
 synchronous.
+
+Reading a channel that does not exist throws a `ChannelNotFoundError`;
+`group()` / `channel()` return `undefined` instead.
 
 Timestamps stay `number` seconds **relative to the measurement start** —
 that is how MDF stores them, and a float64 keeps sub-nanosecond precision
@@ -360,34 +372,42 @@ Node classes plus a headless run of the `mf4-rs/web` build).
 
 ## API surface
 
-- `Mdf` — in-memory reader: `fromBytes`, `fromFile` (Node), `fromUrl`,
-  `groups()`, `channelNames()`, `values()`, `read()` (both take a group name
-  or `ReadOptions` window), `timeRange()`, `conversionInfo()`,
-  `startTimeNs()`, `dispose()`.
-- `MdfIndex` — self-contained index + lazy reads: `fromBytes`,
-  `fromJson(json, source?)`, `fromFile` (Node), `fromRangeSource` / `fromUrl`
-  (metadata-only, over a `RangeSource` / HTTP), `source` / `setSource()`,
-  `toJson()`, `validate()`, `groups()`, `channel()`, `channelNames()`,
-  `startTimeNs()`, `fileSize()`, `byteRanges()`, `byteRangesForRecords()`,
-  `signalByteRanges()`, `valuesFromFragments()`, `readFromFragments()`,
-  `values()` / `read()` (lazy; `(name, source?, group?)` or
-  `(name, ReadOptions)`), `timeRange()`, `conversionInfo()`, `dispose()`.
+The full specification, shared with Rust and Python, is
+[`docs/API.md`](../docs/API.md). In short:
+
+- `Mdf` — in-memory reader. Open: `fromFile` (Node), `fromBytes`, `fromUrl`.
+  Metadata: `groups()`, `group(name)`, `channel(name, group?)`,
+  `channelNames()`, `startTimeNs()`. Data: `read(name, options?)`,
+  `values(name, options?)`, `timeRange(name, group?)`,
+  `conversion(name, group?)`. Plus `dispose()`.
+- `MdfIndex` — index + lazy reads, with **the same metadata and data methods**
+  (`async` for data). Open: `fromFile` (Node), `fromBytes`, `fromUrl`,
+  `fromJson(json, source?)`, `load(path, source?)` (Node), `fromRangeSource`.
+  Also: `toJson()`, `save(path)` (Node), `validate()`, `fileSize()`,
+  `source()` / `setSource()`, `byteRanges()`, `byteRangesForRecords()`, and
+  the fragment API `signalByteRanges()`, `valuesFromFragments()`,
+  `readFromFragments()`.
 - `MdfWriter` — in-memory writer: `initMdfFile`, `setStartTime`,
-  `addChannelGroup`, `addChannel`, `addTimeChannel`, `addFloatChannel`,
-  `addFloat32Channel`, `addIntChannel`, `addSintChannel`, `addStringChannel`,
-  `setTimeChannel`, `addLinearConversion`, `addValueToTextConversion`, `startDataBlock`, `writeRecord`, `finishDataBlock`,
-  `finalize()`, `dispose()`. Numeric channels accept `number` or `bigint`
-  record values; string channels (`addStringChannel`) accept `string`.
+  `addChannelGroup`, `setChannelGroupComment`, `addChannel`, `addTimeChannel`,
+  `addFloatChannel`, `addFloat32Channel`, `addIntChannel`, `addSintChannel`,
+  `addStringChannel`, `setTimeChannel`, `addLinearConversion`,
+  `addValueToTextConversion`, `startDataBlock`, `writeRecord`, `writeColumns`,
+  `finishDataBlock`, `finalize()` (returns the file as a `Uint8Array`),
+  `dispose()`.
+- `ReadOptions` — `{ group, startTime, endTime }` or
+  `{ group, startRecord, recordCount }` (plus a per-call `source` on
+  `MdfIndex`).
 - Column-oriented conversion: `toColumnOriented` (in memory),
   `toColumnOrientedStream` (synchronous source/sink callbacks),
   `toColumnOrientedFile` (Node); `ColumnOptions`, `ColumnReport`.
 - `RangeSource` implementations: `FetchRangeSource`, `FileRangeSource`,
   `BytesRangeSource`.
+- Errors: `ChannelNotFoundError`.
 - Helpers: `toAbsoluteNs(timestamps, startTimeNs)`, `mergeByteRanges`,
   `readAllRanges`.
-- Types: `Signal`, `GroupInfo`, `IndexGroupInfo`, `ChannelInfo`,
-  `IndexChannelInfo`, `ConversionInfo`, `ReadOptions`, `ReadWindow`, `TimeRange`, `ByteRange`,
-  `ChannelValue`.
+- Types: `Signal`, `GroupInfo`, `ChannelInfo`, `ConversionInfo`,
+  `ReadOptions`, `ReadWindow`, `TimeRange`, `ByteRange`, `ChannelValue`,
+  `RecordValue`, `ColumnValues`.
 - Entry points: `mf4-rs` (Node, synchronous) and `mf4-rs/web` (browser; adds
   `init()` and re-exports the same classes minus the Node-only
   `FileRangeSource` and `toColumnOrientedFile`).

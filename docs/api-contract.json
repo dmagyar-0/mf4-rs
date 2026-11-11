@@ -1,0 +1,141 @@
+{
+  "$comment": [
+    "The cross-language API contract of mf4-rs: the single source of truth for the",
+    "public names of the Rust crate, the Python package and the TypeScript package.",
+    "Names are snake_case; Rust and Python use them as written, TypeScript camelCases",
+    "them. docs/API.md is the human-readable version. Three tests fail when a binding",
+    "and this file disagree: tests/api_contract.rs, tests/test_api_contract.py and",
+    "js/test/contract.test.ts. Change the API here first, then in all three languages."
+  ],
+  "languages": ["rust", "python", "typescript"],
+  "classes": {
+    "Mdf": {
+      "constructors": ["from_file", "from_bytes", "from_url"],
+      "accessors": ["groups", "channel_names", "start_time_ns"],
+      "methods": ["group", "channel", "read", "values", "time_range", "conversion", "file_layout"],
+      "only": { "file_layout": ["rust", "python"] },
+      "extra": {
+        "rust": ["read_with", "values_with", "channel_groups", "find_channel"],
+        "python": [],
+        "typescript": ["dispose"]
+      }
+    },
+    "MdfIndex": {
+      "constructors": ["from_file", "from_bytes", "from_url", "from_json", "load"],
+      "accessors": ["groups", "channel_names", "start_time_ns", "file_size", "source"],
+      "methods": [
+        "to_json", "save", "validate", "set_source",
+        "group", "channel", "read", "values", "time_range", "conversion",
+        "byte_ranges", "byte_ranges_for_records"
+      ],
+      "only": {},
+      "extra": {
+        "rust": [
+          "read_with", "values_with", "clear_source", "from_url_with_chunk_size",
+          "from_range_reader", "open", "open_file", "indexed_channel", "conversion_block"
+        ],
+        "python": [],
+        "typescript": [
+          "from_range_source", "signal_byte_ranges", "values_from_fragments",
+          "read_from_fragments", "dispose"
+        ]
+      }
+    },
+    "MdfWriter": {
+      "constructors": [],
+      "accessors": [],
+      "methods": [
+        "init_mdf_file", "set_start_time",
+        "add_channel_group", "set_channel_group_comment",
+        "add_channel", "add_time_channel", "add_float_channel", "add_float32_channel",
+        "add_int_channel", "add_sint_channel", "add_string_channel", "set_time_channel",
+        "add_linear_conversion", "add_value_to_text_conversion",
+        "start_data_block", "write_record", "write_columns", "finish_data_block", "finalize"
+      ],
+      "only": {},
+      "extra": {
+        "rust": [
+          "new", "new_with_capacity", "new_mmap", "new_from_writer",
+          "set_start_time_with", "add_data_group", "add_channel_group_with",
+          "add_channel_group_with_dg", "set_channel_group_name", "add_channel_with",
+          "add_channel_preserving_offsets", "channel_data_types",
+          "write_linear_conversion", "write_value_to_text_conversion",
+          "start_data_block_with", "start_data_block_for_cg", "start_data_block_for_cg_raw",
+          "set_record_template", "write_raw_record", "write_record_u64", "write_records",
+          "write_records_u64", "write_records_f64", "write_columns_f64",
+          "start_signal_data_block", "write_signal_data", "finish_signal_data_block",
+          "write_block", "write_block_with_id", "get_block_position", "update_link",
+          "update_block_link", "offset"
+        ],
+        "python": [],
+        "typescript": ["dispose"]
+      }
+    }
+  },
+  "types": {
+    "Signal": {
+      "fields": ["name", "unit", "timestamps", "values"],
+      "methods": { "rust": ["len", "is_empty", "has_timestamps", "values_f64"], "python": ["to_series"], "typescript": [] }
+    },
+    "GroupInfo": {
+      "fields": ["name", "comment", "record_count", "channel_names", "master_channel", "channels"],
+      "methods": { "rust": ["channel"], "python": [], "typescript": [] }
+    },
+    "ChannelInfo": {
+      "fields": ["name", "unit", "comment", "data_type", "bit_count", "is_master", "is_vlsd", "has_conversion"],
+      "methods": { "rust": [], "python": [], "typescript": [] }
+    },
+    "ConversionInfo": {
+      "fields": ["type", "values", "precision", "flags", "physical_range", "formula", "texts", "refs", "default"],
+      "methods": { "rust": [], "python": [], "typescript": [] }
+    },
+    "ReadOptions": {
+      "fields": ["group", "start_time", "end_time", "start_record", "record_count"],
+      "methods": { "rust": ["new", "group", "time", "records", "from_parts"], "python": [], "typescript": [] }
+    },
+    "TimeRange": {
+      "fields": ["start", "end"],
+      "methods": { "rust": [], "python": [], "typescript": [] }
+    }
+  },
+  "functions": {
+    "to_column_oriented": ["rust", "python", "typescript"],
+    "cut_mdf_by_time": ["rust", "python"],
+    "cut_mdf_by_utc": ["rust", "python"],
+    "merge_files": ["rust", "python"]
+  },
+  "errors": {
+    "base": { "rust": "MdfError", "python": "MdfException", "typescript": "Error" },
+    "channel_not_found": {
+      "rust": "MdfError::ChannelNotFound",
+      "python": "ChannelNotFoundError",
+      "typescript": "ChannelNotFoundError"
+    }
+  },
+  "module_exports": {
+    "python": [
+      "Mdf", "MdfIndex", "MdfWriter", "Signal", "GroupInfo", "ChannelInfo",
+      "ColumnReport", "FileLayout", "BlockInfo", "LinkInfo", "GapInfo",
+      "MdfException", "ChannelNotFoundError",
+      "to_column_oriented", "cut_mdf_by_time", "cut_mdf_by_utc", "merge_files"
+    ],
+    "typescript": [
+      "Mdf", "MdfIndex", "MdfWriter", "ChannelNotFoundError",
+      "toColumnOriented", "toColumnOrientedStream", "toColumnOrientedFile",
+      "FetchRangeSource", "BytesRangeSource", "FileRangeSource", "readAllRanges",
+      "mergeByteRanges", "toAbsoluteNs", "loadWasmModule"
+    ],
+    "typescript_web": [
+      "init", "Mdf", "MdfIndex", "MdfWriter", "ChannelNotFoundError",
+      "toColumnOriented", "toColumnOrientedStream",
+      "FetchRangeSource", "BytesRangeSource", "readAllRanges",
+      "mergeByteRanges", "toAbsoluteNs"
+    ],
+    "rust": [
+      "Mdf", "MdfIndex", "MdfReader", "MdfWriter", "Signal", "GroupInfo", "ChannelInfo",
+      "ConversionInfo", "ReadOptions", "TimeRange", "ColumnOptions", "ColumnReport",
+      "ColumnData", "FileLayout", "MdfError", "DataType", "DecodedValue", "Source",
+      "ByteRangeReader", "to_column_oriented", "cut_mdf_by_time", "cut_mdf_by_utc", "merge_files"
+    ]
+  }
+}

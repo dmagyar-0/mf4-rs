@@ -31,160 +31,79 @@ pip install target/wheels/mf4_rs-*.whl
 
 ## API at a Glance
 
-The Python API is **name-based** — channels and groups are addressed by name, with an optional `group` argument to disambiguate duplicate channel names. There are no positional `(group_index, channel_index)` arguments.
+The Python API is the same as the Rust and TypeScript ones — it is specified
+in [`docs/API.md`](../docs/API.md) and checked by `tests/test_api_contract.py`.
+Everything is addressed by **name**, with an optional `group` to disambiguate
+duplicate channel names.
 
-- `mf4_rs.Mdf(path)` — reader. `groups`, `group(name)`, `channel(name)`, `channel_names`, `read(name, group=None)` → `pandas.Series`, `values(name, group=None)` → numpy `float64` array, `mdf[name]` (same as `read`), `file_layout()`.
-- `mf4_rs.MdfWriter(path)` — writer. `init_mdf_file()`, `add_channel_group(name)`, `add_time_channel()`, `add_float_channel()`, `add_int_channel()`, `add_string_channel()`, `start_data_block()`, `write_record()` / `write_columns_f64()`, `finish_data_block()`, `finalize()`.
-- `mf4_rs.MdfIndex` — lightweight JSON index for lazy reads. `from_file(path)`, `from_url(url)`, `save(path)`, `load(path)`, settable `source` property (file path or `http(s)://` URL), lazy `read()` / `values()`, `byte_ranges()`, `conversion_info()`.
+- `mf4_rs.Mdf` — whole-file reader. Open with `Mdf.from_file(path)`,
+  `from_bytes(data)` or `from_url(url)`.
+- `mf4_rs.MdfIndex` — lazy / remote reader with **the same reading API**. Open
+  with `from_file`, `from_bytes`, `from_url` (fetches only metadata),
+  `from_json` or `load`; `to_json()` / `save(path)`; `source` /
+  `set_source(path_or_url)`.
+- Both readers: `groups`, `channel_names`, `start_time_ns` (properties),
+  `group(name)`, `channel(name, group=None)`, `read(...)` → `Signal`,
+  `values(...)` → numpy `float64`, `time_range(name, group=None)`,
+  `conversion(name, group=None)`, and `obj[name]` as shorthand for `read`.
+- `read` / `values` take `group=`, and either `start_time=` / `end_time=` or
+  `start_record=` / `record_count=` to read only part of a channel.
+- `mf4_rs.MdfWriter(path)` — writer: `init_mdf_file()`, `add_channel_group()`,
+  `add_time_channel()` / `add_float_channel()` / `add_int_channel()` / …,
+  `add_linear_conversion()`, `start_data_block()`, `write_record()` /
+  `write_columns()`, `finish_data_block()`, `finalize()`.
+- File tools: `to_column_oriented`, `cut_mdf_by_time`, `cut_mdf_by_utc`,
+  `merge_files`, `FileLayout`.
 
-`read()` returns a `pandas.Series` indexed by the group's master (time) channel converted to a `DatetimeIndex` using the file's start time. `values()` is pandas-free and returns a plain numpy `float64` array with invalid samples as `NaN`.
+A `Signal` has `name`, `unit`, `timestamps` and `values` (numpy arrays);
+`signal.to_series()` gives a `pandas.Series` with a `DatetimeIndex` built from
+the file's start time.
 
 ## Examples
 
-### 1. read_file.py - Reading MDF Files
+Run `write_file.py` first — it creates the `example.mf4` the others read.
+
+| Script | Shows |
+|---|---|
+| `write_file.py` | Channel groups, typed channels, conversions, `write_record` and the bulk `write_columns`. |
+| `read_file.py` | Metadata, `read` → `Signal`, `values` → numpy, group and window options, `time_range`, `conversion`, error handling. |
+| `index_operations.py` | Building, saving and loading an `MdfIndex`, attaching a source, lazy and windowed reads, byte ranges. |
+| `pandas_example.py` | `Signal.to_series()`, resampling, building a `DataFrame` from a group. |
+| `visualize_layout.py` | `FileLayout`: block types, addresses, sizes, links and gaps. |
 
 ```python
 import mf4_rs
 
-mdf = mf4_rs.Mdf("example.mf4")
-
-# Inspect structure
+mdf = mf4_rs.Mdf.from_file("example.mf4")
 for group in mdf.groups:
-    print(group.name, [c.name for c in group.channels])
+    print(group.name, group.record_count, group.channel_names)
 
-print(mdf.channel_names)
+speed = mdf.read("Speed")                              # Signal
+speed.to_series().resample("1s").mean()                # pandas
+numbers = mdf.values("Speed", start_time=1.0, end_time=2.0)   # numpy
 
-# Read a channel as a pandas Series with DatetimeIndex
-series = mdf.read("Temperature")
-print(series.describe())
-
-# Or as a plain numpy float64 array (no pandas required)
-values = mdf.values("Temperature")
-
-# Disambiguate duplicate channel names by group
-engine_temp = mdf.read("Temperature", group="Engine")
-
-# Dict-style access (same as read)
-series = mdf["Temperature"]
-```
-
-### 2. write_file.py - Creating MDF Files
-
-```python
-import mf4_rs
-
-writer = mf4_rs.MdfWriter("output.mf4")
-writer.init_mdf_file()
-
-group_id = writer.add_channel_group("Test Group")
-
-# Convenience methods handle data types, bit counts, and channel linking.
-# add_time_channel automatically marks the channel as the group master.
-time_ch = writer.add_time_channel(group_id, "Time")
-temp_ch = writer.add_float_channel(group_id, "Temperature")
-speed_ch = writer.add_int_channel(group_id, "Speed")
-
-writer.start_data_block(group_id)
-for i in range(100):
-    writer.write_record(group_id, [
-        mf4_rs.create_float_value(i * 0.01),   # Time
-        mf4_rs.create_float_value(25.5),       # Temperature
-        mf4_rs.create_uint_value(60),          # Speed
-    ])
-writer.finish_data_block(group_id)
-writer.finalize()
-```
-
-For bulk numeric data, `write_columns_f64(group_id, columns)` writes whole
-columns in one call and is much faster than a `write_record` loop.
-
-### 3. index_operations.py - MDF File Indexing
-
-The index is a small, self-contained JSON document holding all metadata
-(including fully resolved conversions) needed to read channel data with
-targeted byte-range I/O — no full file parse or download required.
-
-```python
-import mf4_rs
-
-# Create an index (reads metadata only, never sample data)
-index = mf4_rs.MdfIndex.from_file("data.mf4")
-index.save("data_index.json")
-
-# Later: load the index and attach a data source. The source is not
-# serialized with the index, so set it after loading.
-index = mf4_rs.MdfIndex.load("data_index.json")
-index.source = "data.mf4"                          # local file...
-# index.source = "https://cdn.example.com/data.mf4"  # ...or HTTP URL
-
-# Lazy reads: only the needed byte ranges are fetched
-series = index.read("Temperature")      # pandas Series
-values = index.values("Temperature")    # numpy float64 array
-
-# Indexes can also be built straight from a URL
 index = mf4_rs.MdfIndex.from_url("https://cdn.example.com/data.mf4")
-
-# Power users: raw byte ranges (e.g. for custom HTTP Range requests)
-ranges = index.byte_ranges("Temperature")
-first_10 = index.byte_ranges_for_records("Temperature", 0, 10)
-
-# Inspect the (pre-resolved) conversion attached to a channel
-info = index.conversion_info("Temperature")
-```
-
-### 4. pandas_example.py - Pandas Integration
-
-`read()` returns a pandas Series whose index is a `DatetimeIndex` built from
-the MDF file's absolute start time plus the group's relative master-channel
-times, enabling full time-series functionality:
-
-```python
-import mf4_rs
-import pandas as pd
-
-mdf = mf4_rs.Mdf("data.mf4")
-
-temp = mdf.read("Temperature")
-speed = mdf.read("Speed")
-
-print(temp.index)          # DatetimeIndex with absolute timestamps
-print(temp.describe())
-
-temp_1s = temp.resample("1s").mean()      # resample to 1-second intervals
-window = temp.loc["2024-01-15 10:30:00":"2024-01-15 10:30:10"]
-
-df = pd.DataFrame({"Temperature": temp, "Speed": speed})
-print(df.corr())
-```
-
-### 5. visualize_layout.py - File Layout Inspection
-
-`Mdf.file_layout()` (also `FileLayout.from_file(path)`) walks every block in
-the file and reports block types, addresses, sizes, links, and gaps — handy
-for debugging writers or comparing against files produced by other tools.
-
-```python
-import mf4_rs
-
-layout = mf4_rs.Mdf("data.mf4").file_layout()
-print(layout.to_tree())        # or to_text() / to_json()
+speed = index.read("Speed", group="Vehicle")           # range requests happen now
 ```
 
 ## Error Handling
 
-All operations can raise `mf4_rs.MdfException` for MDF-specific errors:
+Every error is an `mf4_rs.MdfException`. Reading a channel that does not
+exist raises its subclass `mf4_rs.ChannelNotFoundError`; the metadata lookups
+`group()` / `channel()` return `None` instead.
 
 ```python
 try:
-    mdf = mf4_rs.Mdf("nonexistent.mf4")
+    mdf = mf4_rs.Mdf.from_file("nonexistent.mf4")
 except mf4_rs.MdfException as e:
     print(f"MDF Error: {e}")
 ```
 
 ## Performance Tips
 
-- Use `values()` instead of `read()` when you don't need timestamps — it skips pandas entirely and is the fastest read path.
-- Use `write_columns_f64()` / `write_columns()` for bulk writes instead of per-record `write_record()` calls.
+- Use `values()` instead of `read()` when you don't need timestamps — it is the fastest read path.
+- Pass a time or record window to read only part of a channel; through an `MdfIndex` only those records are fetched.
+- Use `write_columns()` for bulk writes instead of per-record `write_record()` calls.
 - Use the indexing system for repeated or remote access: index creation is a one-time metadata scan, after which reads fetch only the byte ranges they need.
 - `Mdf.read` / `Mdf.values` release the GIL while decoding.
 - The underlying Rust library uses memory-mapped files, so large files are handled without loading them into memory.
