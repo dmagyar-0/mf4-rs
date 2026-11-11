@@ -87,8 +87,8 @@ test("multi-group file: group disambiguation selects the right group's data", as
     ["GroupA", "GroupB"],
   );
 
-  const a = mdf.values("Value", "GroupA");
-  const b = mdf.values("Value", "GroupB");
+  const a = mdf.values("Value", { group: "GroupA" });
+  const b = mdf.values("Value", { group: "GroupB" });
   assert.deepEqual(Array.from(a), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
   assert.deepEqual(Array.from(b), [0, 100, 200, 300, 400]);
   mdf.dispose();
@@ -96,8 +96,8 @@ test("multi-group file: group disambiguation selects the right group's data", as
   // Same disambiguation through the lazy index path.
   const index = MdfIndex.fromBytes(bytes);
   const source = new BytesRangeSource(bytes);
-  const lazyA = await index.values("Value", source, "GroupA");
-  const lazyB = await index.values("Value", source, "GroupB");
+  const lazyA = await index.values("Value", { source: source, group: "GroupA" });
+  const lazyB = await index.values("Value", { source: source, group: "GroupB" });
   assert.deepEqual(Array.from(lazyA), Array.from(a));
   assert.deepEqual(Array.from(lazyB), Array.from(b));
   index.dispose();
@@ -118,16 +118,16 @@ test("0-record group reads back as empty", async () => {
 
   const mdf = Mdf.fromBytes(bytes);
   assert.equal(mdf.groups()[0]!.recordCount, 0);
-  const vals = mdf.values("Value", "Empty");
+  const vals = mdf.values("Value", { group: "Empty" });
   assert.equal(vals.length, 0);
-  const sig = mdf.read("Value", "Empty");
+  const sig = mdf.read("Value", { group: "Empty" });
   assert.equal(sig.values.length, 0);
   assert.equal(sig.timestamps.length, 0);
   mdf.dispose();
 
   const index = MdfIndex.fromBytes(bytes);
   const source = new BytesRangeSource(bytes);
-  const lazy = await index.values("Value", source, "Empty");
+  const lazy = await index.values("Value", { source: source, group: "Empty" });
   assert.equal(lazy.length, 0);
   index.dispose();
 });
@@ -150,7 +150,7 @@ test("BigInt / large-integer write -> read round-trip", () => {
   writer.dispose();
 
   const mdf = Mdf.fromBytes(bytes);
-  const sig = mdf.read("Big", "Big");
+  const sig = mdf.read("Big", { group: "Big" });
   assert.equal(sig.values.length, 2);
   assert.equal(sig.values[0], big); // emitted as BigInt (> 2^53)
   assert.equal(typeof sig.values[0], "bigint");
@@ -174,16 +174,25 @@ test("string (VLSD) channel write -> read round-trip", () => {
   writer.dispose();
 
   const mdf = Mdf.fromBytes(bytes);
-  const sig = mdf.read("Msg", "Strings");
+  const sig = mdf.read("Msg", { group: "Strings" });
   assert.equal(sig.values.length, messages.length);
   assert.deepEqual(sig.values, messages);
   mdf.dispose();
 });
 
-test("addChannel rejects string data types, directing to addStringChannel", () => {
+test("addChannel writes string data types as variable-length channels", () => {
   const writer = new MdfWriter();
   writer.initMdfFile();
   const g = writer.addChannelGroup("G");
-  assert.throws(() => writer.addChannel(g, "S", "StringUtf8"), /addStringChannel/);
+  writer.addChannel(g, "S", "StringUtf8");
+  assert.throws(() => writer.addChannel(g, "X", "float"), /unknown data type/);
+  writer.startDataBlock(g);
+  writer.writeRecord(g, ["hello"]);
+  writer.finishDataBlock(g);
+  const mdf = Mdf.fromBytes(writer.finalize());
   writer.dispose();
+  assert.equal(mdf.channel("S")?.dataType, "StringUtf8");
+  assert.equal(mdf.channel("S")?.isVlsd, true);
+  assert.deepEqual(mdf.read("S").values, ["hello"]);
+  mdf.dispose();
 });

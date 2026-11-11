@@ -5,12 +5,13 @@
 //! without parsing the entire file structure.
 
 use serde::{Deserialize, Serialize};
-use crate::api::mdf::MDF;
+use crate::api::mdf::Mdf;
 use crate::blocks::common::{DataType, BlockHeader, BlockParse};
 use crate::blocks::conversion::{ConversionBlock, ConversionType};
 use crate::error::MdfError;
 use crate::parsing::decoder::{check_value_validity, decode_channel_value, decode_channel_value_with_validity, decode_f64_from_record, DecodedValue};
 use crate::signal::{decoded_opt_to_f64, Signal};
+use crate::types::{resolve_records, ChannelInfo, ConversionInfo, GroupInfo, ReadOptions, TimeRange, Window};
 
 /// Largest single read issued when coalescing adjacent data blocks (64 MiB).
 const MAX_COALESCED_READ: u64 = 64 * 1024 * 1024;
@@ -88,6 +89,20 @@ impl IndexedChannel {
     /// no bytes, its raw value is the record index.
     pub fn is_virtual(&self) -> bool {
         self.channel_type == 3 || self.channel_type == 6
+    }
+
+    /// This channel's metadata as a plain [`ChannelInfo`].
+    pub fn info(&self) -> ChannelInfo {
+        ChannelInfo {
+            name: self.name.clone(),
+            unit: self.unit.clone(),
+            comment: self.comment.clone(),
+            data_type: self.data_type.name().to_string(),
+            bit_count: self.bit_count,
+            is_master: self.is_master(),
+            is_vlsd: self.is_vlsd(),
+            has_conversion: self.conversion.is_some() || self.conversion_addr != 0,
+        }
     }
 
     /// `true` if this is a variable-length (VLSD) channel.
@@ -228,8 +243,8 @@ impl IndexedChannelGroup {
 
 /// Where an [`MdfIndex`] reads sample data from when asked to.
 ///
-/// The source is *not* serialized with the index — after [`MdfIndex::load_from_file`]
-/// re-attach one with [`MdfIndex::set_file`] / [`MdfIndex::set_url`]. Building an
+/// The source is *not* serialized with the index — after [`MdfIndex::load`]
+/// re-attach one with [`MdfIndex::set_source`]. Building an
 /// index never reads sample data; the actual byte-range reads happen lazily on
 /// [`MdfIndex::read`].
 #[derive(Debug, Clone)]
@@ -239,6 +254,57 @@ pub enum Source {
     /// An HTTP/S3 URL, read via range requests.
     #[cfg(feature = "http")]
     Url(String),
+}
+
+impl Source {
+    /// The file path or URL as a string.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Source::File(p) => p,
+            #[cfg(feature = "http")]
+            Source::Url(u) => u,
+        }
+    }
+}
+
+/// A string is a [`Source`]: `http://` / `https://` URLs become
+/// [`Source::Url`] (with the `http` feature), anything else a file path.
+impl From<&str> for Source {
+    fn from(value: &str) -> Self {
+        #[cfg(feature = "http")]
+        if value.starts_with("http://") || value.starts_with("https://") {
+            return Source::Url(value.to_string());
+        }
+        Source::File(value.to_string())
+    }
+}
+
+impl From<String> for Source {
+    fn from(value: String) -> Self {
+        Source::from(value.as_str())
+    }
+}
+
+/// Reader over an index's attached [`Source`], for windowed reads.
+enum SourceReader {
+    #[cfg(not(target_arch = "wasm32"))]
+    File(MmapRangeReader),
+    #[cfg(feature = "http")]
+    Url(CachingRangeReader<HttpRangeReader>),
+}
+
+impl ByteRangeReader for SourceReader {
+    type Error = MdfError;
+
+    #[allow(unused_variables)]
+    fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
+        match *self {
+            #[cfg(not(target_arch = "wasm32"))]
+            SourceReader::File(ref mut r) => r.read_range(offset, length),
+            #[cfg(feature = "http")]
+            SourceReader::Url(ref mut r) => r.read_range(offset, length),
+        }
+    }
 }
 
 /// Complete MDF file index
@@ -252,7 +318,7 @@ pub struct MdfIndex {
     /// Channel groups in the file
     pub channel_groups: Vec<IndexedChannelGroup>,
     /// The data source for lazy value reads. Populated by `from_file` /
-    /// `from_url`, re-attachable after load via `set_file` / `set_url`. Never
+    /// `from_url`, re-attachable after load via `set_source`. Never
     /// serialized — an index file is portable; the source is environment-local.
     #[serde(skip)]
     pub source: Option<Source>,
@@ -782,6 +848,18 @@ impl HttpRangeReader {
         })
     }
 
+    /// Download the whole resource with one plain `GET`.
+    pub(crate) fn fetch_all(&mut self) -> Result<Vec<u8>, MdfError> {
+        use std::io::Read;
+        self.request_count += 1;
+        let response = self.agent.get(&self.url).call().map_err(|e| {
+            MdfError::BlockSerializationError(format!("HTTP request failed: {e}"))
+        })?;
+        let mut body = Vec::new();
+        response.into_reader().read_to_end(&mut body).map_err(MdfError::IOError)?;
+        Ok(body)
+    }
+
     /// Learn the resource's total size with a single-byte ranged GET.
     ///
     /// Uses `GET` with `Range: bytes=0-0` and parses the total length out of
@@ -908,10 +986,10 @@ impl ByteRangeReader for HttpRangeReader {
 impl MdfIndex {
     /// Create an index from an MDF file on disk.
     ///
-    /// Not available on `wasm32-unknown-unknown`; use [`from_bytes`] instead.
+    /// Not available on `wasm32-unknown-unknown`; use [`from_bytes`](Self::from_bytes) instead.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_file(file_path: &str) -> Result<Self, MdfError> {
-        let mdf = MDF::from_file(file_path)?;
+        let mdf = Mdf::from_file(file_path)?;
         let file_size = std::fs::metadata(file_path)
             .map_err(|e| MdfError::IOError(e))?
             .len();
@@ -943,7 +1021,7 @@ impl MdfIndex {
     }
 
     /// Shared index-building logic operating on an already-parsed [`MDF`].
-    fn build_index(mdf: MDF, file_size: u64) -> Result<Self, MdfError> {
+    fn build_index(mdf: Mdf, file_size: u64) -> Result<Self, MdfError> {
         let start_time_ns = mdf.start_time_ns();
         let mut indexed_groups = Vec::new();
         // (own ##CG address, remote master ##CG address) per group.
@@ -1118,7 +1196,7 @@ impl MdfIndex {
     /// This is the primary constructor on `wasm32-unknown-unknown`.
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, MdfError> {
         let file_size = data.len() as u64;
-        let mdf = MDF::from_bytes(data)?;
+        let mdf = Mdf::from_bytes(data)?;
         Self::build_index(mdf, file_size)
     }
 
@@ -1611,9 +1689,9 @@ impl MdfIndex {
 
     /// Save the index to a JSON file.
     ///
-    /// Not available on `wasm32-unknown-unknown`; use [`to_json`] instead.
+    /// Not available on `wasm32-unknown-unknown`; use [`to_json`](Self::to_json) instead.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn save_to_file(&self, index_path: &str) -> Result<(), MdfError> {
+    pub fn save(&self, index_path: &str) -> Result<(), MdfError> {
         let json = self.to_json()?;
         std::fs::write(index_path, json)
             .map_err(|e| MdfError::IOError(e))?;
@@ -1622,9 +1700,9 @@ impl MdfIndex {
 
     /// Load an index from a JSON file.
     ///
-    /// Not available on `wasm32-unknown-unknown`; use [`from_json`] instead.
+    /// Not available on `wasm32-unknown-unknown`; use [`from_json`](Self::from_json) instead.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn load_from_file(index_path: &str) -> Result<Self, MdfError> {
+    pub fn load(index_path: &str) -> Result<Self, MdfError> {
         let json = std::fs::read_to_string(index_path)
             .map_err(|e| MdfError::IOError(e))?;
         Self::from_json(&json)
@@ -1649,7 +1727,7 @@ impl MdfIndex {
 
     /// Validate structural invariants of the index.
     ///
-    /// Called from [`Self::from_json`] / [`Self::load_from_file`] so that
+    /// Called from [`Self::from_json`] / [`Self::load`] so that
     /// malformed (hostile or stale) index data returns an error instead of
     /// causing panics, integer underflow, or huge allocations during reads.
     pub fn validate(&self) -> Result<(), MdfError> {
@@ -2045,12 +2123,18 @@ impl MdfIndex {
         t_end: Option<f64>,
         reader: &mut R,
     ) -> Result<(u64, u64), MdfError> {
-        let (mg, m) = self.time_axis_location(g, c).ok_or_else(|| {
-            MdfError::BlockSerializationError(
-                "channel group has no master (time) channel; cannot select by time".to_string(),
-            )
-        })?;
-        let (group, _) = self.group_and_channel(g, c)?;
+        let (group, channel) = self.group_and_channel(g, c)?;
+        let Some((mg, m)) = self.time_axis_location(g, c) else {
+            // Same rule as the in-memory reader (`types::slice_signal`): an
+            // empty group selects nothing, otherwise a master is required.
+            if group.record_count == 0 {
+                return Ok((0, 0));
+            }
+            return Err(MdfError::InvalidArgument(format!(
+                "channel '{}' has no master (time) channel; cannot select by time",
+                channel.name.as_deref().unwrap_or_default()
+            )));
+        };
         let (mgroup, mchannel) = self.group_and_channel(mg, m)?;
         let n = group.record_count.min(mgroup.record_count);
         let conversion = Self::resolve_conversion(mchannel, reader)?;
@@ -2369,7 +2453,7 @@ impl MdfIndex {
         Ok(values)
     }
 
-    /// Map VLSD decoded values to `f64`, matching `Channel::values_as_f64`:
+    /// Map VLSD decoded values to `f64`, matching `Channel::values`:
     /// numeric variants convert, everything else (strings, bytes, invalid) is
     /// NaN.
     fn vlsd_values_to_f64(values: Vec<Option<DecodedValue>>) -> Vec<f64> {
@@ -2545,68 +2629,95 @@ impl MdfIndex {
         Ok(())
     }
 
-    /// All channel groups in the file, in file order.
-    pub fn groups(&self) -> &[IndexedChannelGroup] {
-        &self.channel_groups
+    // ----- metadata (cross-language contract) -----------------------------
+
+    /// Metadata of every channel group, in file order.
+    ///
+    /// The raw indexed structures (record layout, data-block locations) are
+    /// available through the public [`channel_groups`](Self::channel_groups)
+    /// field.
+    pub fn groups(&self) -> Result<Vec<GroupInfo>, MdfError> {
+        Ok((0..self.channel_groups.len()).map(|g| self.group_info(g)).collect())
     }
 
-    /// Find a channel group by its name.
-    ///
-    /// Returns the first group whose `##CG` acquisition name matches `name`.
-    pub fn group(&self, name: &str) -> Option<&IndexedChannelGroup> {
-        self.channel_groups
+    /// Metadata of the first channel group named `name`, or `None`.
+    pub fn group(&self, name: &str) -> Result<Option<GroupInfo>, MdfError> {
+        Ok(self
+            .channel_groups
             .iter()
-            .find(|g| g.name.as_deref() == Some(name))
+            .position(|g| g.name.as_deref() == Some(name))
+            .map(|g| self.group_info(g)))
     }
 
-    /// Look up a single channel by name across all groups (first match).
-    pub fn channel(&self, name: &str) -> Option<&IndexedChannel> {
-        let (g, c) = self.locate(name)?;
-        self.channel_groups.get(g)?.channels.get(c)
+    /// Metadata of the first channel named `name`, or `None`. Pass `group` to
+    /// look only in the group(s) with that name.
+    pub fn channel(&self, name: &str, group: Option<&str>) -> Result<Option<ChannelInfo>, MdfError> {
+        Ok(self.indexed_channel(name, group).map(IndexedChannel::info))
     }
 
-    /// Look up a channel by group name + channel name.
-    ///
-    /// Every group carrying that name is searched (like [`MdfIndex::read_in`]),
-    /// since a column-oriented file has one channel group per signal.
-    pub fn channel_in(&self, group: &str, name: &str) -> Option<&IndexedChannel> {
-        let (g, c) = self.locate_in(group, name)?;
-        self.channel_groups.get(g)?.channels.get(c)
-    }
-
-    /// The attached data source rendered as a string (file path or URL).
-    pub fn source_string(&self) -> Option<String> {
-        match &self.source {
-            Some(Source::File(p)) => Some(p.clone()),
-            #[cfg(feature = "http")]
-            Some(Source::Url(u)) => Some(u.clone()),
-            None => None,
-        }
-    }
-
-    /// A flat catalog of every channel as `(source, group name, channel name)`.
-    ///
-    /// `source` is this index's attached source (the same value for every row,
-    /// handy when concatenating catalogs from many files/URLs). Built purely
-    /// from metadata — no sample data is read.
-    pub fn signal_list(&self) -> Vec<(Option<String>, Option<String>, Option<String>)> {
-        let src = self.source_string();
-        let mut out = Vec::new();
-        for group in &self.channel_groups {
-            for channel in &group.channels {
-                out.push((src.clone(), group.name.clone(), channel.name.clone()));
-            }
-        }
-        out
-    }
-
-    /// Every channel name across all groups, in file order (duplicates kept).
-    pub fn channel_names(&self) -> Vec<&str> {
-        self.channel_groups
+    /// Names of every named channel across all groups (duplicates kept).
+    pub fn channel_names(&self) -> Result<Vec<String>, MdfError> {
+        Ok(self
+            .channel_groups
             .iter()
             .flat_map(|g| g.channels.iter())
-            .filter_map(|c| c.name.as_deref())
-            .collect()
+            .filter_map(|c| c.name.clone())
+            .collect())
+    }
+
+    /// Measurement start time in nanoseconds since the Unix epoch, or `None`
+    /// if the file header does not record one.
+    pub fn start_time_ns(&self) -> Option<u64> {
+        self.start_time_ns
+    }
+
+    /// Size in bytes of the indexed MDF file.
+    pub fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    /// The raw [`IndexedChannel`] of the first channel named `name` (in the
+    /// group(s) named `group`, when given). Rust-only access to the record
+    /// layout behind [`channel`](Self::channel).
+    pub fn indexed_channel(&self, name: &str, group: Option<&str>) -> Option<&IndexedChannel> {
+        let (g, c) = self.locate_opt(name, group)?;
+        self.channel_groups.get(g)?.channels.get(c)
+    }
+
+    fn group_info(&self, g: usize) -> GroupInfo {
+        let group = &self.channel_groups[g];
+        GroupInfo {
+            name: group.name.clone(),
+            comment: group.comment.clone(),
+            record_count: group.record_count,
+            channel_names: group.channels.iter().filter_map(|c| c.name.clone()).collect(),
+            // A column-oriented (MDF 4.2) signal group reports the shared
+            // time channel it references.
+            master_channel: group
+                .master_channel()
+                .or_else(|| {
+                    group
+                        .master_group
+                        .and_then(|mg| self.channel_groups.get(mg))
+                        .and_then(|mg| mg.master_channel())
+                })
+                .and_then(|c| c.name.clone()),
+            channels: group.channels.iter().map(IndexedChannel::info).collect(),
+        }
+    }
+
+    /// Position of a channel by name, optionally restricted to a group name.
+    pub(crate) fn locate_opt(&self, name: &str, group: Option<&str>) -> Option<(usize, usize)> {
+        match group {
+            Some(group) => self.locate_in(group, name),
+            None => self.locate(name),
+        }
+    }
+
+    /// [`locate_opt`](Self::locate_opt), erroring with `ChannelNotFound`.
+    pub(crate) fn locate_checked(&self, name: &str, group: Option<&str>) -> Result<(usize, usize), MdfError> {
+        self.locate_opt(name, group)
+            .ok_or_else(|| MdfError::channel_not_found(name, group))
     }
 
     /// Resolve a channel name to its `(group_index, channel_index)` position.
@@ -2655,22 +2766,6 @@ impl MdfIndex {
         Some((mg, m))
     }
 
-    /// All `(group_index, channel_index)` positions matching a channel name.
-    ///
-    /// Useful when the same name appears in several groups (e.g. a per-group
-    /// `Time` master channel).
-    pub fn find_channels(&self, name: &str) -> Vec<(usize, usize)> {
-        let mut matches = Vec::new();
-        for (g, group) in self.channel_groups.iter().enumerate() {
-            for (c, channel) in group.channels.iter().enumerate() {
-                if channel.name.as_deref() == Some(name) {
-                    matches.push((g, c));
-                }
-            }
-        }
-        matches
-    }
-
     /// Bind this index to a byte-range source for reading sample data.
     ///
     /// The returned [`MdfReader`] borrows the index and owns `reader`; read
@@ -2688,49 +2783,163 @@ impl MdfIndex {
         Ok(self.open(MmapRangeReader::new(path)?))
     }
 
-    /// The data source attached to this index, if any.
+    /// The data source `read` / `values` fetch sample bytes from, if any.
     pub fn source(&self) -> Option<&Source> {
         self.source.as_ref()
     }
 
-    /// Attach (or replace) the data source used by [`MdfIndex::read`].
-    pub fn set_source(&mut self, source: Source) {
-        self.source = Some(source);
-    }
-
-    /// Attach a local file path as the data source for lazy reads.
-    pub fn set_file(&mut self, path: impl Into<String>) {
-        self.source = Some(Source::File(path.into()));
-    }
-
-    /// Attach an HTTP/S3 URL as the data source for lazy reads.
-    #[cfg(feature = "http")]
-    pub fn set_url(&mut self, url: impl Into<String>) {
-        self.source = Some(Source::Url(url.into()));
-    }
-
-    /// Read a channel by name as a [`Signal`] using the attached [`Source`].
+    /// Attach (or replace) the data source used by `read` / `values`.
     ///
-    /// Values are paired with the channel's group master (time) axis. This is
-    /// the lazy read path: the byte-range request happens now, not at index
-    /// build time. Errors if no source is attached (see [`MdfIndex::set_file`] /
-    /// [`MdfIndex::set_url`]).
-    pub fn read(&self, name: &str) -> Result<Signal, MdfError> {
-        let (g, c) = self.locate(name).ok_or_else(|| {
-            MdfError::BlockSerializationError(format!("Channel '{}' not found", name))
-        })?;
-        self.read_signal(g, c)
+    /// Accepts a [`Source`] or a string: `http(s)://` URLs are read with range
+    /// requests (with the `http` feature), anything else is a file path.
+    pub fn set_source(&mut self, source: impl Into<Source>) {
+        self.source = Some(source.into());
     }
 
-    /// [`MdfIndex::read`] addressed by group name + channel name.
-    pub fn read_in(&self, group: &str, name: &str) -> Result<Signal, MdfError> {
-        let (g, c) = self.locate_in(group, name).ok_or_else(|| {
-            MdfError::BlockSerializationError(format!(
-                "Channel '{}' not found in group '{}'",
-                name, group
-            ))
-        })?;
-        self.read_signal(g, c)
+    /// Detach the data source.
+    pub fn clear_source(&mut self) {
+        self.source = None;
+    }
+
+    // ----- data (cross-language contract) ---------------------------------
+
+    /// Read a channel as a [`Signal`]: its values (conversions applied,
+    /// `None` = invalid sample) paired with the group's time axis. For the
+    /// master channel itself `timestamps` is empty.
+    ///
+    /// This is the lazy read path: bytes are fetched from the attached
+    /// [`Source`] now, not at index build time. Errors with
+    /// [`MdfError::ChannelNotFound`] if no such channel exists, or if no
+    /// source is attached (see [`set_source`](Self::set_source)).
+    ///
+    /// `options` is `None` for the whole channel, or a [`ReadOptions`] with a
+    /// group filter and/or a time or record window. A window fetches only the
+    /// selected records: a time window is located by searching the master
+    /// channel (a few single-record reads), not by downloading it.
+    pub fn read<'o>(&self, name: &str, options: impl Into<Option<&'o ReadOptions>>) -> Result<Signal, MdfError> {
+        let default = ReadOptions::default();
+        let options = options.into().unwrap_or(&default);
+        let window = options.window()?;
+        let (g, c) = self.locate_checked(name, options.group_name())?;
+        if window == Window::All {
+            return self.read_signal(g, c);
+        }
+        let mut reader = self.source_reader(g, c)?;
+        let (start, count) = self.resolve_window(g, c, window, &mut reader)?;
+        read_signal_window(self, g, c, start, count, &mut reader)
+    }
+
+    /// Read a numeric channel as plain `f64` values (no timestamps).
+    /// Conversions are applied; invalid and non-numeric samples are `NaN`.
+    /// `options` as for [`read`](Self::read).
+    pub fn values<'o>(&self, name: &str, options: impl Into<Option<&'o ReadOptions>>) -> Result<Vec<f64>, MdfError> {
+        let default = ReadOptions::default();
+        let options = options.into().unwrap_or(&default);
+        let window = options.window()?;
+        let (g, c) = self.locate_checked(name, options.group_name())?;
+        if window == Window::All {
+            return self.read_values_f64_via_source(g, c);
+        }
+        let mut reader = self.source_reader(g, c)?;
+        let (start, count) = self.resolve_window(g, c, window, &mut reader)?;
+        self.values_f64_window(g, c, start, count, &mut reader)
+    }
+
+    /// First and last master (time) value of the group holding `name`, or
+    /// `None` for an empty group. Reads just two records. Errors if the group
+    /// has no master channel.
+    pub fn time_range(&self, name: &str, group: Option<&str>) -> Result<Option<TimeRange>, MdfError> {
+        let (g, c) = self.locate_checked(name, group)?;
+        let mut reader = self.source_reader(g, c)?;
+        self.time_range_at(g, c, &mut reader)
+    }
+
+    /// The conversion `read` / `values` apply to channel `name`, fully
+    /// resolved, or `None` when the channel has none.
+    ///
+    /// Indexes built over the network record only a conversion's location;
+    /// it is then fetched through the attached source on demand.
+    pub fn conversion(&self, name: &str, group: Option<&str>) -> Result<Option<ConversionInfo>, MdfError> {
+        Ok(self.conversion_block(name, group)?.as_ref().map(ConversionInfo::from))
+    }
+
+    /// Records `[start, start + count)` a window selects in the group of `(g, c)`.
+    pub(crate) fn resolve_window<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        g: usize,
+        c: usize,
+        window: Window,
+        reader: &mut R,
+    ) -> Result<(u64, u64), MdfError> {
+        let total = self.channel_groups[g].record_count;
+        match window {
+            Window::All => Ok((0, total)),
+            Window::Records(start, count) => resolve_records(start, count, total),
+            Window::Time(t_start, t_end) => self.record_window_for_time(g, c, t_start, t_end, reader),
+        }
+    }
+
+    /// `f64` values of records `[start, start + count)` of `(g, c)`.
+    pub(crate) fn values_f64_window<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        g: usize,
+        c: usize,
+        start: u64,
+        count: u64,
+        reader: &mut R,
+    ) -> Result<Vec<f64>, MdfError> {
+        Ok(self
+            .read_channel_values_window(g, c, start, count, reader)?
+            .iter()
+            .map(decoded_opt_to_f64)
+            .collect())
+    }
+
+    /// First and last value of the time axis of `(g, c)` (two single-record reads).
+    pub(crate) fn time_range_at<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        g: usize,
+        c: usize,
+        reader: &mut R,
+    ) -> Result<Option<TimeRange>, MdfError> {
+        let total = self.channel_groups[g].record_count;
+        let Some((mg, m)) = self.time_axis_location(g, c) else {
+            if total == 0 {
+                return Ok(None);
+            }
+            let name = self.channel_groups[g].channels[c].name.clone().unwrap_or_default();
+            return Err(MdfError::InvalidArgument(format!(
+                "channel '{name}' has no master (time) channel"
+            )));
+        };
+        let n = total.min(self.channel_groups[mg].record_count);
+        if n == 0 {
+            return Ok(None);
+        }
+        let first = self.values_f64_window(mg, m, 0, 1, reader);
+        // Attempt the second read even when the first failed, so a probing
+        // reader records both gaps in one pass.
+        let last = self.values_f64_window(mg, m, n - 1, 1, reader)?;
+        Ok(Some(TimeRange { start: first?[0], end: last[0] }))
+    }
+
+    /// A byte-range reader over the attached source, with the conversion of
+    /// `(g, c)` resolved up front for URL sources.
+    fn source_reader(&self, g: usize, c: usize) -> Result<SourceReader, MdfError> {
+        let _ = (g, c);
+        match self.require_source()? {
+            #[cfg(not(target_arch = "wasm32"))]
+            Source::File(path) => Ok(SourceReader::File(MmapRangeReader::new(path)?)),
+            #[cfg(target_arch = "wasm32")]
+            Source::File(_) => Err(MdfError::BlockSerializationError(
+                "file sources are not available on wasm32".to_string(),
+            )),
+            #[cfg(feature = "http")]
+            Source::Url(url) => {
+                let http = HttpRangeReader::new(url)?;
+                Ok(SourceReader::Url(self.url_reader_with_conversion(http, g, c)?))
+            }
+        }
     }
 
     /// Decode a channel + its group master from the attached source.
@@ -2774,11 +2983,21 @@ impl MdfIndex {
 
     /// Resolve the attached [`Source`], erroring with a helpful message if none.
     fn require_source(&self) -> Result<&Source, MdfError> {
-        self.source.as_ref().ok_or_else(|| {
+        let source = self.source.as_ref().ok_or_else(|| {
             MdfError::BlockSerializationError(
-                "no data source attached to index; build with from_file/from_url or call set_file/set_url".to_string(),
+                "no data source attached to index; build with from_file/from_url or call set_source".to_string(),
             )
-        })
+        })?;
+        #[cfg(not(feature = "http"))]
+        {
+            let Source::File(path) = source;
+            if path.starts_with("http://") || path.starts_with("https://") {
+                return Err(MdfError::InvalidArgument(format!(
+                    "'{path}' is a URL, but mf4-rs was built without the `http` feature"
+                )));
+            }
+        }
+        Ok(source)
     }
 
     /// Read one channel's decoded values lazily through the attached source.
@@ -2787,6 +3006,8 @@ impl MdfIndex {
         g: usize,
         c: usize,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
+        #[cfg(target_arch = "wasm32")]
+        let _ = (g, c);
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
             Source::File(path) => {
@@ -2813,11 +3034,12 @@ impl MdfIndex {
     ///
     /// Returns `None` when the channel has no conversion. Errors if resolution
     /// needs the source (a deferred conversion) but none is attached — attach
-    /// one with [`set_file`](Self::set_file) / [`set_url`](Self::set_url).
-    pub fn conversion(&self, name: &str) -> Result<Option<ConversionBlock>, MdfError> {
-        let (g, c) = self.locate(name).ok_or_else(|| {
-            MdfError::BlockSerializationError(format!("Channel '{}' not found", name))
-        })?;
+    /// one with [`set_source`](Self::set_source).
+    ///
+    /// This returns the raw [`ConversionBlock`]; [`conversion`](Self::conversion)
+    /// is the contract method returning a plain [`ConversionInfo`].
+    pub fn conversion_block(&self, name: &str, group: Option<&str>) -> Result<Option<ConversionBlock>, MdfError> {
+        let (g, c) = self.locate_checked(name, group)?;
         let channel = &self.channel_groups[g].channels[c];
         if let Some(conv) = &channel.conversion {
             return Ok(Some(conv.clone()));
@@ -2852,6 +3074,8 @@ impl MdfIndex {
         g: usize,
         c: usize,
     ) -> Result<Vec<f64>, MdfError> {
+        #[cfg(target_arch = "wasm32")]
+        let _ = (g, c);
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
             Source::File(path) => {
@@ -3042,21 +3266,11 @@ impl MdfIndex {
     /// first record to its last byte in the fragment's last record. Because
     /// records interleave all channels of the group, the span **includes the
     /// bytes of the other channels** lying between this channel's samples.
-    pub fn byte_ranges(&self, name: &str) -> Result<Vec<(u64, u64)>, MdfError> {
-        let (g, c) = self.locate(name).ok_or_else(|| {
-            MdfError::BlockSerializationError(format!("Channel '{}' not found", name))
-        })?;
-        self.get_channel_byte_ranges(g, c)
-    }
-
-    /// Byte ranges for a channel addressed by group name + channel name.
-    pub fn byte_ranges_in(&self, group: &str, name: &str) -> Result<Vec<(u64, u64)>, MdfError> {
-        let (g, c) = self.locate_in(group, name).ok_or_else(|| {
-            MdfError::BlockSerializationError(format!(
-                "Channel '{}' not found in group '{}'",
-                name, group
-            ))
-        })?;
+    ///
+    /// Pass `group` to resolve the channel in the group(s) with that name.
+    /// Refused for VLSD channels (use `read` / `values`).
+    pub fn byte_ranges(&self, name: &str, group: Option<&str>) -> Result<Vec<(u64, u64)>, MdfError> {
+        let (g, c) = self.locate_checked(name, group)?;
         self.get_channel_byte_ranges(g, c)
     }
 
@@ -3071,10 +3285,9 @@ impl MdfIndex {
         name: &str,
         start_record: u64,
         record_count: u64,
+        group: Option<&str>,
     ) -> Result<Vec<(u64, u64)>, MdfError> {
-        let (g, c) = self.locate(name).ok_or_else(|| {
-            MdfError::BlockSerializationError(format!("Channel '{}' not found", name))
-        })?;
+        let (g, c) = self.locate_checked(name, group)?;
         self.get_channel_byte_ranges_for_records(g, c, start_record, record_count)
     }
 
@@ -3343,65 +3556,44 @@ impl<'a, R: ByteRangeReader<Error = MdfError>> MdfReader<'a, R> {
         self.reader
     }
 
-    fn locate(&self, name: &str) -> Result<(usize, usize), MdfError> {
-        self.index.locate(name).ok_or_else(|| {
-            MdfError::BlockSerializationError(format!("Channel '{}' not found", name))
-        })
+    /// Read a channel as a [`Signal`] — see [`MdfIndex::read`].
+    pub fn read<'o>(&mut self, name: &str, options: impl Into<Option<&'o ReadOptions>>) -> Result<Signal, MdfError> {
+        let default = ReadOptions::default();
+        let options = options.into().unwrap_or(&default);
+        let window = options.window()?;
+        let (g, c) = self.index.locate_checked(name, options.group_name())?;
+        if window == Window::All {
+            return self.read_signal(g, c);
+        }
+        let (start, count) = self.index.resolve_window(g, c, window, &mut self.reader)?;
+        read_signal_window(self.index, g, c, start, count, &mut self.reader)
     }
 
-    fn locate_in(&self, group: &str, name: &str) -> Result<(usize, usize), MdfError> {
-        self.index.locate_in(group, name).ok_or_else(|| {
-            MdfError::BlockSerializationError(format!(
-                "Channel '{}' not found in group '{}'",
-                name, group
-            ))
-        })
+    /// Read a numeric channel as plain `f64` values — see [`MdfIndex::values`].
+    pub fn values<'o>(&mut self, name: &str, options: impl Into<Option<&'o ReadOptions>>) -> Result<Vec<f64>, MdfError> {
+        let default = ReadOptions::default();
+        let options = options.into().unwrap_or(&default);
+        let window = options.window()?;
+        let (g, c) = self.index.locate_checked(name, options.group_name())?;
+        if window == Window::All {
+            return self.index.read_channel_values_as_f64(g, c, &mut self.reader);
+        }
+        let (start, count) = self.index.resolve_window(g, c, window, &mut self.reader)?;
+        self.index.values_f64_window(g, c, start, count, &mut self.reader)
     }
 
-    /// Read all samples of a channel by name (first match across groups).
-    ///
-    /// Conversions stored in the index are applied; invalid samples are `None`.
-    pub fn values(&mut self, name: &str) -> Result<Vec<Option<DecodedValue>>, MdfError> {
-        let (g, c) = self.locate(name)?;
+    /// Rust-only: all samples of a channel as decoded values (no time axis),
+    /// keeping text and byte values that `values` would turn into `NaN`.
+    pub fn decoded_values(&mut self, name: &str, group: Option<&str>) -> Result<Vec<Option<DecodedValue>>, MdfError> {
+        let (g, c) = self.index.locate_checked(name, group)?;
         self.index.read_channel_values(g, c, &mut self.reader)
     }
 
-    /// Read all samples of a channel, addressed by group name + channel name.
-    pub fn values_in(
-        &mut self,
-        group: &str,
-        name: &str,
-    ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
-        let (g, c) = self.locate_in(group, name)?;
-        self.index.read_channel_values(g, c, &mut self.reader)
-    }
-
-    /// Fast path: read a numeric channel by name as `Vec<f64>`.
-    ///
-    /// Invalid / non-numeric samples are `f64::NAN`. Conversions that reduce to
-    /// a linear scale are applied inline.
-    pub fn values_f64(&mut self, name: &str) -> Result<Vec<f64>, MdfError> {
-        let (g, c) = self.locate(name)?;
-        self.index.read_channel_values_as_f64(g, c, &mut self.reader)
-    }
-
-    /// Fast `f64` path addressed by group name + channel name.
-    pub fn values_f64_in(&mut self, group: &str, name: &str) -> Result<Vec<f64>, MdfError> {
-        let (g, c) = self.locate_in(group, name)?;
-        self.index.read_channel_values_as_f64(g, c, &mut self.reader)
-    }
-
-    /// Read a channel by name as a [`Signal`] (values paired with the group's
-    /// master/time axis), using this reader's bound source.
-    pub fn signal(&mut self, name: &str) -> Result<Signal, MdfError> {
-        let (g, c) = self.locate(name)?;
-        self.read_signal(g, c)
-    }
-
-    /// [`MdfReader::signal`] addressed by group name + channel name.
-    pub fn signal_in(&mut self, group: &str, name: &str) -> Result<Signal, MdfError> {
-        let (g, c) = self.locate_in(group, name)?;
-        self.read_signal(g, c)
+    /// First and last master (time) value of the group holding `name` — see
+    /// [`MdfIndex::time_range`].
+    pub fn time_range(&mut self, name: &str, group: Option<&str>) -> Result<Option<TimeRange>, MdfError> {
+        let (g, c) = self.index.locate_checked(name, group)?;
+        self.index.time_range_at(g, c, &mut self.reader)
     }
 
     fn read_signal(&mut self, g: usize, c: usize) -> Result<Signal, MdfError> {
@@ -3419,40 +3611,6 @@ impl<'a, R: ByteRangeReader<Error = MdfError>> MdfReader<'a, R> {
             None => Vec::new(),
         };
         Ok(Signal { name, unit, timestamps, values })
-    }
-
-    /// Read records `[start, start + count)` of a channel as a [`Signal`],
-    /// fetching only those records' bytes (and the master's).
-    pub fn signal_records(&mut self, name: &str, start: u64, count: u64) -> Result<Signal, MdfError> {
-        let (g, c) = self.locate(name)?;
-        self.read_signal_window(g, c, start, count)
-    }
-
-    /// [`MdfReader::signal_records`] addressed by group name + channel name.
-    pub fn signal_records_in(&mut self, group: &str, name: &str, start: u64, count: u64) -> Result<Signal, MdfError> {
-        let (g, c) = self.locate_in(group, name)?;
-        self.read_signal_window(g, c, start, count)
-    }
-
-    /// Read the samples of a channel whose master (time) value lies in
-    /// `[t_start, t_end]` (seconds, as stored in the master; `None` leaves that
-    /// side open). The window is located by searching the master, so only a
-    /// few single records plus the selected window are read.
-    pub fn signal_between(&mut self, name: &str, t_start: Option<f64>, t_end: Option<f64>) -> Result<Signal, MdfError> {
-        let (g, c) = self.locate(name)?;
-        let (start, count) = self.index.record_window_for_time(g, c, t_start, t_end, &mut self.reader)?;
-        self.read_signal_window(g, c, start, count)
-    }
-
-    /// [`MdfReader::signal_between`] addressed by group name + channel name.
-    pub fn signal_between_in(&mut self, group: &str, name: &str, t_start: Option<f64>, t_end: Option<f64>) -> Result<Signal, MdfError> {
-        let (g, c) = self.locate_in(group, name)?;
-        let (start, count) = self.index.record_window_for_time(g, c, t_start, t_end, &mut self.reader)?;
-        self.read_signal_window(g, c, start, count)
-    }
-
-    fn read_signal_window(&mut self, g: usize, c: usize, start: u64, count: u64) -> Result<Signal, MdfError> {
-        read_signal_window(self.index, g, c, start, count, &mut self.reader)
     }
 }
 

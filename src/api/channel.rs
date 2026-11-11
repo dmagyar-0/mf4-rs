@@ -66,6 +66,25 @@ impl<'a> Channel<'a> {
         Ok(Some(conversion))
     }
 
+    /// This channel's metadata as a plain [`ChannelInfo`](crate::types::ChannelInfo).
+    pub fn info(&self) -> Result<crate::types::ChannelInfo, MdfError> {
+        Ok(crate::types::ChannelInfo {
+            name: self.name()?,
+            unit: self.unit()?,
+            comment: self.comment()?,
+            data_type: self.block.data_type.name().to_string(),
+            bit_count: self.block.bit_count,
+            is_master: self.is_master(),
+            is_vlsd: self.block.channel_type == 1 && self.block.data != 0,
+            has_conversion: self.block.conversion_addr != 0,
+        })
+    }
+
+    /// `true` when this is a master (time) channel (`cn_type` 2 or 3).
+    pub fn is_master(&self) -> bool {
+        matches!(self.block.channel_type, 2 | 3)
+    }
+
     /// Get the acquisition source for this channel if available.
     pub fn source(&self) -> Result<Option<SourceInfo>, MdfError> {
         let addr = self.block.source_addr;
@@ -81,7 +100,7 @@ impl<'a> Channel<'a> {
     /// A vector with one `Option<DecodedValue>` per record:
     /// - `Some(value)` for valid samples
     /// - `None` for invalid samples (invalidation bit set or decoding failed)
-    pub fn values(&self) -> Result<Vec<Option<DecodedValue>>, MdfError> {
+    pub fn decoded_values(&self) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         let record_id_len = self.raw_data_group.block.record_id_len as usize;
         let cg_data_bytes = self.raw_channel_group.block.samples_byte_nr;
         let invalidation_bytes_nr = self.raw_channel_group.block.invalidation_bytes_nr;
@@ -178,20 +197,20 @@ impl<'a> Channel<'a> {
 
     /// Decode all samples as **physical** f64 values.
     ///
-    /// This is significantly faster than `values()` for numeric channels
+    /// This is significantly faster than `decoded_values()` for numeric channels
     /// because it avoids the `Option<DecodedValue>` wrapping. Conversions are
     /// applied (with a fast inline path for linear conversions) and samples
     /// flagged invalid via invalidation bits or the all-invalid channel flag
     /// are returned as NaN — matching `MdfIndex`'s `values_f64` semantics.
     /// Non-numeric results (e.g. text conversions) are returned as NaN.
-    pub fn values_as_f64(&self) -> Result<Vec<f64>, MdfError> {
+    pub fn values(&self) -> Result<Vec<f64>, MdfError> {
         let record_id_len = self.raw_data_group.block.record_id_len as usize;
         let cg_data_bytes = self.raw_channel_group.block.samples_byte_nr;
         let capacity = self.raw_channel_group.block.cycles_nr as usize;
         let mut out = Vec::with_capacity(capacity);
 
         if matches!(self.block.channel_type, 3 | 6) {
-            return Ok(self.values()?.iter().map(crate::signal::decoded_opt_to_f64).collect());
+            return Ok(self.decoded_values()?.iter().map(crate::signal::decoded_opt_to_f64).collect());
         }
 
         let all_invalid = self.block.flags & 0x01 != 0;

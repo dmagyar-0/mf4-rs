@@ -3,7 +3,7 @@
 // framing, DL equal-length semantics, write_record_u64 auto-splitting,
 // degenerate splits, VLSD channel normalization and header start time.
 
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::blocks::channel_group_block::ChannelGroupBlock;
 use mf4_rs::blocks::common::{BlockParse, DataType};
 use mf4_rs::blocks::data_group_block::DataGroupBlock;
@@ -43,8 +43,8 @@ fn fixed_string_channel_errors_on_start() -> Result<(), MdfError> {
     let path = tmp("fixw_fixed_string.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::StringUtf8; // fixed-length string, NOT VLSD
         ch.bit_count = 64;
         ch.name = Some("Label".into());
@@ -62,8 +62,8 @@ fn big_endian_channel_errors_on_start() -> Result<(), MdfError> {
     let path = tmp("fixw_be.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::UnsignedIntegerBE;
         ch.bit_count = 32;
         ch.name = Some("BigEnd".into());
@@ -78,8 +78,8 @@ fn type_mismatched_value_errors_on_write() -> Result<(), MdfError> {
     let path = tmp("fixw_mismatch.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.bit_count = 32;
         ch.name = Some("U32".into());
@@ -103,8 +103,8 @@ fn type_mismatched_value_errors_on_write() -> Result<(), MdfError> {
     w.finish_data_block(&cg)?;
     w.finalize()?;
 
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
-    let values = mdf.channel_groups()[0].channels()[0].values()?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
+    let values = mdf.channel_groups()[0].channels()[0].decoded_values()?;
     assert_eq!(
         values,
         vec![
@@ -121,8 +121,8 @@ fn unsigned_out_of_range_into_signed_errors() -> Result<(), MdfError> {
     let path = tmp("fixw_signed_range.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::SignedIntegerLE;
         ch.bit_count = 64;
         ch.name = Some("I64".into());
@@ -147,8 +147,8 @@ fn nonzero_bit_offset_errors_on_start() -> Result<(), MdfError> {
     let path = tmp("fixw_bit_offset.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.bit_count = 4;
         ch.bit_offset = 3;
@@ -169,8 +169,8 @@ fn f16_float_errors_on_start() -> Result<(), MdfError> {
     let path = tmp("fixw_f16.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 16; // half float: unsupported
         ch.name = Some("Half".into());
@@ -191,16 +191,16 @@ fn invalidation_bytes_round_trip_with_correct_stride() -> Result<(), MdfError> {
     let path = tmp("fixw_inval.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |cg| {
+    let cg = w.add_channel_group_with(None, |cg| {
         cg.invalidation_bytes_nr = 2;
     })?;
-    let t = w.add_channel(&cg, None, |ch| {
+    let t = w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Time".into());
     })?;
     w.set_time_channel(&t)?;
-    w.add_channel(&cg, Some(&t), |ch| {
+    w.add_channel_with(&cg, Some(&t), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.bit_count = 32;
         ch.name = Some("Value".into());
@@ -236,10 +236,10 @@ fn invalidation_bytes_round_trip_with_correct_stride() -> Result<(), MdfError> {
 
     // The file must decode correctly (invalidation bytes are zero-filled, so
     // every value is valid).
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let groups = mdf.channel_groups();
     let channels = groups[0].channels();
-    let vals = channels[1].values()?;
+    let vals = channels[1].decoded_values()?;
     assert_eq!(vals.len(), n as usize);
     for (i, v) in vals.iter().enumerate() {
         assert_eq!(*v, Some(DecodedValue::UnsignedInteger(i as u64 * 100)));
@@ -257,9 +257,9 @@ fn dl_equal_length_is_fragment_data_length() -> Result<(), MdfError> {
     let path = tmp("fixw_dl_equal.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
+    let cg = w.add_channel_group_with(None, |_| {})?;
     // 64 KiB byte-array records force a DT split after 63 records.
-    w.add_channel(&cg, None, |ch| {
+    w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::ByteArray;
         ch.bit_count = 64 * 1024 * 8;
         ch.name = Some("Blob".into());
@@ -291,9 +291,9 @@ fn dl_equal_length_is_fragment_data_length() -> Result<(), MdfError> {
     }
 
     // Round trip still works across the fragment chain.
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let groups = mdf.channel_groups();
-    let vals = groups[0].channels()[0].values()?;
+    let vals = groups[0].channels()[0].decoded_values()?;
     assert_eq!(vals.len(), 100);
     match &vals[99] {
         Some(DecodedValue::ByteArray(b)) => {
@@ -316,10 +316,10 @@ fn write_record_u64_splits_at_4mb() -> Result<(), MdfError> {
     let path = tmp("fixw_u64_split.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
+    let cg = w.add_channel_group_with(None, |_| {})?;
     let mut prev: Option<String> = None;
     for i in 0..8 {
-        let id = w.add_channel(&cg, prev.as_deref(), |ch| {
+        let id = w.add_channel_with(&cg, prev.as_deref(), |ch| {
             ch.data_type = DataType::UnsignedIntegerLE;
             ch.bit_count = 64;
             ch.name = Some(format!("U{}", i));
@@ -346,14 +346,14 @@ fn write_record_u64_splits_at_4mb() -> Result<(), MdfError> {
     let dl = DataListBlock::from_bytes(&bytes[data_addr as usize..]).unwrap();
     assert!(dl.data_links.len() >= 2);
 
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let groups = mdf.channel_groups();
     let channels = groups[0].channels();
-    let vals = channels[0].values()?;
+    let vals = channels[0].decoded_values()?;
     assert_eq!(vals.len(), n as usize);
     assert_eq!(vals[0], Some(DecodedValue::UnsignedInteger(0)));
     assert_eq!(vals[n as usize - 1], Some(DecodedValue::UnsignedInteger(n - 1)));
-    let vals7 = channels[7].values()?;
+    let vals7 = channels[7].decoded_values()?;
     assert_eq!(vals7[n as usize - 1], Some(DecodedValue::UnsignedInteger(n - 1 + 7)));
     std::fs::remove_file(&path)?;
     Ok(())
@@ -369,10 +369,10 @@ fn oversized_record_does_not_create_empty_fragment() -> Result<(), MdfError> {
     let path = tmp("fixw_oversized.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
+    let cg = w.add_channel_group_with(None, |_| {})?;
     // 5 MB record: larger than MAX_DT_BLOCK_SIZE - 24.
     let record_bytes: usize = 5 * 1024 * 1024;
-    w.add_channel(&cg, None, |ch| {
+    w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::ByteArray;
         ch.bit_count = (record_bytes * 8) as u32;
         ch.name = Some("Huge".into());
@@ -412,14 +412,14 @@ fn vlsd_channel_gets_bit_count_64_and_null_data_link() -> Result<(), MdfError> {
     let path = tmp("fixw_vlsd_norm.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Time".into());
     })?;
     w.set_time_channel(&t)?;
-    w.add_channel(&cg, Some(&t), |ch| {
+    w.add_channel_with(&cg, Some(&t), |ch| {
         ch.data_type = DataType::StringUtf8;
         ch.channel_type = 1; // VLSD — note: no `ch.data = 1` sentinel needed
         ch.bit_count = 32; // wrong on purpose; must be forced to 64
@@ -448,14 +448,14 @@ fn vlsd_write_read_round_trip_without_sentinel() -> Result<(), MdfError> {
     let path = tmp("fixw_vlsd_rt.mf4");
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Time".into());
     })?;
     w.set_time_channel(&t)?;
-    w.add_channel(&cg, Some(&t), |ch| {
+    w.add_channel_with(&cg, Some(&t), |ch| {
         ch.data_type = DataType::StringUtf8;
         ch.channel_type = 1; // detection must work WITHOUT ch.data = 1
         ch.name = Some("Msg".into());
@@ -474,10 +474,10 @@ fn vlsd_write_read_round_trip_without_sentinel() -> Result<(), MdfError> {
     w.finish_data_block(&cg)?;
     w.finalize()?;
 
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let groups = mdf.channel_groups();
     let channels = groups[0].channels();
-    let vals = channels[1].values()?;
+    let vals = channels[1].decoded_values()?;
     assert_eq!(vals.len(), msgs.len());
     for (v, want) in vals.iter().zip(msgs.iter()) {
         match v {
@@ -515,7 +515,7 @@ fn init_mdf_file_sets_current_start_time() -> Result<(), MdfError> {
         .unwrap()
         .as_nanos() as u64;
 
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let start = mdf
         .start_time_ns()
         .expect("writer must stamp a non-zero start time");
@@ -527,9 +527,9 @@ fn init_mdf_file_sets_current_start_time() -> Result<(), MdfError> {
     // set_start_time must still be able to override it.
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    w.set_start_time(1_700_000_000_000_000_000, 60, 0, 0b11, 0)?;
+    w.set_start_time_with(1_700_000_000_000_000_000, 60, 0, 0b11, 0)?;
     w.finalize()?;
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     assert_eq!(mdf.start_time_ns(), Some(1_700_000_000_000_000_000));
     std::fs::remove_file(&path)?;
     Ok(())

@@ -23,8 +23,8 @@ pub enum ColumnData<'a> {
 }
 
 pub(super) enum ChannelEncoder {
-    UInt { offset: usize, bytes: usize },
-    Int { offset: usize, bytes: usize },
+    UInt { offset: usize, bytes: usize, bits: u32 },
+    Int { offset: usize, bytes: usize, bits: u32 },
     F32 { offset: usize },
     F64 { offset: usize },
     Bytes { offset: usize, bytes: usize },
@@ -53,38 +53,42 @@ impl ChannelEncoder {
 
     fn encode(&self, buf: &mut [u8], value: &DecodedValue) -> Result<(), MdfError> {
         match (self, value) {
-            (ChannelEncoder::UInt { offset, bytes }, DecodedValue::UnsignedInteger(v)) => {
+            (ChannelEncoder::UInt { offset, bytes, bits }, DecodedValue::UnsignedInteger(v)) => {
+                check_unsigned_fits(*v, *bits)?;
                 let b = v.to_le_bytes();
                 buf[*offset..*offset + *bytes].copy_from_slice(&b[..*bytes]);
                 Ok(())
             }
             // Signed values are accepted into unsigned channels only when
             // non-negative; a negative value cannot be represented.
-            (ChannelEncoder::UInt { offset, bytes }, DecodedValue::SignedInteger(v)) => {
+            (ChannelEncoder::UInt { offset, bytes, bits }, DecodedValue::SignedInteger(v)) => {
                 if *v < 0 {
                     return Err(MdfError::BlockSerializationError(format!(
                         "cannot encode negative value {} into an unsigned integer channel",
                         v
                     )));
                 }
+                check_unsigned_fits(*v as u64, *bits)?;
                 let b = (*v as u64).to_le_bytes();
                 buf[*offset..*offset + *bytes].copy_from_slice(&b[..*bytes]);
                 Ok(())
             }
-            (ChannelEncoder::Int { offset, bytes }, DecodedValue::SignedInteger(v)) => {
+            (ChannelEncoder::Int { offset, bytes, bits }, DecodedValue::SignedInteger(v)) => {
+                check_signed_fits(*v, *bits)?;
                 let b = v.to_le_bytes();
                 buf[*offset..*offset + *bytes].copy_from_slice(&b[..*bytes]);
                 Ok(())
             }
             // Unsigned values are accepted into signed channels only when they
             // fit in the signed range.
-            (ChannelEncoder::Int { offset, bytes }, DecodedValue::UnsignedInteger(v)) => {
+            (ChannelEncoder::Int { offset, bytes, bits }, DecodedValue::UnsignedInteger(v)) => {
                 if *v > i64::MAX as u64 {
                     return Err(MdfError::BlockSerializationError(format!(
                         "cannot encode unsigned value {} into a signed integer channel (out of range)",
                         v
                     )));
                 }
+                check_signed_fits(*v as i64, *bits)?;
                 let b = (*v as i64).to_le_bytes();
                 buf[*offset..*offset + *bytes].copy_from_slice(&b[..*bytes]);
                 Ok(())
@@ -117,13 +121,57 @@ impl ChannelEncoder {
         }
     }
 
-    fn encode_u64(&self, buf: &mut [u8], value: u64) {
-        if let ChannelEncoder::UInt { offset, bytes } = self {
+    fn encode_u64(&self, buf: &mut [u8], value: u64) -> Result<(), MdfError> {
+        if let ChannelEncoder::UInt { offset, bytes, bits } = self {
+            check_unsigned_fits(value, *bits)?;
             let b = value.to_le_bytes();
             buf[*offset..*offset + *bytes].copy_from_slice(&b[..*bytes]);
         }
+        Ok(())
     }
 
+}
+
+/// Error unless `v` fits an unsigned field of `bits` bits.
+fn check_unsigned_fits(v: u64, bits: u32) -> Result<(), MdfError> {
+    if bits < 64 && v >> bits != 0 {
+        return Err(MdfError::InvalidArgument(format!(
+            "value {v} does not fit a {bits}-bit unsigned integer channel"
+        )));
+    }
+    Ok(())
+}
+
+/// Error unless `v` fits a signed (two's complement) field of `bits` bits.
+fn check_signed_fits(v: i64, bits: u32) -> Result<(), MdfError> {
+    if (1..64).contains(&bits) {
+        let shift = 64 - bits;
+        if (v << shift) >> shift != v {
+            return Err(MdfError::InvalidArgument(format!(
+                "value {v} does not fit a {bits}-bit signed integer channel"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Encode text for a variable-length channel in the channel's own encoding.
+fn encode_text(text: &str, data_type: &DataType) -> Result<Vec<u8>, MdfError> {
+    match data_type {
+        DataType::StringLatin1 => text
+            .chars()
+            .map(|c| {
+                u8::try_from(c as u32).map_err(|_| {
+                    MdfError::InvalidArgument(format!(
+                        "character {c:?} cannot be written to a StringLatin1 channel"
+                    ))
+                })
+            })
+            .collect(),
+        DataType::StringUtf16LE => Ok(text.encode_utf16().flat_map(u16::to_le_bytes).collect()),
+        DataType::StringUtf16BE => Ok(text.encode_utf16().flat_map(u16::to_be_bytes).collect()),
+        _ => Ok(text.as_bytes().to_vec()),
+    }
 }
 
 const MAX_DT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
@@ -144,17 +192,39 @@ fn encode_values(
 /// per-channel buffers in `dt.vlsd_payloads` and writing the running offset
 /// into `dt.record_buf`. Non-VLSD channels are encoded in-place via
 /// `ChannelEncoder::encode`.
+///
+/// All or nothing: if any value is refused, the payloads appended for earlier
+/// VLSD channels of the same record are rolled back, so a refused record
+/// leaves no trace in the `##SD` streams.
 fn encode_record(dt: &mut super::OpenDataBlock, values: &[DecodedValue]) -> Result<(), MdfError> {
+    let payload_lengths: Vec<Option<usize>> =
+        dt.vlsd_payloads.iter().map(|p| p.as_ref().map(Vec::len)).collect();
+    let result = encode_record_values(dt, values);
+    if result.is_err() {
+        for (payload, length) in dt.vlsd_payloads.iter_mut().zip(payload_lengths) {
+            if let (Some(payload), Some(length)) = (payload.as_mut(), length) {
+                payload.truncate(length);
+            }
+        }
+    }
+    result
+}
+
+fn encode_record_values(dt: &mut super::OpenDataBlock, values: &[DecodedValue]) -> Result<(), MdfError> {
     for (i, val) in values.iter().enumerate() {
         match &dt.encoders[i] {
             ChannelEncoder::VlsdOffset { offset, channel_index } => {
                 let off = *offset;
                 let ch_idx = *channel_index;
+                let encoded;
                 let bytes: &[u8] = match val {
                     DecodedValue::ByteArray(b)
                     | DecodedValue::MimeSample(b)
                     | DecodedValue::MimeStream(b) => b.as_slice(),
-                    DecodedValue::String(s) => s.as_bytes(),
+                    DecodedValue::String(s) => {
+                        encoded = encode_text(s, &dt.channels[i].data_type)?;
+                        &encoded
+                    }
                     other => {
                         return Err(MdfError::BlockSerializationError(format!(
                             "value {:?} cannot be written to a VLSD channel (expected String or ByteArray)",
@@ -178,7 +248,7 @@ fn encode_record(dt: &mut super::OpenDataBlock, values: &[DecodedValue]) -> Resu
 
 impl MdfWriter {
     /// Start writing a DTBLOCK for the given data group.
-    pub fn start_data_block(
+    pub fn start_data_block_with(
         &mut self,
         dg_id: &str,
         cg_id: &str,
@@ -275,8 +345,15 @@ impl MdfWriter {
                 ChannelEncoder::VlsdOffset { offset, channel_index: i }
             } else {
                 match ch.data_type {
-                    DataType::UnsignedIntegerLE => ChannelEncoder::UInt { offset, bytes },
-                    DataType::SignedIntegerLE => ChannelEncoder::Int { offset, bytes },
+                    DataType::UnsignedIntegerLE | DataType::SignedIntegerLE if ch.bit_count == 0 || ch.bit_count > 64 => {
+                        return Err(MdfError::InvalidArgument(format!(
+                            "integer channel '{}' has an unsupported width of {} bits",
+                            ch.name.as_deref().unwrap_or_default(),
+                            ch.bit_count
+                        )));
+                    }
+                    DataType::UnsignedIntegerLE => ChannelEncoder::UInt { offset, bytes, bits: ch.bit_count },
+                    DataType::SignedIntegerLE => ChannelEncoder::Int { offset, bytes, bits: ch.bit_count },
                     DataType::FloatLE => {
                         if ch.bit_count == 32 {
                             ChannelEncoder::F32 { offset }
@@ -331,7 +408,7 @@ impl MdfWriter {
     ) -> Result<(), MdfError> {
         let dg = self.cg_to_dg.get(cg_id).ok_or_else(|| MdfError::BlockSerializationError("unknown channel group".into()))?.clone();
         let channels = self.cg_channels.get(cg_id).ok_or_else(|| MdfError::BlockSerializationError("no channels for channel group".into()))?.clone();
-        self.start_data_block(&dg, cg_id, record_id_len, &channels)
+        self.start_data_block_with(&dg, cg_id, record_id_len, &channels)
     }
 
     /// Open a DT block for raw byte-level record writing.
@@ -444,15 +521,19 @@ impl MdfWriter {
                 && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
         };
 
+        // Encode first: a refused record must not start a new block.
+        {
+            let dt = self.open_dts.get_mut(cg_id).unwrap();
+            dt.record_buf.copy_from_slice(&dt.record_template);
+            encode_record(dt, values)?;
+        }
+
         if potential_new_block {
             let mut empty = Vec::new();
             self.split_dt_block(cg_id, &mut empty)?;
         }
 
         let dt = self.open_dts.get_mut(cg_id).unwrap();
-        dt.record_buf.copy_from_slice(&dt.record_template);
-        encode_record(dt, values)?;
-
         self.file.write_all(&dt.record_buf)?;
         dt.record_count += 1;
         self.offset += dt.record_buf.len() as u64;
@@ -511,16 +592,21 @@ impl MdfWriter {
                 && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
         };
 
+        // Encode first: a refused record must not start a new block.
+        {
+            let dt = self.open_dts.get_mut(cg_id).unwrap();
+            dt.record_buf.copy_from_slice(&dt.record_template);
+            for (enc, &v) in dt.encoders.iter().zip(values.iter()) {
+                enc.encode_u64(&mut dt.record_buf, v)?;
+            }
+        }
+
         if potential_new_block {
             let mut empty = Vec::new();
             self.split_dt_block(cg_id, &mut empty)?;
         }
 
         let dt = self.open_dts.get_mut(cg_id).unwrap();
-        dt.record_buf.copy_from_slice(&dt.record_template);
-        for (enc, &v) in dt.encoders.iter().zip(values.iter()) {
-            enc.encode_u64(&mut dt.record_buf, v);
-        }
         self.file.write_all(&dt.record_buf)?;
         dt.record_count += 1;
         self.offset += dt.record_buf.len() as u64;
@@ -543,24 +629,39 @@ impl MdfWriter {
         let max_records = (MAX_DT_BLOCK_SIZE - 24) / record_size;
         let mut buffer = Vec::with_capacity(record_size * max_records);
         for record in records {
-            let potential_new_block = {
+            let (count_matches, potential_new_block) = {
                 let dt = self.open_dts.get(cg_id).ok_or_else(|| {
                     MdfError::BlockSerializationError("no open DT block for this channel group".into())
                 })?;
-                if record.len() != dt.channels.len() {
-                    return Err(MdfError::BlockSerializationError("value count mismatch".into()));
-                }
-                dt.record_count > 0
-                    && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
+                (
+                    !(record.len() != dt.channels.len()),
+                    dt.record_count > 0
+                        && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE,
+                )
             };
+            if !count_matches {
+                // Keep the records already accepted (they are counted).
+                self.flush_records(&mut buffer)?;
+                return Err(MdfError::BlockSerializationError("value count mismatch".into()));
+            }
+
+            // Encode first; on a refused record, keep the records already
+            // accepted (they are counted) and stop.
+            let encoded = {
+                let dt = self.open_dts.get_mut(cg_id).unwrap();
+                dt.record_buf.copy_from_slice(&dt.record_template);
+                encode_record(dt, record)
+            };
+            if let Err(error) = encoded {
+                self.flush_records(&mut buffer)?;
+                return Err(error);
+            }
 
             if potential_new_block {
                 self.split_dt_block(cg_id, &mut buffer)?;
             }
 
             let dt = self.open_dts.get_mut(cg_id).unwrap();
-            dt.record_buf.copy_from_slice(&dt.record_template);
-            encode_record(dt, record)?;
             buffer.extend_from_slice(&dt.record_buf);
             dt.record_count += 1;
         }
@@ -595,26 +696,42 @@ impl MdfWriter {
         let max_records = (MAX_DT_BLOCK_SIZE - 24) / record_size;
         let mut buffer = Vec::with_capacity(record_size * max_records);
         for rec in records {
-            let potential_new_block = {
+            let (count_matches, potential_new_block) = {
                 let dt = self.open_dts.get(cg_id).ok_or_else(|| {
                     MdfError::BlockSerializationError("no open DT block for this channel group".into())
                 })?;
-                if rec.len() != dt.encoders.len() {
-                    return Err(MdfError::BlockSerializationError("value count mismatch".into()));
-                }
-                dt.record_count > 0
-                    && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
+                (
+                    !(rec.len() != dt.encoders.len()),
+                    dt.record_count > 0
+                        && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE,
+                )
             };
+            if !count_matches {
+                // Keep the records already accepted (they are counted).
+                self.flush_records(&mut buffer)?;
+                return Err(MdfError::BlockSerializationError("value count mismatch".into()));
+            }
+
+            // Encode first; on a refused record, keep the records already
+            // accepted (they are counted) and stop.
+            let encoded = {
+                let dt = self.open_dts.get_mut(cg_id).unwrap();
+                dt.record_buf.copy_from_slice(&dt.record_template);
+                dt.encoders
+                    .iter()
+                    .zip(rec.iter())
+                    .try_for_each(|(enc, &v)| enc.encode_u64(&mut dt.record_buf, v))
+            };
+            if let Err(error) = encoded {
+                self.flush_records(&mut buffer)?;
+                return Err(error);
+            }
 
             if potential_new_block {
                 self.split_dt_block(cg_id, &mut buffer)?;
             }
 
             let dt = self.open_dts.get_mut(cg_id).unwrap();
-            dt.record_buf.copy_from_slice(&dt.record_template);
-            for (enc, &v) in dt.encoders.iter().zip(rec.iter()) {
-                enc.encode_u64(&mut dt.record_buf, v);
-            }
             buffer.extend_from_slice(&dt.record_buf);
             dt.record_count += 1;
         }
@@ -622,6 +739,16 @@ impl MdfWriter {
         if !buffer.is_empty() {
             self.file.write_all(&buffer)?;
             self.offset += buffer.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Write buffered, already counted records to the file.
+    fn flush_records(&mut self, buffer: &mut Vec<u8>) -> Result<(), MdfError> {
+        if !buffer.is_empty() {
+            self.file.write_all(buffer)?;
+            self.offset += buffer.len() as u64;
+            buffer.clear();
         }
         Ok(())
     }
@@ -692,16 +819,21 @@ impl MdfWriter {
         let max_records = (MAX_DT_BLOCK_SIZE - 24) / record_size;
         let mut buffer = Vec::with_capacity(record_size * max_records);
         for rec in records {
-            let potential_new_block = {
+            let (count_matches, potential_new_block) = {
                 let dt = self.open_dts.get(cg_id).ok_or_else(|| {
                     MdfError::BlockSerializationError("no open DT block for this channel group".into())
                 })?;
-                if rec.len() != dt.encoders.len() {
-                    return Err(MdfError::BlockSerializationError("value count mismatch".into()));
-                }
-                dt.record_count > 0
-                    && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
+                (
+                    !(rec.len() != dt.encoders.len()),
+                    dt.record_count > 0
+                        && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE,
+                )
             };
+            if !count_matches {
+                // Keep the records already accepted (they are counted).
+                self.flush_records(&mut buffer)?;
+                return Err(MdfError::BlockSerializationError("value count mismatch".into()));
+            }
 
             if potential_new_block {
                 self.split_dt_block(cg_id, &mut buffer)?;
@@ -845,7 +977,7 @@ impl MdfWriter {
                 None => 0,
             };
             let mut total_channel_bytes = 0usize;
-            for (col, enc) in columns.iter().zip(dt.encoders.iter()) {
+            for (column_index, (col, enc)) in columns.iter().zip(dt.encoders.iter()).enumerate() {
                 let col_len = match col {
                     ColumnData::F64(s) => s.len(),
                     ColumnData::F32(s) => s.len(),
@@ -853,7 +985,9 @@ impl MdfWriter {
                     ColumnData::I64(s) => s.len(),
                 };
                 if col_len != nrows {
-                    return Err(MdfError::BlockSerializationError("column length mismatch".into()));
+                    return Err(MdfError::InvalidArgument(format!(
+                        "column length mismatch: column 0 has {nrows} values, another has {col_len}"
+                    )));
                 }
                 let type_ok = match (col, enc) {
                     (ColumnData::F64(_), ChannelEncoder::F64 { .. }) => true,
@@ -862,15 +996,35 @@ impl MdfWriter {
                     (ColumnData::I64(_), ChannelEncoder::Int { .. }) => true,
                     _ => false,
                 };
+                // Integers narrower than 64 bits: refuse values that do not
+                // fit before anything is written.
+                match (col, enc) {
+                    (ColumnData::U64(values), ChannelEncoder::UInt { bits, .. }) if *bits < 64 => {
+                        values.iter().try_for_each(|v| check_unsigned_fits(*v, *bits))?;
+                    }
+                    (ColumnData::I64(values), ChannelEncoder::Int { bits, .. }) if *bits < 64 => {
+                        values.iter().try_for_each(|v| check_signed_fits(*v, *bits))?;
+                    }
+                    _ => {}
+                }
                 if !type_ok {
-                    return Err(MdfError::BlockSerializationError("column type does not match encoder type".into()));
+                    let given = match col {
+                        ColumnData::F64(_) => "64-bit float",
+                        ColumnData::F32(_) => "32-bit float",
+                        ColumnData::U64(_) => "unsigned 64-bit integer",
+                        ColumnData::I64(_) => "signed 64-bit integer",
+                    };
+                    return Err(MdfError::InvalidArgument(format!(
+                        "column {column_index} holds {given} values but its channel is a {} channel",
+                        enc.kind()
+                    )));
                 }
             }
             let enc_info: Vec<(usize, usize)> = dt.encoders.iter().map(|e| match e {
                 ChannelEncoder::F64 { offset } => (*offset, 8usize),
                 ChannelEncoder::F32 { offset } => (*offset, 4usize),
-                ChannelEncoder::UInt { offset, bytes } => (*offset, *bytes),
-                ChannelEncoder::Int { offset, bytes } => (*offset, *bytes),
+                ChannelEncoder::UInt { offset, bytes, .. } => (*offset, *bytes),
+                ChannelEncoder::Int { offset, bytes, .. } => (*offset, *bytes),
                 ChannelEncoder::Bytes { offset, bytes } => (*offset, *bytes),
                 ChannelEncoder::VlsdOffset { .. } | ChannelEncoder::Skip => (0, 0),
             }).collect();

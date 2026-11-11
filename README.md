@@ -10,6 +10,21 @@ The library ships for three ecosystems, all released together from this reposito
 | Python (PyO3 bindings) | [`mf4-rs` on PyPI](https://pypi.org/project/mf4-rs/) | `pip install mf4-rs` |
 | TypeScript / JavaScript (WebAssembly bindings) | `mf4-rs` on npm | `npm install mf4-rs` |
 
+**The API is the same in all three languages** — the same classes (`Mdf`, `MdfIndex`, `MdfWriter`), the same methods, the same types. It is specified in [`docs/API.md`](docs/API.md) and enforced by a contract test per language.
+
+```python
+mdf = mf4_rs.Mdf.from_file("recording.mf4")        # Python
+speed = mdf.read("Speed", group="Engine")
+```
+```rust
+let mdf = Mdf::from_file("recording.mf4")?;         // Rust
+let speed = mdf.read("Speed", &ReadOptions::new().group("Engine"))?;
+```
+```ts
+const mdf = await Mdf.fromFile("recording.mf4");    // TypeScript
+const speed = mdf.read("Speed", { group: "Engine" });
+```
+
 ## Architecture
 
 ### High-Level Structure
@@ -18,9 +33,9 @@ The codebase is organized into distinct layers:
 
 #### 1. API Layer (`src/api/`)
 - **High-level user-facing API** for working with MDF files
-- `MDF` - Main entry point for parsing files from disk
-- `ChannelGroup` - Wrapper providing ergonomic access to channel group metadata
-- `Channel` - High-level channel representation with value decoding
+- `Mdf` - Whole-file reader implementing the cross-language contract (`groups`, `read`, `values`, …)
+- `ChannelGroup` / `Channel` - Borrowed block wrappers underneath it, for raw block access
+- `src/types.rs` - The contract's plain data types (`GroupInfo`, `ChannelInfo`, `ConversionInfo`, `ReadOptions`, `TimeRange`)
 
 #### 2. Writer Module (`src/writer/`)
 - **MdfWriter** - Core writer for creating MDF 4.1-compliant files
@@ -98,95 +113,79 @@ cargo run --example index_operations
 
 ### Working with MDF Files
 
-#### Basic File Creation Pattern:
+Everything below is the contract documented in [`docs/API.md`](docs/API.md); the Python and TypeScript APIs have the same methods.
+
+#### Writing a file
 ```rust
-use mf4_rs::writer::MdfWriter;
-use mf4_rs::blocks::common::DataType;
-use mf4_rs::parsing::decoder::DecodedValue;
+use mf4_rs::{DecodedValue, MdfWriter};
 
 let mut writer = MdfWriter::new("output.mf4")?;
 writer.init_mdf_file()?;
-let cg = writer.add_channel_group(None, |_| {})?;
+let group = writer.add_channel_group(Some("Engine"))?;
 
-// Create master channel (usually time)
-let time_ch_id = writer.add_channel(&cg, None, |ch| {
-    ch.data_type = DataType::FloatLE;
-    ch.name = Some("Time".to_string());
-    ch.bit_count = 64;
-})?;
-writer.set_time_channel(&time_ch_id)?; // Mark as master channel
+writer.add_time_channel(&group, "Time")?;            // master channel, add it first
+let speed = writer.add_float_channel(&group, "Speed")?;
+writer.add_int_channel(&group, "Gear")?;
+writer.add_linear_conversion(&speed, 0.0, 3.6)?;     // m/s -> km/h
 
-// Add data channels with master as parent
-writer.add_channel(&cg, Some(&time_ch_id), |ch| {
-    ch.data_type = DataType::UnsignedIntegerLE;
-    ch.name = Some("DataChannel".to_string());
-    ch.bit_count = 32;
-})?;
-
-writer.start_data_block_for_cg(&cg, 0)?;
-writer.write_record(&cg, &[
-    DecodedValue::Float(1.0),              // Time
-    DecodedValue::UnsignedInteger(42),     // Data
+writer.start_data_block(&group)?;
+writer.write_record(&group, &[
+    DecodedValue::Float(0.0),
+    DecodedValue::Float(12.5),
+    DecodedValue::UnsignedInteger(3),
 ])?;
-writer.finish_data_block(&cg)?;
+writer.finish_data_block(&group)?;
 writer.finalize()?;
 ```
 
-#### Basic File Parsing Pattern:
-```rust
-use mf4_rs::api::mdf::MDF;
+For bulk data use `write_columns` (one slice per channel). The closure-based building blocks (`add_channel_with`, `add_channel_group_with`, …) remain available when you need full control over the written blocks.
 
-let mdf = MDF::from_file("input.mf4")?;
-for group in mdf.channel_groups() {
-    println!("channels: {}", group.channels().len());
-    for channel in group.channels() {
-        let values = channel.values()?;
-        // Process values...
-    }
+#### Reading a file
+```rust
+use mf4_rs::{Mdf, ReadOptions};
+
+let mdf = Mdf::from_file("output.mf4")?;
+for group in mdf.groups()? {
+    println!("{:?}: {} records, channels {:?}", group.name, group.record_count, group.channel_names);
 }
+
+let speed = mdf.read("Speed", None)?;    // Signal { name, unit, timestamps, values }
+let numbers = mdf.values("Speed", None)?; // Vec<f64>, NaN for invalid samples
+
+// Narrow by group and/or read only a time or record window
+let window = mdf.read("Speed", &ReadOptions::new().group("Engine").time(Some(1.0), Some(2.5)))?;
+
+mdf.time_range("Speed", None)?;          // first/last timestamp
+mdf.conversion("Speed", None)?;          // the conversion read/values apply
 ```
 
-### MDF Indexing System
+### Lazy and remote reads with `MdfIndex`
 
-The library includes a powerful indexing system that allows you to:
-1. **Create lightweight JSON indexes** of MDF files containing all metadata needed for data access
-2. **Read channel data without full file parsing** using only the index and targeted file I/O
-3. **Serialize/deserialize indexes** for persistent storage and sharing
-4. **Support multiple data sources** through the `ByteRangeReader` trait (local files, HTTP, S3, etc.)
+`MdfIndex` has the same reading API as `Mdf`, but holds only metadata: it remembers a data **source** (a file path or URL) and fetches just the bytes each call needs — with HTTP range requests for URLs. The index serialises to JSON, so a file needs to be indexed only once.
 
-The public index API is **name-based**: channels and groups are addressed by name, not by positional indices.
-
-#### Basic Indexing Workflow:
 ```rust
-use mf4_rs::index::MdfIndex;
+use mf4_rs::{MdfIndex, ReadOptions};
 
-// Create an index from an MDF file (never reads sample data — only metadata)
+// Index a local file (never reads sample data) and save the index
 let index = MdfIndex::from_file("data.mf4")?;
+index.save("data_index.json")?;
 
-// Save index to JSON for later use
-index.save_to_file("data_index.json")?;
+// Later: load the index. The source is not serialised, so re-attach it.
+let mut index = MdfIndex::load("data_index.json")?;
+index.set_source("data.mf4");            // or "https://cdn.example.com/data.mf4"
 
-// Later: load index and read specific channel data. The data source is not
-// serialized with the index, so re-attach it after loading:
-let mut index = MdfIndex::load_from_file("data_index.json")?;
-index.set_file("data.mf4"); // or index.set_url("https://cdn.example.com/data.mf4")
+let signal = index.read("Temperature", None)?;
+let engine_temp = index.read("Temperature", &ReadOptions::new().group("Engine"))?;
+let last_minute = index.values("Temperature", &ReadOptions::new().time(Some(540.0), None))?;
 
-// Lazy read: fetches only the byte ranges the channel needs and returns a
-// Signal (values paired with the group's master/time axis)
-let signal = index.read("Temperature")?;
-println!("{:?} {:?}", signal.timestamps, signal.values);
-
-// Disambiguate duplicate channel names by group
-let engine_temp = index.read_in("Engine", "Temperature")?;
-
-// Or build the index directly over HTTP (requires the `http` feature)
+// Or index a remote file directly, fetching only its metadata (`http` feature)
 let remote = MdfIndex::from_url("https://cdn.example.com/data.mf4")?;
 
 // Power users: compute raw byte ranges (e.g. for HTTP Range requests)
-let ranges = index.byte_ranges("Temperature")?;
+let ranges = index.byte_ranges("Temperature", None)?;
 ```
 
-Custom data sources (S3, caches, …) plug in through the `ByteRangeReader` trait: `index.open(reader)` returns an `MdfReader` with `values(name)` / `signal(name)` methods.
+Custom data sources (S3, caches, …) plug in through the `ByteRangeReader` trait: `index.open(reader)` returns an `MdfReader` with the same `read` / `values` / `time_range` methods.
 
 ### Column-oriented MDF 4.20 for cloud reads
 
@@ -215,16 +214,16 @@ single-signal cloud reads:
   invalidation bits and VLSD (`##SD`) channels carry over unchanged.
 
 ```rust
-use mf4_rs::column::{to_column_oriented, ColumnOptions};
+use mf4_rs::{to_column_oriented, ColumnOptions};
 
 let report = to_column_oriented("recording.mf4", "recording.col.mf4", &ColumnOptions::default())?;
 println!("{} signals, {} time groups, metadata prefix {} bytes",
          report.signal_groups, report.time_groups, report.metadata_size);
 ```
 
-The output reads like any other MDF file: `MDF`, `MdfIndex`, the Python and
+The output reads like any other MDF file: `Mdf`, `MdfIndex`, the Python and
 TypeScript bindings and asammdf all resolve the remote master transparently
-(`signal("Speed")` comes back with its shared timestamps). Lower-level entry
+(`read("Speed")` comes back with its shared timestamps). Lower-level entry
 points: `to_column_oriented_with(reader, sink, options)` over any
 `ByteRangeReader` and `ColumnSink`, and `to_column_oriented_bytes` in memory.
 
@@ -274,7 +273,7 @@ Check the `python_examples/` directory for complete scripts:
 
 ### Basic Usage
 
-All navigation in the Python API is **by name**. `read()` returns a `pandas.Series` (indexed by the group's master channel as a `DatetimeIndex`); `values()` returns a plain numpy `float64` array (invalid samples are `NaN`).
+The Python API is the contract in [`docs/API.md`](docs/API.md): `read()` returns a `Signal` (numpy `values` + `timestamps`, with `.to_series()` for pandas), `values()` returns a plain numpy `float64` array.
 
 ```python
 import mf4_rs
@@ -283,53 +282,50 @@ import mf4_rs
 writer = mf4_rs.MdfWriter("output.mf4")
 writer.init_mdf_file()
 group = writer.add_channel_group("MyGroup")
+writer.add_time_channel(group, "Time")       # master channel, add it first
+writer.add_float_channel(group, "Data")
 
-# Add channels (the time channel is automatically the master)
-time_ch = writer.add_time_channel(group, "Time")
-data_ch = writer.add_float_channel(group, "Data")
-
-# Write data
 writer.start_data_block(group)
-writer.write_record(group, [
-    mf4_rs.create_float_value(0.1),  # Time
-    mf4_rs.create_float_value(42.0)  # Data
-])
+writer.write_record(group, [0.1, 42.0])      # plain values, one per channel
 writer.finish_data_block(group)
 writer.finalize()
 
 # Reading a file
-mdf = mf4_rs.Mdf("output.mf4")
+mdf = mf4_rs.Mdf.from_file("output.mf4")
 for group in mdf.groups:
-    print(f"Group: {group.name}, Channels: {[c.name for c in group.channels]}")
+    print(f"Group: {group.name}, Channels: {group.channel_names}")
 
-series = mdf.read("Data")     # pandas Series with DatetimeIndex
-array = mdf.values("Data")    # numpy float64 array (no pandas needed)
-same = mdf["Data"]            # __getitem__ is read()
+signal = mdf.read("Data")        # Signal: .values, .timestamps, .name, .unit
+series = signal.to_series()      # pandas Series with a DatetimeIndex
+array = mdf.values("Data")       # numpy float64 array
+same = mdf["Data"]               # __getitem__ is read()
+part = mdf.read("Data", start_time=0.0, end_time=1.0)   # or start_record/record_count
 
 # Column-oriented MDF 4.20 copy for cloud reads (streaming, bounded memory)
 report = mf4_rs.to_column_oriented("output.mf4", "output.col.mf4")
 print(report)  # ColumnReport(signal_groups=..., time_groups=..., ...)
 
-# Lazy remote/indexed reads
+# Lazy remote/indexed reads — same reading API as Mdf
 index = mf4_rs.MdfIndex.from_file("output.mf4")
 index.save("output_index.json")
 
 index = mf4_rs.MdfIndex.load("output_index.json")
-index.source = "output.mf4"   # file path or http(s):// URL
-series = index.read("Data")   # fetches only the byte ranges it needs
+index.set_source("output.mf4")   # file path or http(s):// URL
+signal = index.read("Data")      # fetches only the byte ranges it needs
 ```
 
 ## TypeScript / JavaScript Bindings (WebAssembly)
 
-`mf4-rs` also ships WebAssembly bindings (`src/wasm.rs`, built with `wasm-bindgen`) wrapped in a typed TypeScript package under [`js/`](js/), published to npm as `mf4-rs` on every release. It mirrors the name-based API of the Python bindings: an in-memory `Mdf` reader, an `MdfWriter` producing a `Uint8Array`, and a JSON-serialisable `MdfIndex` for lazy, partial reads of large or remote files over any `RangeSource` (HTTP `fetch`, local file, in-memory bytes, or your own).
+`mf4-rs` also ships WebAssembly bindings (`src/wasm.rs`, built with `wasm-bindgen`) wrapped in a typed TypeScript package under [`js/`](js/), published to npm as `mf4-rs` on every release. It exposes the same API as the Rust crate and the Python package ([`docs/API.md`](docs/API.md)): an in-memory `Mdf` reader, an `MdfWriter` producing a `Uint8Array`, and a JSON-serialisable `MdfIndex` for lazy, partial reads of large or remote files over any `RangeSource` (HTTP `fetch`, local file, in-memory bytes, or your own).
 
 ```ts
 import { Mdf } from "mf4-rs";
 
 const mdf = await Mdf.fromFile("./measurement.mf4");
 console.log(mdf.channelNames());
-const speed = mdf.values("VehicleSpeed");   // number[] (conversions applied, invalid -> NaN)
-const signal = mdf.read("VehicleSpeed");    // { timestamps, values }
+const speed = mdf.values("VehicleSpeed");   // Float64Array (conversions applied, invalid -> NaN)
+const signal = mdf.read("VehicleSpeed");    // Signal { name, unit, timestamps, values }
+const part = mdf.read("VehicleSpeed", { group: "Engine", startTime: 1.0, endTime: 2.5 });
 mdf.dispose();
 ```
 

@@ -32,14 +32,14 @@ fn write_vlsd_file(path: &str) -> Result<usize, MdfError> {
 
     let mut w = MdfWriter::new(path)?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |c| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".into());
     })?;
     w.set_time_channel(&t)?;
-    let vlsd = w.add_channel(&cg, Some(&t), |c| {
+    let vlsd = w.add_channel_with(&cg, Some(&t), |c| {
         c.data_type = DataType::StringUtf8;
         c.bit_count = 64;
         c.channel_type = 1; // VLSD
@@ -79,7 +79,7 @@ fn vlsd_channel_reads_resolve_correctly() -> Result<(), MdfError> {
 
     // MdfReader::values (DecodedValue path) resolves the strings.
     let mut reader = index.open_file(path_str)?;
-    let msgs = reader.values("Msg")?;
+    let msgs = reader.decoded_values("Msg", None)?;
     assert_eq!(msgs.len(), n);
     for (got, want) in msgs.iter().zip(expected.iter()) {
         match got {
@@ -89,19 +89,19 @@ fn vlsd_channel_reads_resolve_correctly() -> Result<(), MdfError> {
     }
 
     // MdfReader::values_f64 (fast f64 path): strings map to NaN, one per record.
-    let f64s = reader.values_f64("Msg")?;
+    let f64s = reader.values("Msg", None)?;
     assert_eq!(f64s.len(), n);
     assert!(f64s.iter().all(|v| v.is_nan()), "string VLSD values must be NaN");
 
     // Byte-range calculation still refuses VLSD channels.
     assert!(
-        index.byte_ranges("Msg").is_err(),
+        index.byte_ranges("Msg", None).is_err(),
         "byte_ranges() on a VLSD channel must error"
     );
 
     // Lazy source-based read (slice path via mmap) yields a Signal whose
     // timestamps align with the values (one per record).
-    let sig = index.read("Msg")?;
+    let sig = index.read("Msg", None)?;
     assert_eq!(sig.values.len(), n);
     assert_eq!(sig.timestamps.len(), n);
     for (got, want) in sig.values.iter().zip(expected.iter()) {
@@ -112,7 +112,7 @@ fn vlsd_channel_reads_resolve_correctly() -> Result<(), MdfError> {
     }
 
     // The fixed-size channel in the same group still reads fine.
-    let times = reader.values_f64("Time")?;
+    let times = reader.values("Time", None)?;
     assert_eq!(times.len(), n);
     assert!(times.iter().all(|v| !v.is_nan()));
 
@@ -124,14 +124,14 @@ fn vlsd_channel_reads_resolve_correctly() -> Result<(), MdfError> {
 fn write_basic_file(path: &str, records: usize) -> Result<(), MdfError> {
     let mut w = MdfWriter::new(path)?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |c| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".into());
     })?;
     w.set_time_channel(&t)?;
-    w.add_channel(&cg, Some(&t), |c| {
+    w.add_channel_with(&cg, Some(&t), |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Value".into());
@@ -180,7 +180,7 @@ fn malformed_index_json_errors_instead_of_panicking() -> Result<(), MdfError> {
         Ok(idx) => {
             // If deserialization were permissive, reading must still error.
             let mut r = idx.open_file(path_str)?;
-            assert!(r.values("Value").is_err(), "record_size == 0 must error on read");
+            assert!(r.decoded_values("Value", None).is_err(), "record_size == 0 must error on read");
         }
     }
 
@@ -194,15 +194,15 @@ fn malformed_index_json_errors_instead_of_panicking() -> Result<(), MdfError> {
     let idx = MdfIndex::from_json(&v.to_string())?;
     let mut r = idx.open(FileRangeReader::new(path_str)?);
     assert!(
-        r.values_f64("Value").is_err(),
+        r.values("Value", None).is_err(),
         "forged huge block size must error, not abort"
     );
 
     // (d) byte_ranges_for_records edge cases: record_count == 0 must not
     // underflow, and start + count must not wrap.
-    assert!(index.byte_ranges_for_records("Time", 0, 0)?.is_empty());
-    assert!(index.byte_ranges_for_records("Time", u64::MAX, 2).is_err());
-    assert!(index.byte_ranges_for_records("Time", 11, 0).is_err());
+    assert!(index.byte_ranges_for_records("Time", 0, 0, None)?.is_empty());
+    assert!(index.byte_ranges_for_records("Time", u64::MAX, 2, None).is_err());
+    assert!(index.byte_ranges_for_records("Time", 11, 0, None).is_err());
 
     std::fs::remove_file(&path)?;
     Ok(())
@@ -246,14 +246,14 @@ fn all_invalid_flag_yields_nan_on_f64_path() -> Result<(), MdfError> {
 
     let mut w = MdfWriter::new(path_str)?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |c| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".into());
     })?;
     w.set_time_channel(&t)?;
-    w.add_channel(&cg, Some(&t), |c| {
+    w.add_channel_with(&cg, Some(&t), |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Broken".into());
@@ -274,12 +274,12 @@ fn all_invalid_flag_yields_nan_on_f64_path() -> Result<(), MdfError> {
 
     let index = MdfIndex::from_file(path_str)?;
     // The group must have NO invalidation bytes for this regression to bite.
-    assert_eq!(index.groups()[0].invalidation_bytes, 0);
+    assert_eq!(index.channel_groups[0].invalidation_bytes, 0);
 
     let mut reader = index.open_file(path_str)?;
 
     // f64 fast path: previously returned the raw values.
-    let broken = reader.values_f64("Broken")?;
+    let broken = reader.values("Broken", None)?;
     assert_eq!(broken.len(), 10);
     assert!(
         broken.iter().all(|v| v.is_nan()),
@@ -288,11 +288,11 @@ fn all_invalid_flag_yields_nan_on_f64_path() -> Result<(), MdfError> {
     );
 
     // Consistency with the DecodedValue path (already handled bit 0).
-    let decoded = reader.values("Broken")?;
+    let decoded = reader.decoded_values("Broken", None)?;
     assert!(decoded.iter().all(|v| v.is_none()));
 
     // Sibling channel without the flag is unaffected.
-    let times = reader.values_f64("Time")?;
+    let times = reader.values("Time", None)?;
     assert!(times.iter().all(|v| !v.is_nan()));
 
     std::fs::remove_file(&path)?;
@@ -309,7 +309,7 @@ fn valid_index_json_round_trips() -> Result<(), MdfError> {
     let index = MdfIndex::from_file(path_str)?;
     let restored = MdfIndex::from_json(&index.to_json()?)?;
     let mut reader = restored.open_file(path_str)?;
-    let vals = reader.values_f64("Value")?;
+    let vals = reader.values("Value", None)?;
     assert_eq!(vals.len(), 25);
     assert_eq!(vals[7], 7.0);
 

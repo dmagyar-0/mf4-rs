@@ -52,12 +52,12 @@ test("VLSD channel reads via the lazy index path (JSON round trip)", async () =>
   const source = new BytesRangeSource(bytes);
 
   // read: strings, one per record, timestamps aligned with the master.
-  const sig = await idx.read("Label", source);
+  const sig = await idx.read("Label", { source: source });
   assert.deepEqual(sig.values, strs);
   assert.equal(sig.timestamps.length, strs.length);
 
   // values: the numeric fast path maps strings to NaN, one per record.
-  const vals = await idx.values("Label", source);
+  const vals = await idx.values("Label", { source: source });
   assert.equal(vals.length, strs.length);
   assert.ok(Array.from(vals).every((v) => Number.isNaN(v)));
 
@@ -92,16 +92,16 @@ test("VLSD and fixed-width channels coexist on the index path", async () => {
 
   // Fixed-width channel in the same (VLSD-containing) group reads via the
   // index path and matches the direct reader.
-  const lazy = await idx.read("Value", source);
+  const lazy = await idx.read("Value", { source: source });
   const direct = mdf.read("Value");
   assert.deepEqual(Array.from(lazy.values as number[]), Array.from(direct.values as number[]));
   assert.deepEqual(Array.from(lazy.timestamps), Array.from(direct.timestamps));
 
-  const lazyVals = await idx.values("Value", source);
+  const lazyVals = await idx.values("Value", { source: source });
   assert.deepEqual(Array.from(lazyVals), Array.from(mdf.values("Value")));
 
   // And the VLSD channel matches the direct reader too.
-  const lazyLabel = await idx.read("Label", source);
+  const lazyLabel = await idx.read("Label", { source: source });
   assert.deepEqual(lazyLabel.values, mdf.read("Label").values);
 
   idx.dispose();

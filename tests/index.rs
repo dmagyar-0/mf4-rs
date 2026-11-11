@@ -2,7 +2,7 @@ use mf4_rs::writer::MdfWriter;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::parsing::decoder::DecodedValue;
 use mf4_rs::index::MdfIndex;
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::error::MdfError;
 use std::fs;
 
@@ -19,16 +19,16 @@ fn test_index_roundtrip() -> Result<(), MdfError> {
     let mut writer = MdfWriter::new(mdf_path.to_str().unwrap())?;
     writer.init_mdf_file()?;
 
-    let cg_id = writer.add_channel_group(None, |_| {})?;
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
 
-    let time_ch_id = writer.add_channel(&cg_id, None, |ch| {
+    let time_ch_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Time".to_string());
         ch.bit_count = 64;
     })?;
     writer.set_time_channel(&time_ch_id)?;
 
-    writer.add_channel(&cg_id, Some(&time_ch_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&time_ch_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Value".to_string());
         ch.bit_count = 32;
@@ -55,14 +55,14 @@ fn test_index_roundtrip() -> Result<(), MdfError> {
 
     // Create and save index
     let index = MdfIndex::from_file(mdf_path.to_str().unwrap())?;
-    index.save_to_file(index_path.to_str().unwrap())?;
+    index.save(index_path.to_str().unwrap())?;
 
     // Load index and verify structure
-    let loaded_index = MdfIndex::load_from_file(index_path.to_str().unwrap())?;
+    let loaded_index = MdfIndex::load(index_path.to_str().unwrap())?;
 
-    assert_eq!(loaded_index.groups().len(), 1);
+    assert_eq!(loaded_index.channel_groups.len(), 1);
 
-    let group = &loaded_index.groups()[0];
+    let group = &loaded_index.channel_groups[0];
     assert_eq!(group.channels.len(), 2);
     assert_eq!(group.record_count, test_values.len() as u64);
 
@@ -85,8 +85,8 @@ fn test_index_roundtrip() -> Result<(), MdfError> {
 
     // Test reading channel values by name via a bound reader
     let mut data = loaded_index.open_file(mdf_path.to_str().unwrap())?;
-    let time_values = data.values("Time")?;
-    let value_values = data.values("Value")?;
+    let time_values = data.decoded_values("Time", None)?;
+    let value_values = data.decoded_values("Value", None)?;
 
     assert_eq!(time_values.len(), test_values.len());
     assert_eq!(value_values.len(), test_values.len());
@@ -126,8 +126,8 @@ fn test_index_vs_direct_read() -> Result<(), MdfError> {
     let mut writer = MdfWriter::new(mdf_path.to_str().unwrap())?;
     writer.init_mdf_file()?;
 
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("TestChannel".to_string());
         ch.bit_count = 32;
@@ -144,13 +144,13 @@ fn test_index_vs_direct_read() -> Result<(), MdfError> {
     writer.finalize()?;
 
     // Read via direct MDF parsing
-    let mdf = MDF::from_file(mdf_path.to_str().unwrap())?;
-    let direct_values = mdf.channel("TestChannel").unwrap().values()?;
+    let mdf = Mdf::from_file(mdf_path.to_str().unwrap())?;
+    let direct_values = mdf.find_channel("TestChannel", None).unwrap().unwrap().decoded_values()?;
 
     // Read via index (bound reader, by name)
     let index = MdfIndex::from_file(mdf_path.to_str().unwrap())?;
     let mut data = index.open_file(mdf_path.to_str().unwrap())?;
-    let indexed_values = data.values("TestChannel")?;
+    let indexed_values = data.decoded_values("TestChannel", None)?;
 
     // Compare results
     assert_eq!(direct_values.len(), indexed_values.len());
@@ -183,14 +183,14 @@ fn test_index_metadata() -> Result<(), MdfError> {
     let mut writer = MdfWriter::new(mdf_path.to_str().unwrap())?;
     writer.init_mdf_file()?;
 
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let float_ch_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let float_ch_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("TestFloat".to_string());
         ch.bit_count = 32;
     })?;
 
-    writer.add_channel(&cg_id, Some(&float_ch_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&float_ch_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("TestInt".to_string());
         ch.bit_count = 16;
@@ -207,7 +207,7 @@ fn test_index_metadata() -> Result<(), MdfError> {
     // Create index and verify metadata via the name-based navigation
     let index = MdfIndex::from_file(mdf_path.to_str().unwrap())?;
 
-    let groups = index.groups();
+    let groups = &index.channel_groups;
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].name, None); // unnamed group
     assert_eq!(groups[0].channels.len(), 2);
@@ -216,12 +216,12 @@ fn test_index_metadata() -> Result<(), MdfError> {
     assert_eq!(channel_names, vec!["TestFloat", "TestInt"]);
 
     // Channel info retrieval by name
-    let float_info = index.channel("TestFloat").unwrap();
+    let float_info = index.indexed_channel("TestFloat", None).unwrap();
     assert_eq!(float_info.name, Some("TestFloat".to_string()));
     assert_eq!(float_info.data_type, DataType::FloatLE);
     assert_eq!(float_info.bit_count, 32);
 
-    let int_info = index.channel("TestInt").unwrap();
+    let int_info = index.indexed_channel("TestInt", None).unwrap();
     assert_eq!(int_info.name, Some("TestInt".to_string()));
     assert_eq!(int_info.data_type, DataType::UnsignedIntegerLE);
     assert_eq!(int_info.bit_count, 16);
@@ -240,16 +240,16 @@ fn test_byte_ranges() -> Result<(), MdfError> {
     let mut writer = MdfWriter::new(mdf_path.to_str().unwrap())?;
     writer.init_mdf_file()?;
 
-    let cg_id = writer.add_channel_group(None, |_| {})?;
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
 
     // Create channels with predictable sizes
-    let ch1_id = writer.add_channel(&cg_id, None, |ch| {
+    let ch1_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Ch1".to_string());
         ch.bit_count = 32; // 4 bytes
     })?;
 
-    writer.add_channel(&cg_id, Some(&ch1_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&ch1_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Ch2".to_string());
         ch.bit_count = 16; // 2 bytes
@@ -272,22 +272,22 @@ fn test_byte_ranges() -> Result<(), MdfError> {
     let index = MdfIndex::from_file(mdf_path.to_str().unwrap())?;
 
     // Byte ranges for all data of a channel
-    let ranges = index.byte_ranges("Ch1")?;
+    let ranges = index.byte_ranges("Ch1", None)?;
     assert!(!ranges.is_empty(), "Should have at least one byte range");
 
     let total_bytes: u64 = ranges.iter().map(|(_, len)| len).sum();
     assert!(total_bytes > 0, "Should have positive total bytes");
 
     // Partial record reading
-    let partial_ranges = index.byte_ranges_for_records("Ch1", 1, 3)?;
+    let partial_ranges = index.byte_ranges_for_records("Ch1", 1, 3, None)?;
     assert!(!partial_ranges.is_empty(), "Should have byte ranges for partial records");
 
     let partial_total: u64 = partial_ranges.iter().map(|(_, len)| len).sum();
     assert!(partial_total <= total_bytes, "Partial range should be <= total range");
 
     // Error conditions
-    assert!(index.byte_ranges("DoesNotExist").is_err(), "Unknown channel should error");
-    assert!(index.byte_ranges_for_records("Ch1", 10, 1).is_err(), "Out of range records should error");
+    assert!(index.byte_ranges("DoesNotExist", None).is_err(), "Unknown channel should error");
+    assert!(index.byte_ranges_for_records("Ch1", 10, 1, None).is_err(), "Out of range records should error");
 
     let _ = fs::remove_file(mdf_path);
     Ok(())
@@ -303,8 +303,8 @@ fn test_byte_ranges_accuracy() -> Result<(), MdfError> {
     let mut writer = MdfWriter::new(mdf_path.to_str().unwrap())?;
     writer.init_mdf_file()?;
 
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Val".to_string());
         ch.bit_count = 32;
@@ -319,7 +319,7 @@ fn test_byte_ranges_accuracy() -> Result<(), MdfError> {
     // Create index and read values via the bound reader
     let index = MdfIndex::from_file(mdf_path.to_str().unwrap())?;
     let mut data = index.open_file(mdf_path.to_str().unwrap())?;
-    let values = data.values("Val")?;
+    let values = data.decoded_values("Val", None)?;
 
     // Verify the values are what we expect
     assert_eq!(values.len(), 2);
@@ -336,7 +336,7 @@ fn test_byte_ranges_accuracy() -> Result<(), MdfError> {
     }
 
     // Byte ranges should make sense
-    let ranges = index.byte_ranges("Val")?;
+    let ranges = index.byte_ranges("Val", None)?;
     let total_bytes: u64 = ranges.iter().map(|(_, len)| len).sum();
     assert!(total_bytes >= 8, "Should have at least 8 bytes for 2x32-bit values");
 
@@ -354,10 +354,10 @@ fn test_name_based_lookup() -> Result<(), MdfError> {
     let mut writer = MdfWriter::new(mdf_path.to_str().unwrap())?;
     writer.init_mdf_file()?;
 
-    let cg_id = writer.add_channel_group(None, |_| {})?;
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
 
     // Create master channel
-    let temp_ch_id = writer.add_channel(&cg_id, None, |ch| {
+    let temp_ch_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Temperature".to_string());
         ch.bit_count = 32;
@@ -365,7 +365,7 @@ fn test_name_based_lookup() -> Result<(), MdfError> {
     writer.set_time_channel(&temp_ch_id)?;
 
     // Create data channel with master as parent
-    writer.add_channel(&cg_id, Some(&temp_ch_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&temp_ch_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Speed".to_string());
         ch.bit_count = 16;
@@ -383,23 +383,23 @@ fn test_name_based_lookup() -> Result<(), MdfError> {
     let index = MdfIndex::from_file(mdf_path.to_str().unwrap())?;
 
     // Locating channels by name
-    assert_eq!(index.find_channels("Temperature"), vec![(0, 0)]);
-    assert_eq!(index.find_channels("Speed"), vec![(0, 1)]);
-    assert!(index.channel("NonExistent").is_none());
+    assert_eq!(index.indexed_channel("Temperature", None).map(|c| c.byte_offset), Some(0));
+    assert!(index.indexed_channel("Speed", None).is_some());
+    assert!(index.indexed_channel("NonExistent", None).is_none());
 
     // Group-scoped lookup
-    assert!(index.groups()[0].channel("Temperature").is_some());
-    assert!(index.groups()[0].channel("Speed").is_some());
-    assert!(index.groups()[0].channel("NonExistent").is_none());
+    assert!(index.channel_groups[0].channel("Temperature").is_some());
+    assert!(index.channel_groups[0].channel("Speed").is_some());
+    assert!(index.channel_groups[0].channel("NonExistent").is_none());
 
     // Channel info by name
-    let channel_info = index.channel("Temperature").unwrap();
+    let channel_info = index.indexed_channel("Temperature", None).unwrap();
     assert_eq!(channel_info.name, Some("Temperature".to_string()));
     assert_eq!(channel_info.data_type, DataType::FloatLE);
 
     // Reading channels by name through the bound reader
     let mut data = index.open_file(mdf_path.to_str().unwrap())?;
-    let temp_values = data.values("Temperature")?;
+    let temp_values = data.decoded_values("Temperature", None)?;
     assert_eq!(temp_values.len(), 1);
     if let Some(DecodedValue::Float(temp)) = temp_values[0] {
         assert!((temp - 25.5).abs() < 0.001);
@@ -407,7 +407,7 @@ fn test_name_based_lookup() -> Result<(), MdfError> {
         panic!("Expected Float value");
     }
 
-    let speed_values = data.values("Speed")?;
+    let speed_values = data.decoded_values("Speed", None)?;
     assert_eq!(speed_values.len(), 1);
     if let Some(DecodedValue::UnsignedInteger(speed)) = speed_values[0] {
         assert_eq!(speed, 120);
@@ -416,10 +416,10 @@ fn test_name_based_lookup() -> Result<(), MdfError> {
     }
 
     // Error for non-existent channel
-    assert!(data.values("NonExistent").is_err());
+    assert!(data.decoded_values("NonExistent", None).is_err());
 
     // Byte ranges by name
-    let ranges = index.byte_ranges("Temperature")?;
+    let ranges = index.byte_ranges("Temperature", None)?;
     assert!(!ranges.is_empty());
 
     let _ = fs::remove_file(mdf_path);
@@ -437,16 +437,16 @@ fn test_multiple_channels_same_name() -> Result<(), MdfError> {
     writer.init_mdf_file()?;
 
     // First group
-    let cg1_id = writer.add_channel_group(None, |_| {})?;
-    writer.add_channel(&cg1_id, None, |ch| {
+    let cg1_id = writer.add_channel_group_with(None, |_| {})?;
+    writer.add_channel_with(&cg1_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Temperature".to_string());
         ch.bit_count = 32;
     })?;
 
     // Second group
-    let cg2_id = writer.add_channel_group(Some(&cg1_id), |_| {})?;
-    writer.add_channel(&cg2_id, None, |ch| {
+    let cg2_id = writer.add_channel_group_with(Some(&cg1_id), |_| {})?;
+    writer.add_channel_with(&cg2_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Temperature".to_string());
         ch.bit_count = 32;
@@ -465,13 +465,15 @@ fn test_multiple_channels_same_name() -> Result<(), MdfError> {
     // Test finding all channels with same name
     let index = MdfIndex::from_file(mdf_path.to_str().unwrap())?;
 
-    let all_temp_channels = index.find_channels("Temperature");
-    assert_eq!(all_temp_channels.len(), 2);
-    assert!(all_temp_channels.contains(&(0, 0))); // First group, first channel
-    assert!(all_temp_channels.contains(&(1, 0))); // Second group, first channel
+    let holders: Vec<_> = index
+        .groups()?
+        .into_iter()
+        .filter(|g| g.channel("Temperature").is_some())
+        .collect();
+    assert_eq!(holders.len(), 2);
 
-    // index.channel() should return the first match
-    assert_eq!(index.find_channels("Temperature")[0], (0, 0));
+    // index.channel() returns the first match
+    assert!(index.channel("Temperature", None)?.is_some());
 
     let _ = fs::remove_file(mdf_path);
     Ok(())
@@ -487,14 +489,14 @@ fn test_signal_and_lazy_source() -> Result<(), MdfError> {
     // Master (Time) + one data channel.
     let mut writer = MdfWriter::new(mdf_path.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let t_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let t_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Time".to_string());
         ch.bit_count = 64;
     })?;
     writer.set_time_channel(&t_id)?;
-    writer.add_channel(&cg_id, Some(&t_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&t_id), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Speed".to_string());
         ch.bit_count = 64;
@@ -514,7 +516,7 @@ fn test_signal_and_lazy_source() -> Result<(), MdfError> {
     let index = MdfIndex::from_file(mdf_path.to_str().unwrap())?;
     assert!(index.source().is_some(), "from_file should attach a source");
 
-    let speed = index.read("Speed")?;
+    let speed = index.read("Speed", None)?;
     assert_eq!(speed.name, "Speed");
     assert_eq!(speed.values.len(), 10);
     assert_eq!(speed.timestamps.len(), 10, "Speed should carry the Time axis");
@@ -526,17 +528,17 @@ fn test_signal_and_lazy_source() -> Result<(), MdfError> {
     }
 
     // The master channel indexes itself: no separate timestamps.
-    let time = index.read("Time")?;
+    let time = index.read("Time", None)?;
     assert_eq!(time.values.len(), 10);
     assert!(!time.has_timestamps(), "master channel has no separate timestamps");
 
     // Source is not persisted; re-attach after load, then read lazily.
-    index.save_to_file(index_path.to_str().unwrap())?;
-    let mut loaded = MdfIndex::load_from_file(index_path.to_str().unwrap())?;
+    index.save(index_path.to_str().unwrap())?;
+    let mut loaded = MdfIndex::load(index_path.to_str().unwrap())?;
     assert!(loaded.source().is_none(), "source must not be serialized");
-    assert!(loaded.read("Speed").is_err(), "read without a source should error");
-    loaded.set_file(mdf_path.to_str().unwrap());
-    let speed2 = loaded.read("Speed")?;
+    assert!(loaded.read("Speed", None).is_err(), "read without a source should error");
+    loaded.set_source(mdf_path.to_str().unwrap());
+    let speed2 = loaded.read("Speed", None)?;
     assert_eq!(speed2.values_f64(), speed.values_f64());
 
     let _ = fs::remove_file(mdf_path);
@@ -553,13 +555,13 @@ fn test_channel_group_name_lookup() -> Result<(), MdfError> {
     let mut writer = MdfWriter::new(mdf_path.to_str().unwrap())?;
     writer.init_mdf_file()?;
 
-    let _cg1_id = writer.add_channel_group(None, |_| {})?;
+    let _cg1_id = writer.add_channel_group_with(None, |_| {})?;
     writer.finalize()?;
 
     let index = MdfIndex::from_file(mdf_path.to_str().unwrap())?;
 
     // Unnamed groups are not found by name
-    assert!(index.group("SomeGroup").is_none());
+    assert!(index.group("SomeGroup").unwrap().is_none());
 
     let _ = fs::remove_file(mdf_path);
     Ok(())

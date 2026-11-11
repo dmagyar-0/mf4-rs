@@ -150,7 +150,7 @@ pub(crate) fn clone_block_to_writer(
 /// * `output_path` - Destination path for the trimmed file
 /// * `start_ns` - Start of the window in UNIX-epoch nanoseconds (inclusive)
 /// * `end_ns` - End of the window in UNIX-epoch nanoseconds (inclusive)
-pub fn cut_mdf_by_utc_ns(
+pub fn cut_mdf_by_utc(
     input_path: &str,
     output_path: &str,
     start_ns: i64,
@@ -216,7 +216,7 @@ pub fn cut_mdf_by_time(
     // Anchor the cut output to the same wall-clock as the source. Without this
     // the writer's default HD timestamp (a fixed non-epoch value) would be
     // emitted, breaking absolute-time interpretation of the kept records.
-    writer.set_start_time(
+    writer.set_start_time_with(
         mdf.header.abs_time,
         mdf.header.tz_offset,
         mdf.header.daylight_save_time,
@@ -254,7 +254,7 @@ pub fn cut_mdf_by_time(
                 + invalidation_bytes_nr as usize;
 
             let src_record_id = cg.block.record_id;
-            let cg_id = writer.add_channel_group(prev_cg.as_deref(), |c| {
+            let cg_id = writer.add_channel_group_with(prev_cg.as_deref(), |c| {
                 // Records are copied verbatim including any leading record-ID
                 // bytes, so the output CG must declare the same record ID.
                 c.record_id = src_record_id;

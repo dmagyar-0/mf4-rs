@@ -1,7 +1,7 @@
 /// Tests and benchmarks for chunked/streaming columnar writes.
 /// Verifies that write_columns_f64 can be called multiple times
 /// without requiring the full dataset in memory.
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::error::MdfError;
 use mf4_rs::writer::MdfWriter;
@@ -17,24 +17,24 @@ fn cleanup(path: &std::path::Path) {
 fn setup_f64_writer(path: &std::path::Path) -> Result<(MdfWriter, String), MdfError> {
     let mut w = MdfWriter::new(path.to_str().unwrap())?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |ch| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Time".into());
         ch.bit_count = 64;
     })?;
     w.set_time_channel(&t)?;
-    let a = w.add_channel(&cg, Some(&t), |ch| {
+    let a = w.add_channel_with(&cg, Some(&t), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("A".into());
         ch.bit_count = 64;
     })?;
-    let b = w.add_channel(&cg, Some(&a), |ch| {
+    let b = w.add_channel_with(&cg, Some(&a), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("B".into());
         ch.bit_count = 64;
     })?;
-    w.add_channel(&cg, Some(&b), |ch| {
+    w.add_channel_with(&cg, Some(&b), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("C".into());
         ch.bit_count = 64;
@@ -85,8 +85,8 @@ fn chunked_write_matches_single_write() -> Result<(), MdfError> {
     }
 
     // Read both and compare
-    let mdf_single = MDF::from_file(path_single.to_str().unwrap())?;
-    let mdf_chunked = MDF::from_file(path_chunked.to_str().unwrap())?;
+    let mdf_single = Mdf::from_file(path_single.to_str().unwrap())?;
+    let mdf_chunked = Mdf::from_file(path_chunked.to_str().unwrap())?;
 
     let groups_s: Vec<_> = mdf_single.channel_groups();
     let groups_c: Vec<_> = mdf_chunked.channel_groups();
@@ -96,8 +96,8 @@ fn chunked_write_matches_single_write() -> Result<(), MdfError> {
         let chc: Vec<_> = gc.channels();
         assert_eq!(chs.len(), chc.len());
         for (cs, cc) in chs.iter().zip(chc.iter()) {
-            let vs = cs.values_as_f64()?;
-            let vc = cc.values_as_f64()?;
+            let vs = cs.values()?;
+            let vc = cc.values()?;
             assert_eq!(vs.len(), vc.len(), "length mismatch for channel {}", cs.name().unwrap_or(None).unwrap_or_default());
             for i in 0..vs.len() {
                 assert!(
@@ -146,13 +146,13 @@ fn chunked_write_across_dt_boundaries() -> Result<(), MdfError> {
     }
 
     // Read back and verify
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let groups: Vec<_> = mdf.channel_groups();
     assert_eq!(groups.len(), 1);
     let channels: Vec<_> = groups[0].channels();
     assert_eq!(channels.len(), 4);
 
-    let vals0 = channels[0].values_as_f64()?;
+    let vals0 = channels[0].values()?;
     assert_eq!(vals0.len(), n);
     // Check first, last, and boundary values
     assert!((vals0[0] - 0.0).abs() < 1e-15);

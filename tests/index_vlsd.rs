@@ -26,14 +26,14 @@ const RECORD_LEN: usize = 16; // 8 bytes time + 8 bytes VLSD offset slot
 fn write_vlsd_file(path: &str, payloads: &[&[u8]]) -> Result<(), MdfError> {
     let mut w = MdfWriter::new(path)?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |c| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".into());
     })?;
     w.set_time_channel(&t)?;
-    let vlsd = w.add_channel(&cg, Some(&t), |c| {
+    let vlsd = w.add_channel_with(&cg, Some(&t), |c| {
         c.data_type = DataType::StringUtf8;
         c.bit_count = 64;
         c.channel_type = 1;
@@ -69,14 +69,14 @@ fn write_vlsd_uneven(path: &str) -> Result<Vec<Vec<u8>>, MdfError> {
 
     let mut w = MdfWriter::new(path)?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let t = w.add_channel(&cg, None, |c| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".into());
     })?;
     w.set_time_channel(&t)?;
-    let vlsd = w.add_channel(&cg, Some(&t), |c| {
+    let vlsd = w.add_channel_with(&cg, Some(&t), |c| {
         c.data_type = DataType::ByteArray;
         c.bit_count = 64;
         c.channel_type = 1;
@@ -121,7 +121,7 @@ fn vlsd_roundtrip_all_entry_points() -> Result<(), MdfError> {
     // (1) bound reader via open_file (mmap)
     {
         let mut reader = index.open_file(path_str)?;
-        let vals = reader.values("Msg")?;
+        let vals = reader.decoded_values("Msg", None)?;
         assert_eq!(vals.len(), 3);
         for (v, w) in vals.iter().zip(expected.iter()) {
             assert_string(v, w);
@@ -130,7 +130,7 @@ fn vlsd_roundtrip_all_entry_points() -> Result<(), MdfError> {
 
     // (2) lazy index.read via attached source
     {
-        let sig = index.read("Msg")?;
+        let sig = index.read("Msg", None)?;
         assert_eq!(sig.values.len(), 3);
         for (v, w) in sig.values.iter().zip(expected.iter()) {
             assert_string(v, w);
@@ -140,7 +140,7 @@ fn vlsd_roundtrip_all_entry_points() -> Result<(), MdfError> {
     // (3) explicit FileRangeReader through open(...) -> read_channel_values
     {
         let mut reader = index.open(FileRangeReader::new(path_str)?);
-        let vals = reader.values("Msg")?;
+        let vals = reader.decoded_values("Msg", None)?;
         assert_eq!(vals.len(), 3);
         for (v, w) in vals.iter().zip(expected.iter()) {
             assert_string(v, w);
@@ -148,8 +148,8 @@ fn vlsd_roundtrip_all_entry_points() -> Result<(), MdfError> {
     }
 
     // Ensure set_file / source path also works after a manual re-attach.
-    index.set_file(path_str);
-    assert_eq!(index.read("Msg")?.values.len(), 3);
+    index.set_source(path_str);
+    assert_eq!(index.read("Msg", None)?.values.len(), 3);
 
     std::fs::remove_file(&path)?;
     Ok(())
@@ -164,7 +164,7 @@ fn vlsd_multi_fragment_exact_bytes() -> Result<(), MdfError> {
 
     let index = MdfIndex::from_file(path_str)?;
     let mut reader = index.open_file(path_str)?;
-    let vals = reader.values("Image")?;
+    let vals = reader.decoded_values("Image", None)?;
     assert_eq!(vals.len(), payloads.len());
     for (i, v) in vals.iter().enumerate() {
         match v {
@@ -191,11 +191,11 @@ fn vlsd_json_persistence() -> Result<(), MdfError> {
     let payloads: [&[u8]; 3] = [b"one", b"two", b"three"];
     write_vlsd_file(path_str, &payloads)?;
 
-    MdfIndex::from_file(path_str)?.save_to_file(json_str)?;
+    MdfIndex::from_file(path_str)?.save(json_str)?;
 
-    let mut index = MdfIndex::load_from_file(json_str)?;
-    index.set_file(path_str);
-    let sig = index.read("Msg")?;
+    let mut index = MdfIndex::load(json_str)?;
+    index.set_source(path_str);
+    let sig = index.read("Msg", None)?;
     assert_eq!(sig.values.len(), 3);
     assert_string(&sig.values[0], "one");
     assert_string(&sig.values[2], "three");
@@ -226,9 +226,9 @@ fn vlsd_missing_fragments_errors_with_rebuild_message() -> Result<(), MdfError> 
         }
     }
     let mut stripped = MdfIndex::from_json(&v.to_string())?;
-    stripped.set_file(path_str);
+    stripped.set_source(path_str);
 
-    let err = stripped.read("Msg").unwrap_err();
+    let err = stripped.read("Msg", None).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("rebuild the index"),
@@ -236,7 +236,7 @@ fn vlsd_missing_fragments_errors_with_rebuild_message() -> Result<(), MdfError> 
     );
 
     // The fixed-size Time channel still reads fine.
-    let times = stripped.read("Time")?;
+    let times = stripped.read("Time", None)?;
     assert_eq!(times.values.len(), 3);
 
     std::fs::remove_file(&path)?;
@@ -252,7 +252,7 @@ fn vlsd_signal_alignment() -> Result<(), MdfError> {
     write_vlsd_file(path_str, &payloads)?;
 
     let index = MdfIndex::from_file(path_str)?;
-    let sig = index.read("Msg")?;
+    let sig = index.read("Msg", None)?;
     assert_eq!(sig.values.len(), payloads.len());
     assert_eq!(sig.timestamps.len(), payloads.len());
     assert_eq!(sig.timestamps.len(), sig.values.len());

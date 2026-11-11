@@ -3,7 +3,6 @@
 
 import builtins
 import typing
-from enum import Enum, auto
 
 class BlockInfo:
     r"""
@@ -35,35 +34,39 @@ class BlockInfo:
 
 class ChannelInfo:
     r"""
-    Read-only metadata describing a single channel.
+    Metadata of one channel.
     
-    Found on :py:attr:`GroupInfo.channels`, and returned by
+    Found on :py:attr:`GroupInfo.channels` and returned by
     :py:meth:`Mdf.channel` / :py:meth:`MdfIndex.channel`.
     
     Attributes
     ----------
     name : Optional[str]
-        Channel name from the ``##TX`` block, or ``None`` if not set.
+        Channel name.
     unit : Optional[str]
-        Engineering unit string, or ``None``.
+        Physical unit.
     comment : Optional[str]
-        Free-form comment, or ``None``. ``None`` for an index saved by an older
-        mf4-rs version (rebuild it to pick comments up).
-    data_type : DataType
-        The MDF data type of the raw samples.
+        Channel comment.
+    data_type : str
+        Canonical data-type name, e.g. ``"FloatLE"``, ``"UnsignedIntegerLE"``,
+        ``"StringUtf8"`` — the same names :py:meth:`MdfWriter.add_channel` takes.
     bit_count : int
-        Width of the raw value in bits (e.g. 32 for f32, 64 for f64/u64).
+        Width of the stored value in bits.
+    is_master : bool
+        The channel is its group's master (time) channel.
+    is_vlsd : bool
+        Variable-length (VLSD) channel, e.g. strings.
+    has_conversion : bool
+        The channel carries a conversion (applied by ``read`` / ``values``).
     """
     name: typing.Optional[builtins.str]
     unit: typing.Optional[builtins.str]
     comment: typing.Optional[builtins.str]
-    data_type: DataType
+    data_type: builtins.str
     bit_count: builtins.int
     is_master: builtins.bool
     is_vlsd: builtins.bool
-    def __str__(self) -> builtins.str:
-        ...
-
+    has_conversion: builtins.bool
     def __repr__(self) -> builtins.str:
         ...
 
@@ -103,30 +106,6 @@ class ColumnReport:
     metadata_size: builtins.int
     file_size: builtins.int
     skipped_channels: builtins.list[builtins.str]
-    def __repr__(self) -> builtins.str:
-        ...
-
-
-class DataType:
-    r"""
-    MDF channel data type descriptor.
-    
-    Wraps the on-disk MDF 4 data type code (`cn_data_type`) together with a
-    human-readable name. Use the ``create_data_type_*`` helper functions to
-    construct one for the writer API.
-    
-    Attributes
-    ----------
-    name : str
-        Symbolic name, e.g. ``"FloatLE"``, ``"UnsignedIntegerLE"``.
-    value : int
-        The MDF spec numeric code (0-16, or 255 for unknown).
-    """
-    name: builtins.str
-    value: builtins.int
-    def __str__(self) -> builtins.str:
-        ...
-
     def __repr__(self) -> builtins.str:
         ...
 
@@ -216,36 +195,33 @@ class GapInfo:
 
 class GroupInfo:
     r"""
-    Read-only metadata describing a channel group (``##CG`` block).
+    Metadata of one channel group.
     
-    Returned by :py:attr:`Mdf.groups` / :py:attr:`MdfIndex.groups`.
+    Returned by the ``groups`` property and ``group(name)`` of
+    :class:`Mdf` and :class:`MdfIndex`.
     
     Attributes
     ----------
     name : Optional[str]
-        Group / acquisition name (often ``None`` for files written by mf4-rs).
+        Group (acquisition) name.
     comment : Optional[str]
-        Free-form comment.
-    channel_count : int
-        Number of channels in this group.
+        Group comment.
     record_count : int
-        Number of records (cycles) recorded for this group.
+        Number of records (samples per channel).
+    channel_names : list[str]
+        Names of the group's named channels, in file order.
+    master_channel : Optional[str]
+        Name of the group's master (time) channel — local, or the remote
+        master of an MDF 4.2 column-oriented group.
+    channels : list[ChannelInfo]
+        The group's channels, in file order.
     """
     name: typing.Optional[builtins.str]
     comment: typing.Optional[builtins.str]
-    channel_count: builtins.int
     record_count: builtins.int
-    channels: builtins.list[ChannelInfo]
     channel_names: builtins.list[builtins.str]
-    def channel(self, name:builtins.str) -> typing.Optional[ChannelInfo]:
-        r"""
-        Find a channel in this group by name (first match), or ``None``.
-        """
-        ...
-
-    def __str__(self) -> builtins.str:
-        ...
-
+    master_channel: typing.Optional[builtins.str]
+    channels: builtins.list[ChannelInfo]
     def __repr__(self) -> builtins.str:
         ...
 
@@ -272,319 +248,331 @@ class LinkInfo:
 
 class Mdf:
     r"""
-    Read-only handle to an MDF 4 file, backed by a memory-mapped buffer.
+    Reader for a whole MDF 4 file.
     
-    Metadata (block tree, channel names, conversions) is parsed up front, but
-    sample data is only decoded when you call :py:meth:`read`, :py:meth:`read_raw`
-    or :py:meth:`series`. Navigate by group / channel **name** — there are no
-    numeric indices in the public API.
+    Only metadata is parsed up front; samples are decoded when you call
+    :py:meth:`read` / :py:meth:`values`. Everything is addressed by **name**.
+    :class:`MdfIndex` offers the same reading API for lazy / remote access.
     
     Example
     -------
     >>> import mf4_rs
-    >>> mdf = mf4_rs.Mdf("recording.mf4")
+    >>> mdf = mf4_rs.Mdf.from_file("recording.mf4")
     >>> for group in mdf.groups:
     ...     print(group.name, group.record_count, group.channel_names)
-    >>> speed = mdf["Speed"]                 # numpy float64 array
-    >>> rpm   = mdf.read("RPM", group="Engine")
-    >>> s     = mdf.series("Speed")          # pandas Series, datetime index
+    >>> speed = mdf.read("Speed")                 # Signal (values + timestamps)
+    >>> speed.to_series()                         # pandas Series, datetime index
+    >>> rpm = mdf.values("RPM", group="Engine")   # numpy float64 array
+    >>> part = mdf.read("Speed", start_time=1.0, end_time=2.5)
     """
-    source: builtins.str
     groups: builtins.list[GroupInfo]
     channel_names: builtins.list[builtins.str]
-    def __new__(cls,path:builtins.str): ...
-    def list_signals(self) -> builtins.list[tuple[builtins.str, typing.Optional[builtins.str], typing.Optional[builtins.str]]]:
+    start_time_ns: typing.Optional[builtins.int]
+    @staticmethod
+    def from_file(path:builtins.str) -> Mdf:
         r"""
-        A flat catalog of every channel as ``(source, group, channel)`` tuples.
+        Open an MDF 4 file from disk (memory-mapped).
+        """
+        ...
+
+    @staticmethod
+    def from_bytes(data:bytes) -> Mdf:
+        r"""
+        Parse an MDF 4 file from a ``bytes`` object.
+        """
+        ...
+
+    @staticmethod
+    def from_url(url:builtins.str) -> Mdf:
+        r"""
+        Download an MDF 4 file in full over HTTP(S) and parse it.
         
-        ``source`` is this file's path (same for every row). ``group`` /
-        ``channel`` are ``None`` if unnamed. Metadata only — no samples decoded.
-        
-        Returns
-        -------
-        list[tuple[str, Optional[str], Optional[str]]]
+        To read a remote file *without* downloading it, use
+        :py:meth:`MdfIndex.from_url`.
         """
         ...
 
     def group(self, name:builtins.str) -> typing.Optional[GroupInfo]:
         r"""
-        Find a channel group by name (first match), or ``None``.
-        
-        In a column-oriented file every signal is its own group named after
-        its source group, so this returns only the first of them; use
-        ``read(name, group=...)`` / ``values(name, group=...)``, which search
-        every group with that name.
+        Metadata of the first channel group named ``name``, or ``None``.
         """
         ...
 
-    def channel(self, name:builtins.str) -> typing.Optional[ChannelInfo]:
+    def channel(self, name:builtins.str, group:typing.Optional[builtins.str] = None) -> typing.Optional[ChannelInfo]:
         r"""
-        Find a channel by name across all groups (first match), or ``None``.
+        Metadata of the first channel named ``name``, or ``None``.
+        
+        Parameters
+        ----------
+        name : str
+        group : Optional[str]
+            Look only in the group(s) with this name.
         """
         ...
 
-    def read(self, name:builtins.str, group:typing.Optional[builtins.str]) -> typing.Any:
+    def read(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None) -> Signal:
         r"""
-        Read a channel as a ``pandas.Series`` of values indexed by timestamps.
-        
-        This is the primary read: the channel's samples (with all conversions
-        applied) are the data, and the group's master/time channel is the index
-        — a ``DatetimeIndex`` when the file has a start time, otherwise the raw
-        master seconds. If there is no master, or the requested channel *is* the
-        master, a default integer index is used.
+        Read a channel as a :class:`Signal`: its values (conversions applied)
+        paired with the group's time axis.
         
         Parameters
         ----------
         name : str
             Channel name (case-sensitive).
         group : Optional[str]
-            Restrict the search to a single group by name. Use this when the
-            same channel name (e.g. ``"Time"``) appears in several groups.
+            Look only in the group(s) with this name. Use it when the same
+            channel name (e.g. ``"Time"``) appears in several groups.
+        start_time, end_time : Optional[float]
+            Inclusive time window, in the master channel's unit (seconds
+            relative to the measurement start). Omitted bounds are open.
+        start_record, record_count : Optional[int]
+            Record window ``[start_record, start_record + record_count)``.
+            Pass either a time window or a record window, not both.
         
         Raises
         ------
-        MdfException
-            If no matching channel exists or pandas is not installed.
+        ChannelNotFoundError
+            If no matching channel exists.
         """
         ...
 
-    def values(self, name:builtins.str, group:typing.Optional[builtins.str]) -> typing.Any:
+    def values(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
-        Read a numeric channel by name as a plain numpy ``float64`` array.
-        
-        The fast, pandas-free path — just the values, no timestamp index.
-        Invalid / non-numeric samples are ``NaN``. Use :py:meth:`read` when you
-        want the timestamp-indexed Series and faithful (text / table) conversions.
-        
-        Parameters
-        ----------
-        name : str
-        group : Optional[str]
+        Read a numeric channel as a plain numpy ``float64`` array (no
+        timestamps). Conversions are applied; invalid and non-numeric samples
+        are ``NaN``. Parameters as for :py:meth:`read`.
         """
         ...
 
-    def __getitem__(self, key:typing.Any) -> typing.Any:
+    def __getitem__(self, key:typing.Any) -> Signal:
         r"""
-        ``mdf["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).
+        ``mdf["Speed"]`` — shorthand for :py:meth:`read`.
         
         Pass a ``(name, group)`` tuple to disambiguate a channel name shared by
         several groups, e.g. ``mdf["Speed", "Engine"]``.
         """
         ...
 
+    def time_range(self, name:builtins.str, group:typing.Optional[builtins.str] = None) -> typing.Optional[tuple[builtins.float, builtins.float]]:
+        r"""
+        First and last master (time) value of the group holding ``name`` as a
+        ``(start, end)`` tuple, or ``None`` for an empty group.
+        """
+        ...
+
+    def conversion(self, name:builtins.str, group:typing.Optional[builtins.str] = None) -> typing.Any:
+        r"""
+        The conversion ``read`` / ``values`` apply to channel ``name``, fully
+        resolved, or ``None`` when the channel has none.
+        
+        Returns a dict with ``type`` (e.g. ``"Linear"``, ``"ValueToText"``),
+        ``values``, ``precision``, ``flags`` and, when present,
+        ``physical_range``, ``formula``, ``texts`` (``{ref index: text}``),
+        ``refs`` (``{ref index: nested conversion}``) and ``default``.
+        """
+        ...
+
     def file_layout(self) -> FileLayout:
         r"""
         Build a :class:`FileLayout` describing every block in this file.
-        
-        Useful for debugging or analysing on-disk structure: offset, size,
-        type, link targets and unreferenced gaps for each MDF block.
         """
         ...
 
 
 class MdfIndex:
     r"""
-    Lightweight, self-contained index over an MDF 4 file.
+    Lightweight, serialisable index of an MDF file for lazy and remote reads.
     
-    An index records the byte ranges of each channel, fully resolves every
-    conversion block, and serialises to JSON. Navigate it by **name**
-    (:py:attr:`groups`, :py:meth:`group`, :py:meth:`channel`). It also remembers
-    its data :py:attr:`source` (file path or URL); reading is lazy — the
-    byte-range request happens on :py:meth:`read` / :py:meth:`values`, never at
-    build time.
-    
-    **Limitation:** compressed (``##DZ``) data blocks are not supported.
+    Building an index reads only metadata. The index remembers its data
+    ``source`` (a file path or ``http(s)://`` URL) and fetches just the bytes a
+    ``read`` / ``values`` call needs — with HTTP range requests for URLs. It
+    offers the same reading API as :class:`Mdf`, and can be saved as JSON and
+    re-attached to a source later.
     
     Example
     -------
-    >>> idx = mf4_rs.MdfIndex.from_url("https://host/recording.mf4")  # only metadata fetched
-    >>> speed = idx.read("Speed")            # pandas Series; range request happens now
-    >>> rpm   = idx.values("RPM")            # numpy float64, no timestamp index
+    >>> idx = mf4_rs.MdfIndex.from_url("https://host/recording.mf4")
+    >>> speed = idx.read("Speed", start_time=10.0, end_time=20.0)
     >>> idx.save("recording.idx.json")
     >>> idx = mf4_rs.MdfIndex.load("recording.idx.json")
-    >>> idx.source = "recording.mf4"         # re-attach a source after load
-    >>> t = idx.read("Speed")
+    >>> idx.set_source("recording.mf4")
+    >>> raw = idx.values("Speed")
     """
     groups: builtins.list[GroupInfo]
     channel_names: builtins.list[builtins.str]
+    start_time_ns: typing.Optional[builtins.int]
     file_size: builtins.int
     source: typing.Optional[builtins.str]
     @staticmethod
     def from_file(path:builtins.str) -> MdfIndex:
         r"""
-        Build a fresh index by parsing an MDF file from disk.
-        
-        All conversions are resolved during construction so the index is fully
-        self-contained afterwards.
+        Build an index of a local MDF file. The file becomes the ``source``.
+        """
+        ...
+
+    @staticmethod
+    def from_bytes(data:bytes) -> MdfIndex:
+        r"""
+        Build an index from a ``bytes`` object holding an MDF file. No source
+        is attached — call :py:meth:`set_source` before reading values.
+        """
+        ...
+
+    @staticmethod
+    def from_url(url:builtins.str, chunk_size:typing.Optional[builtins.int] = None) -> MdfIndex:
+        r"""
+        Build an index of a remote MDF file, fetching only its metadata with
+        HTTP range requests. The URL becomes the ``source``.
         
         Parameters
         ----------
-        path : str
-            Path to a ``.mf4`` file.
+        url : str
+        chunk_size : Optional[int]
+            Metadata read-ahead chunk size in bytes (default 1 MiB).
+        """
+        ...
+
+    @staticmethod
+    def from_json(json:builtins.str) -> MdfIndex:
+        r"""
+        Reload an index from its JSON string (see :py:meth:`to_json`). The
+        source is not part of the JSON — attach one with :py:meth:`set_source`.
         """
         ...
 
     @staticmethod
     def load(path:builtins.str) -> MdfIndex:
         r"""
-        Load a previously saved JSON index (companion to :py:meth:`save`).
-        
-        The original MDF file is only needed later, when you actually read
-        values via :py:meth:`open`.
+        Reload an index from a JSON file written by :py:meth:`save`.
         """
         ...
 
-    @staticmethod
-    def from_url(url:builtins.str, chunk_size:typing.Optional[builtins.int]) -> MdfIndex:
+    def to_json(self) -> builtins.str:
         r"""
-        Build an index from an MDF file served over HTTP / S3 using range
-        requests, without downloading the whole file.
-        
-        Issues range reads only for metadata blocks; sample data is never
-        fetched. With the default 1 MiB read-ahead chunk a typical file
-        collapses to a handful of HTTP requests regardless of size.
-        
-        Parameters
-        ----------
-        url : str
-            ``http://`` / ``https://`` URL honouring ``Range`` requests.
-        chunk_size : int, optional
-            Metadata read-ahead chunk size in bytes (default 1 MiB).
+        Serialise the index to a JSON string.
         """
         ...
 
     def save(self, path:builtins.str) -> None:
         r"""
-        Serialize the index to JSON at ``path`` (dependency-free).
+        Write the index as JSON to ``path``.
+        """
+        ...
+
+    def validate(self) -> None:
+        r"""
+        Check the index for internal consistency (e.g. after loading JSON from
+        an untrusted place). Raises :class:`MdfException` when it is not.
+        """
+        ...
+
+    def set_source(self, source:typing.Optional[builtins.str] = None) -> None:
+        r"""
+        Attach (or with ``None``, detach) the data source: a file path, or an
+        ``http(s)://`` URL read with range requests.
         """
         ...
 
     def group(self, name:builtins.str) -> typing.Optional[GroupInfo]:
         r"""
-        Find a channel group by name (first match), or ``None``.
-        
-        In a column-oriented file every signal is its own group named after
-        its source group, so this returns only the first of them; use
-        ``read(name, group=...)`` / ``values(name, group=...)``, which search
-        every group with that name.
+        Metadata of the first channel group named ``name``, or ``None``.
         """
         ...
 
-    def channel(self, name:builtins.str) -> typing.Optional[ChannelInfo]:
+    def channel(self, name:builtins.str, group:typing.Optional[builtins.str] = None) -> typing.Optional[ChannelInfo]:
         r"""
-        Find a channel by name across all groups (first match), or ``None``.
-        """
-        ...
-
-    def groups_with_channel(self, name:builtins.str) -> builtins.list[builtins.str]:
-        r"""
-        Names of the groups that contain a channel called ``name``.
-        
-        Use this to disambiguate a channel name shared by several groups, then
-        pass the chosen group to :py:meth:`read` / :py:meth:`values`.
-        """
-        ...
-
-    def byte_ranges(self, name:builtins.str, group:typing.Optional[builtins.str]) -> builtins.list[tuple[builtins.int, builtins.int]]:
-        r"""
-        Byte ranges ``[(offset, length), ...]`` occupied by a channel.
-        
-        Accounts for the channel's record-layout position and data-block
-        splitting. Power-user entry point for issuing your own partial reads.
+        Metadata of the first channel named ``name``, or ``None``.
         
         Parameters
         ----------
         name : str
         group : Optional[str]
-            Disambiguate by group when the name is not unique.
+            Look only in the group(s) with this name.
         """
         ...
 
-    def byte_ranges_for_records(self, name:builtins.str, start_record:builtins.int, record_count:builtins.int) -> builtins.list[tuple[builtins.int, builtins.int]]:
+    def read(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None) -> Signal:
         r"""
-        Byte ranges covering a record window ``[start, start+count)``.
-        """
-        ...
-
-    def conversion_info(self, name:builtins.str) -> typing.Optional[builtins.dict[builtins.str, typing.Any]]:
-        r"""
-        Inspect the conversion attached to a channel (by name).
+        Read a channel as a :class:`Signal`, fetching only the bytes it needs
+        from the ``source``.
         
-        Returns ``None`` if the channel has no conversion, otherwise a dict
-        describing it (``conversion_type``, ``values``, ``resolved_texts``,
-        ``formula`` …).
-        """
-        ...
-
-    def list_signals(self) -> builtins.list[tuple[typing.Optional[builtins.str], typing.Optional[builtins.str], typing.Optional[builtins.str]]]:
-        r"""
-        A flat catalog of every channel as ``(source, group, channel)`` tuples.
-        
-        ``source`` is this index's attached source (file path or URL) — the same
-        for every row, so catalogs from several indexes concatenate cleanly.
-        Built from metadata only; no sample data is read (cheap even for a
-        URL-backed index). ``group`` / ``channel`` are ``None`` if unnamed.
-        
-        Returns
-        -------
-        list[tuple[Optional[str], Optional[str], Optional[str]]]
-        """
-        ...
-
-    def set_source_prop(self, value:typing.Optional[builtins.str]) -> None:
-        ...
-
-    def set_source(self, value:typing.Optional[builtins.str]) -> None:
-        r"""
-        Attach (or clear) the data source used by :py:meth:`read` / :py:meth:`values`.
-        
-        A value starting with ``http://`` or ``https://`` is treated as a URL;
-        anything else as a local file path. Pass ``None`` to clear.
-        """
-        ...
-
-    def read(self, name:builtins.str, group:typing.Optional[builtins.str]) -> typing.Any:
-        r"""
-        Read a channel as a ``pandas.Series`` of values indexed by timestamps.
-        
-        **Lazy:** the byte-range request to the attached source happens now, not
-        when the index was built. Values carry all conversions; the index is the
-        group master converted to a ``DatetimeIndex`` (or raw seconds / default
-        index when there is no start time / master).
+        A window fetches only the selected records: a time window is located
+        by searching the master channel (a few single-record reads), not by
+        downloading it.
         
         Parameters
         ----------
         name : str
+            Channel name (case-sensitive).
         group : Optional[str]
-            Disambiguate by group when the channel name is not unique.
+            Look only in the group(s) with this name.
+        start_time, end_time : Optional[float]
+            Inclusive time window, in the master channel's unit (seconds
+            relative to the measurement start). Omitted bounds are open.
+        start_record, record_count : Optional[int]
+            Record window ``[start_record, start_record + record_count)``.
+            Pass either a time window or a record window, not both.
         
         Raises
         ------
+        ChannelNotFoundError
+            If no matching channel exists.
         MdfException
-            If no source is attached, the channel is missing, or pandas is absent.
+            If no source is attached, or the read fails.
         """
         ...
 
-    def values(self, name:builtins.str, group:typing.Optional[builtins.str]) -> typing.Any:
+    def values(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
-        Read a numeric channel by name as a plain numpy ``float64`` array.
-        
-        Lazy fast path — just the values, no timestamp index, pandas-free.
-        Invalid / non-numeric samples are ``NaN``.
-        
-        Parameters
-        ----------
-        name : str
-        group : Optional[str]
+        Read a numeric channel as a plain numpy ``float64`` array (no
+        timestamps). Conversions are applied; invalid and non-numeric samples
+        are ``NaN``. Parameters as for :py:meth:`read`.
         """
         ...
 
-    def __getitem__(self, key:typing.Any) -> typing.Any:
+    def __getitem__(self, key:typing.Any) -> Signal:
         r"""
-        ``index["Speed"]`` — shorthand for :py:meth:`read` (timestamp-indexed Series).
+        ``idx["Speed"]`` — shorthand for :py:meth:`read`.
         
         Pass a ``(name, group)`` tuple to disambiguate a channel name shared by
-        several groups, e.g. ``index["Speed", "Engine"]``.
+        several groups, e.g. ``idx["Speed", "Engine"]``.
+        """
+        ...
+
+    def time_range(self, name:builtins.str, group:typing.Optional[builtins.str] = None) -> typing.Optional[tuple[builtins.float, builtins.float]]:
+        r"""
+        First and last master (time) value of the group holding ``name`` as a
+        ``(start, end)`` tuple, or ``None`` for an empty group. Reads just two
+        records from the ``source``.
+        """
+        ...
+
+    def conversion(self, name:builtins.str, group:typing.Optional[builtins.str] = None) -> typing.Any:
+        r"""
+        The conversion ``read`` / ``values`` apply to channel ``name``, fully
+        resolved, or ``None`` when the channel has none. See
+        :py:meth:`Mdf.conversion` for the returned dict.
+        
+        Indexes built from a URL fetch the conversion from the ``source`` on
+        demand.
+        """
+        ...
+
+    def byte_ranges(self, name:builtins.str, group:typing.Optional[builtins.str] = None) -> builtins.list[tuple[builtins.int, builtins.int]]:
+        r"""
+        ``(offset, length)`` byte ranges of the file holding a channel's
+        samples — for issuing range requests yourself.
+        
+        Each range is one span per data block and includes the bytes of the
+        group's other channels lying between this channel's samples. Refused
+        for variable-length (VLSD) channels: use ``read`` / ``values``.
+        """
+        ...
+
+    def byte_ranges_for_records(self, name:builtins.str, start_record:builtins.int, record_count:builtins.int, group:typing.Optional[builtins.str] = None) -> builtins.list[tuple[builtins.int, builtins.int]]:
+        r"""
+        :py:meth:`byte_ranges` for the record window
+        ``[start_record, start_record + record_count)``.
         """
         ...
 
@@ -593,386 +581,224 @@ class MdfWriter:
     r"""
     Streaming writer for MDF 4 files.
     
-    Build an MDF file in five logical steps:
-    
-    1. ``writer = mf4_rs.MdfWriter("out.mf4")``
-    2. ``writer.init_mdf_file()`` — write ``##ID`` and ``##HD``.
-    3. Define structure: :py:meth:`add_channel_group`, then any combination of
-       :py:meth:`add_time_channel`, :py:meth:`add_float_channel`,
-       :py:meth:`add_float32_channel`, :py:meth:`add_int_channel`, or the
-       generic :py:meth:`add_channel`.
-    4. Write data: :py:meth:`start_data_block`, then either
-       :py:meth:`write_record` (one record at a time, ergonomic) or
-       :py:meth:`write_columns_f64` / :py:meth:`write_columns` (bulk numpy,
-       much faster), then :py:meth:`finish_data_block`.
-    5. :py:meth:`finalize` — flushes and closes the file. The writer is
-       unusable after this; calling any other method raises ``MdfException``.
-    
-    All identifiers (``cg_*`` for groups, ``ch_*`` for channels) are *opaque
-    strings* — pass them back to subsequent methods, but don't try to parse
-    them. Channels are auto-linked into a per-group linked list in the order
-    they were added.
+    Call order: :py:meth:`init_mdf_file` → :py:meth:`add_channel_group` →
+    ``add_*_channel`` (time channel first) → :py:meth:`start_data_block` →
+    :py:meth:`write_record` / :py:meth:`write_columns` →
+    :py:meth:`finish_data_block` → :py:meth:`finalize`.
     
     Example
     -------
-    >>> w = mf4_rs.MdfWriter("demo.mf4")
+    >>> w = mf4_rs.MdfWriter("out.mf4")
     >>> w.init_mdf_file()
-    >>> cg = w.add_channel_group("group_0")
-    >>> t = w.add_time_channel(cg, "Time")
-    >>> y = w.add_float_channel(cg, "Speed")
-    >>> w.start_data_block(cg)
-    >>> for i in range(100):
-    ...     w.write_record(cg, [
-    ...         mf4_rs.create_float_value(i * 0.01),
-    ...         mf4_rs.create_float_value(i * 1.5),
-    ...     ])
-    >>> w.finish_data_block(cg)
+    >>> g = w.add_channel_group("Engine")
+    >>> t = w.add_time_channel(g, "Time")
+    >>> speed = w.add_float_channel(g, "Speed")
+    >>> w.add_linear_conversion(speed, 0.0, 3.6)       # m/s -> km/h
+    >>> w.start_data_block(g)
+    >>> w.write_record(g, [0.0, 12.5])
+    >>> w.write_columns(g, [numpy.arange(1.0, 4.0), numpy.ones(3)])
+    >>> w.finish_data_block(g)
     >>> w.finalize()
     """
     def __new__(cls,path:builtins.str): ...
     def init_mdf_file(self) -> None:
         r"""
-        Write the MDF identification (``##ID``) and header (``##HD``) blocks.
-        
-        Must be called exactly once, before adding any channel group.
+        Write the identification and header blocks. Call once, first. The
+        header is stamped with the current time (see :py:meth:`set_start_time`).
         """
         ...
 
-    def add_channel_group(self, name:typing.Optional[builtins.str]) -> builtins.str:
+    def set_start_time(self, abs_time_ns:builtins.int) -> None:
         r"""
-        Append a new channel group (``##CG``) to the file.
-        
-        Parameters
-        ----------
-        name : Optional[str]
-            Group acquisition name. Written as a ``##TX`` block referenced
-            from the new ``##CG`` via ``acq_name_addr``. Pass ``None`` to
-            leave it unset.
-        
-        Returns
-        -------
-        str
-            Opaque group ID (e.g. ``"cg_0"``) — pass to subsequent
-            ``add_channel`` / ``write_record`` / ``finish_data_block`` calls.
+        Set the measurement start time (nanoseconds since the Unix epoch, UTC).
+        """
+        ...
+
+    def add_channel_group(self, name:typing.Optional[builtins.str] = None) -> builtins.str:
+        r"""
+        Add a channel group and return its id.
         """
         ...
 
     def set_channel_group_comment(self, group_id:builtins.str, comment:builtins.str) -> None:
         r"""
-        Attach a comment / description to a channel group.
-        
-        Writes a ``##TX`` block holding ``comment`` and links it from the
-        group's ``comment_addr`` field.
+        Set a channel group's comment.
         """
         ...
 
-    def add_channel(self, group_id:builtins.str, name:builtins.str, data_type:DataType) -> builtins.str:
+    def add_channel(self, group_id:builtins.str, name:builtins.str, data_type:builtins.str) -> builtins.str:
         r"""
-        Add a generic channel to a channel group, using the data type's
-        natural bit width.
-        
-        The new channel is linked after the most recently added channel in
-        the same group, and inherits its byte offset from the running record
-        layout. For float channels this defaults to **32 bits** — use
-        :py:meth:`add_float_channel` if you want 64-bit precision.
+        Add a channel of the given data type (default width) and return its id.
         
         Parameters
         ----------
         group_id : str
-            ID returned by :py:meth:`add_channel_group`.
         name : str
-            Channel name (written as a ``##TX`` block).
-        data_type : DataType
-            One of the values from the ``create_data_type_*`` helpers.
-        
-        Returns
-        -------
-        str
-            Opaque channel ID (e.g. ``"ch_3"``).
+        data_type : str
+            A canonical data-type name as reported by
+            :py:attr:`ChannelInfo.data_type`: ``"FloatLE"``,
+            ``"UnsignedIntegerLE"``, ``"SignedIntegerLE"``, ``"StringUtf8"``,
+            ``"ByteArray"``, … Text types are written as variable-length channels.
         """
         ...
 
     def add_time_channel(self, group_id:builtins.str, name:builtins.str) -> builtins.str:
         r"""
-        Add a 64-bit little-endian float channel and mark it as the group's
-        master / time channel.
-        
-        Equivalent to :py:meth:`add_float_channel` followed by
-        :py:meth:`set_time_channel`. Should typically be the **first** channel
-        added to a group — subsequent channels will be linked after it.
-        
-        Parameters
-        ----------
-        group_id : str
-        name : str
-            Usually ``"Time"`` or ``"t"``.
-        
-        Returns
-        -------
-        str
-            Channel ID.
+        Add a 64-bit float channel and mark it as the group's master (time)
+        channel. Add it first, before the group's data channels.
         """
         ...
 
     def add_float_channel(self, group_id:builtins.str, name:builtins.str) -> builtins.str:
         r"""
-        Add a 64-bit little-endian float (``f64``) data channel.
-        
-        Recommended default for scientific / numeric data. Use
-        :py:meth:`add_float32_channel` when 32-bit precision is enough and
-        file size matters.
+        Add a 64-bit float channel.
         """
         ...
 
     def add_float32_channel(self, group_id:builtins.str, name:builtins.str) -> builtins.str:
         r"""
-        Add a 32-bit little-endian float (``f32``) data channel.
-        
-        Halves the per-record size compared to :py:meth:`add_float_channel`
-        at the cost of precision (~7 decimal digits).
+        Add a 32-bit float channel.
         """
         ...
 
     def add_int_channel(self, group_id:builtins.str, name:builtins.str) -> builtins.str:
         r"""
-        Add a 64-bit little-endian unsigned integer (``u64``) data channel.
-        
-        Values must be created with ``create_uint_value``. For signed
-        integers use :py:meth:`add_sint_channel` (writing a negative
-        ``create_int_value`` into an unsigned channel raises).
+        Add a 64-bit **unsigned** integer channel.
         """
         ...
 
     def add_sint_channel(self, group_id:builtins.str, name:builtins.str) -> builtins.str:
         r"""
-        Add a 64-bit little-endian signed integer (``i64``) data channel.
-        
-        Values must be created with ``create_int_value``.
+        Add a 64-bit **signed** integer channel.
         """
         ...
 
     def add_string_channel(self, group_id:builtins.str, name:builtins.str) -> builtins.str:
         r"""
-        Add a variable-length (VLSD) UTF-8 string data channel.
-        
-        Each record stores an offset into a ``##SD`` block that the writer
-        maintains automatically; pass values created with
-        ``create_string_value`` to :py:meth:`write_record`. This is the only
-        way to write string data — fixed-length string channels are not
-        supported by the writer.
+        Add a variable-length UTF-8 string channel.
         """
         ...
 
     def set_time_channel(self, channel_id:builtins.str) -> None:
         r"""
-        Mark an existing channel as the group's master / time channel.
-        
-        Sets ``channel_type = 2`` and ``sync_type = 1`` on the underlying
-        ``##CN`` block. Most users should prefer :py:meth:`add_time_channel`,
-        which combines channel creation with this call.
+        Mark an existing channel as its group's master (time) channel.
+        """
+        ...
+
+    def add_linear_conversion(self, channel_id:builtins.str, offset:builtins.float, factor:builtins.float) -> None:
+        r"""
+        Attach a linear conversion (``physical = offset + factor * raw``) to a
+        channel. Call before :py:meth:`start_data_block`.
+        """
+        ...
+
+    def add_value_to_text_conversion(self, channel_id:builtins.str, mapping:typing.Sequence[tuple[builtins.int, builtins.str]], default_text:builtins.str) -> None:
+        r"""
+        Attach a value-to-text conversion to a channel.
         
         Parameters
         ----------
         channel_id : str
-            ID returned by one of the ``add_*_channel`` methods.
+        mapping : Sequence[tuple[int, str]]
+            ``(raw value, text)`` pairs.
+        default_text : str
+            Text for any raw value not in ``mapping``.
         """
         ...
 
     def start_data_block(self, group_id:builtins.str) -> None:
         r"""
-        Open a fresh ``##DT`` data block for a channel group.
-        
-        Must be called once after all channels have been added, before any
-        :py:meth:`write_record` / :py:meth:`write_columns_f64` /
-        :py:meth:`write_columns` for that group. The writer will
-        automatically split into multiple ``##DT`` fragments at the 4 MB
-        boundary, joined by a ``##DL`` block when you call
-        :py:meth:`finish_data_block`.
+        Open the data block of a channel group. Call after all of the group's
+        channels and conversions are added.
         """
         ...
 
-    def write_record(self, group_id:builtins.str, values:typing.Sequence[DecodedValue]) -> None:
+    def write_record(self, group_id:builtins.str, values:typing.Sequence[typing.Any]) -> None:
         r"""
-        Append a single record (one sample for each channel in the group).
-        
-        ``values`` must contain exactly one entry per channel, in the same
-        order channels were added — typically the master channel first, then
-        data channels. Each value is encoded according to its channel's data
-        type (the variant of :class:`DecodedValue` is *not* re-checked, so
-        passing the wrong variant will produce nonsense bytes).
-        
-        This call has Python-level overhead per value; for bulk numeric data,
-        prefer :py:meth:`write_columns_f64` or :py:meth:`write_columns`.
+        Append one record: one plain value per channel, in the order the
+        channels were added (``float`` / ``int`` / ``str`` / ``bytes``).
+        """
+        ...
+
+    def write_columns(self, group_id:builtins.str, columns:typing.Sequence[typing.Any]) -> None:
+        r"""
+        Append many records at once from one numpy array per channel (the fast
+        path). Arrays must be 1-D, contiguous, equally long and of dtype
+        ``float64``, ``float32``, ``uint64`` or ``int64`` matching the channel.
         """
         ...
 
     def finish_data_block(self, group_id:builtins.str) -> None:
         r"""
-        Close the open ``##DT`` block for a channel group.
-        
-        If the group's data exceeded the 4 MB block size and was split
-        across multiple ``##DT`` fragments, this also writes the ``##DL``
-        (data list) block linking them together. Call once per group after
-        all records have been written, and before :py:meth:`finalize`.
-        """
-        ...
-
-    def write_columns_f64(self, group_id:builtins.str, columns:typing.Sequence[typing.Any]) -> None:
-        r"""
-        Bulk-write all channels of a group from numpy ``float64`` arrays.
-        
-        Equivalent to writing every record in row order, but ~10× faster than
-        looping over :py:meth:`write_record` because it avoids per-value
-        Python-Rust crossings and ``DecodedValue`` boxing.
-        
-        Parameters
-        ----------
-        group_id : str
-        columns : list[numpy.ndarray]
-            One contiguous 1-D ``float64`` array per channel, in channel
-            order. **All arrays must have identical length** — that length
-            becomes the record count. The float values are converted to each
-            channel's declared data type before encoding.
-        
-        Raises
-        ------
-        MdfException
-            If an array is not contiguous, not ``float64``, or lengths
-            mismatch.
-        """
-        ...
-
-    def write_columns(self, group_id:builtins.str, columns:typing.Sequence[typing.Any], dtypes:typing.Sequence[builtins.str]) -> None:
-        r"""
-        Bulk-write all channels of a group from heterogeneous numpy arrays.
-        
-        Like :py:meth:`write_columns_f64` but accepts a per-column dtype, so
-        integer / single-precision channels are written without an
-        intermediate ``float64`` round-trip.
-        
-        Parameters
-        ----------
-        group_id : str
-        columns : list[numpy.ndarray]
-            One contiguous 1-D array per channel, all of identical length.
-        dtypes : list[str]
-            One entry per column, matching ``columns``. Allowed values:
-            ``"f64"``, ``"f32"``, ``"u64"``, ``"i64"``.
-        
-        Raises
-        ------
-        MdfException
-            If the dtype string is not one of the supported values, the
-            numpy array's element type doesn't match the dtype string, the
-            two list lengths differ, or any array is non-contiguous.
+        Close a channel group's data block. Call once per group after all
+        records are written.
         """
         ...
 
     def finalize(self) -> None:
         r"""
-        Flush all buffered bytes to disk and close the file.
-        
-        After this returns, the writer is consumed: any subsequent method
-        call raises ``MdfException``. Calling :py:meth:`finalize` more than
-        once also raises.
+        Flush and close the file. The writer cannot be used afterwards.
         """
         ...
 
 
-class DecodedValue(Enum):
+class Signal:
     r"""
-    A single decoded channel sample, tagged with its underlying type.
+    A decoded channel: its values paired with the group's time axis.
     
-    Returned by ``create_*_value`` helpers and consumed by
-    :py:meth:`MdfWriter.write_record`. When *reading*, most APIs return native
-    Python objects (``float`` / ``int`` / ``str`` / ``bytes``) directly, so you
-    usually only construct ``DecodedValue`` to feed back into the writer.
+    Returned by ``read`` (and ``obj[name]``) of :class:`Mdf` and
+    :class:`MdfIndex`. Call :py:meth:`to_series` for a ``pandas.Series``.
     
-    Variants carry a single ``value`` field (use the ``value`` getter to
-    retrieve the inner native Python value):
+    Attributes
+    ----------
+    name : str
+        Channel name.
+    unit : Optional[str]
+        Physical unit.
+    timestamps : numpy.ndarray
+        ``float64`` master-channel values (seconds relative to the measurement
+        start for a time master). Empty when the group has no master, or when
+        this channel *is* the master (its ``values`` are the time axis).
+    values : numpy.ndarray
+        One value per record, conversions applied. ``float64`` (``NaN`` =
+        invalid sample) for numeric channels; an ``object`` array of
+        ``str`` / ``bytes`` / ``None`` for text and byte channels.
     
-    - ``Float(value: float)``
-    - ``UnsignedInteger(value: int)``
-    - ``SignedInteger(value: int)``
-    - ``String(value: str)``
-    - ``ByteArray(value: bytes)``
-    - ``Unknown()`` — undecodable / not yet supported
+    Example
+    -------
+    >>> speed = mdf.read("Speed")
+    >>> speed.values.mean(), speed.unit
+    >>> speed.to_series().plot()
     """
-    Float = auto()
-    UnsignedInteger = auto()
-    SignedInteger = auto()
-    String = auto()
-    ByteArray = auto()
-    Unknown = auto()
+    name: builtins.str
+    unit: typing.Optional[builtins.str]
+    timestamps: typing.Any
+    values: typing.Any
+    def __len__(self) -> builtins.int:
+        r"""
+        Number of samples.
+        """
+        ...
 
-def create_data_type_float_le() -> DataType:
-    r"""
-    Return the :class:`DataType` for little-endian IEEE-754 floats.
-    
-    Pair with :py:meth:`MdfWriter.add_channel`. Defaults to 32 bits when
-    passed to ``add_channel`` — for f64 use :py:meth:`MdfWriter.add_float_channel`.
-    """
-    ...
+    def __repr__(self) -> builtins.str:
+        ...
 
-def create_data_type_signed_le() -> DataType:
-    r"""
-    Return the :class:`DataType` for little-endian signed integers.
-    
-    Pair with :py:meth:`MdfWriter.add_channel` when you need a signed
-    integer channel of non-default width (otherwise see
-    :py:meth:`MdfWriter.add_sint_channel`).
-    """
-    ...
+    def to_series(self) -> typing.Any:
+        r"""
+        The signal as a ``pandas.Series``: ``values`` indexed by ``timestamps``.
+        
+        The index is a ``DatetimeIndex`` (timestamps added to the file's start
+        time) when the file records a start time, otherwise the raw master
+        seconds. Without timestamps (no master, or the master channel itself)
+        a default integer index is used. The series is named after the channel.
+        
+        Raises
+        ------
+        MdfException
+            If pandas is not installed.
+        """
+        ...
 
-def create_data_type_string_utf8() -> DataType:
-    r"""
-    Return the :class:`DataType` for UTF-8 encoded string channels.
-    """
-    ...
-
-def create_data_type_uint_le() -> DataType:
-    r"""
-    Return the :class:`DataType` for little-endian unsigned integers.
-    
-    Pair with :py:meth:`MdfWriter.add_channel` when you need an unsigned
-    integer channel of non-default width (otherwise see
-    :py:meth:`MdfWriter.add_int_channel`).
-    """
-    ...
-
-def create_float_value(value:builtins.float) -> DecodedValue:
-    r"""
-    Wrap a Python ``float`` in a :class:`DecodedValue` of variant ``Float``.
-    
-    Use this to feed values into :py:meth:`MdfWriter.write_record` for any
-    floating-point channel (32- or 64-bit; the value is truncated to the
-    channel's declared bit width on encode).
-    """
-    ...
-
-def create_int_value(value:builtins.int) -> DecodedValue:
-    r"""
-    Wrap a Python ``int`` in a ``SignedInteger`` :class:`DecodedValue`.
-    """
-    ...
-
-def create_string_value(value:builtins.str) -> DecodedValue:
-    r"""
-    Wrap a Python ``str`` in a ``String`` :class:`DecodedValue`.
-    
-    For string channels (``StringUtf8`` etc.). Encoding into the file is
-    done according to the channel's declared string data type.
-    """
-    ...
-
-def create_uint_value(value:builtins.int) -> DecodedValue:
-    r"""
-    Wrap a Python ``int`` in a ``UnsignedInteger`` :class:`DecodedValue`.
-    
-    Suitable for any unsigned integer channel; the value is truncated to the
-    channel's bit width on encode.
-    """
-    ...
 
 def cut_mdf_by_time(input_path:builtins.str, output_path:builtins.str, start_time:builtins.float, end_time:builtins.float) -> None:
     r"""
@@ -1015,22 +841,6 @@ def cut_mdf_by_utc(input_path:builtins.str, output_path:builtins.str, start_utc:
     """
     ...
 
-def file_layout_from_file(path:builtins.str) -> FileLayout:
-    r"""
-    Build a :class:`FileLayout` from an MDF file on disk.
-    
-    Functional alias for :py:meth:`FileLayout.from_file`.
-    
-    Parameters
-    ----------
-    path : str
-    
-    Returns
-    -------
-    FileLayout
-    """
-    ...
-
 def merge_files(output:builtins.str, first:builtins.str, second:builtins.str) -> None:
     r"""
     Merge two MDF files into a new file at ``output``.
@@ -1050,14 +860,14 @@ def merge_files(output:builtins.str, first:builtins.str, second:builtins.str) ->
     """
     ...
 
-def to_column_oriented(input_path:builtins.str, output_path:builtins.str, block_size:typing.Optional[builtins.int], memory_budget:typing.Optional[builtins.int], share_identical_time:typing.Optional[builtins.bool]) -> ColumnReport:
+def to_column_oriented(input_path:builtins.str, output_path:builtins.str, block_size:typing.Optional[builtins.int] = None, memory_budget:typing.Optional[builtins.int] = None, share_identical_time:typing.Optional[builtins.bool] = None, read_chunk_size:typing.Optional[builtins.int] = None) -> ColumnReport:
     r"""
     Rewrite an MDF 4 file as a column-oriented MDF 4.20 file optimised for
     reading single signals from cloud storage.
     
     Each signal gets its own channel group whose data blocks are written back
     to back, so one HTTP range request fetches the whole signal. Timestamps are
-    stored once per source group and shared by all its signals through the MDF
+    stored once per source group and shared by all its signals through the Mdf
     4.2 *remote master* link (and, with ``share_identical_time``, shared across
     source groups that have identical time axes). All metadata blocks sit at
     the front of the file, so building an :class:`MdfIndex` over HTTP needs a
@@ -1082,6 +892,8 @@ def to_column_oriented(input_path:builtins.str, output_path:builtins.str, block_
     share_identical_time : bool, optional
         Default ``True``. Merge byte-identical time axes of different source groups into one
         time channel group.
+    read_chunk_size : int, optional
+        Bytes read from the source per step (default 4 MiB).
     
     Returns
     -------
@@ -1100,3 +912,17 @@ def to_column_oriented(input_path:builtins.str, output_path:builtins.str, block_
     """
     ...
 
+
+class MdfException(Exception):
+    r"""
+    Base class of every error raised by mf4_rs.
+    """
+    ...
+
+class ChannelNotFoundError(MdfException):
+    r"""
+    Raised by data operations (``read``, ``values``, ``time_range``,
+    ``conversion``, ``byte_ranges``) when the named channel does not exist.
+    Metadata lookups (``group``, ``channel``) return ``None`` instead.
+    """
+    ...

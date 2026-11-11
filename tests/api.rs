@@ -1,5 +1,5 @@
 use mf4_rs::writer::MdfWriter;
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::parsing::decoder::{decode_channel_value, DecodedValue};
 use mf4_rs::blocks::channel_block::ChannelBlock;
 use mf4_rs::blocks::common::DataType;
@@ -14,18 +14,18 @@ fn writer_and_parser_roundtrip() -> Result<(), MdfError> {
 
     let mut writer = MdfWriter::new(path.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let cn1_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let cn1_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Channel 1".to_string());
     })?;
-    writer.add_channel(&cg_id, Some(&cn1_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&cn1_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("Channel 2".to_string());
     })?;
     writer.finalize()?;
 
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let groups = mdf.channel_groups();
     assert_eq!(groups.len(), 1);
     let cg = &groups[0];
@@ -34,8 +34,8 @@ fn writer_and_parser_roundtrip() -> Result<(), MdfError> {
     assert_eq!(channels.len(), 2);
     assert_eq!(channels[0].name()?.as_deref(), Some("Channel 1"));
     assert_eq!(channels[1].name()?.as_deref(), Some("Channel 2"));
-    assert!(channels[0].values()?.is_empty());
-    assert!(channels[1].values()?.is_empty());
+    assert!(channels[0].decoded_values()?.is_empty());
+    assert!(channels[1].decoded_values()?.is_empty());
 
     std::fs::remove_file(path)?;
     Ok(())
@@ -50,11 +50,11 @@ fn writer_data_roundtrip() -> Result<(), MdfError> {
 
     let mut writer = MdfWriter::new(path.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let cn1 = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let cn1 = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
     })?;
-    writer.add_channel(&cg_id, Some(&cn1), |ch| {
+    writer.add_channel_with(&cg_id, Some(&cn1), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
     })?;
 
@@ -66,14 +66,14 @@ fn writer_data_roundtrip() -> Result<(), MdfError> {
     writer.finish_data_block(&cg_id)?;
     writer.finalize()?;
 
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let groups = mdf.channel_groups();
     assert_eq!(groups.len(), 1);
     let cg = &groups[0];
     let channels = cg.channels();
     assert_eq!(channels.len(), 2);
-    let vals1 = channels[0].values()?;
-    let vals2 = channels[1].values()?;
+    let vals1 = channels[0].decoded_values()?;
+    let vals2 = channels[1].decoded_values()?;
     assert_eq!(vals1.len(), 1);
     assert_eq!(vals2.len(), 1);
     match &vals1[0] {
@@ -96,8 +96,8 @@ fn writer_write_records() -> Result<(), MdfError> {
 
     let mut writer = MdfWriter::new(path.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    writer.add_channel(&cg_id, None, |ch| { ch.data_type = DataType::UnsignedIntegerLE; })?;
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    writer.add_channel_with(&cg_id, None, |ch| { ch.data_type = DataType::UnsignedIntegerLE; })?;
 
     writer.start_data_block_for_cg(&cg_id, 0)?;
     let recs = vec![
@@ -109,9 +109,9 @@ fn writer_write_records() -> Result<(), MdfError> {
     writer.finish_data_block(&cg_id)?;
     writer.finalize()?;
 
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let groups = mdf.channel_groups();
-    let vals = groups[0].channels()[0].values()?;
+    let vals = groups[0].channels()[0].decoded_values()?;
     assert_eq!(vals.len(), 2);
     if let Some(DecodedValue::UnsignedInteger(v)) = vals[0] { assert_eq!(v, 1); } else { panic!("wrong type") }
     if let Some(DecodedValue::UnsignedInteger(v)) = vals[1] { assert_eq!(v, 2); } else { panic!("wrong type") }
@@ -158,14 +158,14 @@ fn cut_mdf_file_by_time() -> Result<(), MdfError> {
     // Create source file with a time channel and a value channel
     let mut writer = MdfWriter::new(input.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let time_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let time_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Time".into());
         ch.bit_count = 64;
     })?;
     writer.set_time_channel(&time_id)?;
-    writer.add_channel(&cg_id, Some(&time_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&time_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.bit_count = 32;
         ch.name = Some("Val".into());
@@ -191,14 +191,14 @@ fn cut_mdf_file_by_time() -> Result<(), MdfError> {
         0.5,
     )?;
 
-    let mdf = MDF::from_file(output.to_str().unwrap())?;
+    let mdf = Mdf::from_file(output.to_str().unwrap())?;
     let groups = mdf.channel_groups();
     assert_eq!(groups.len(), 1);
     let cg = &groups[0];
     let chs = cg.channels();
     assert_eq!(chs.len(), 2);
-    let times = chs[0].values()?;
-    let vals = chs[1].values()?;
+    let times = chs[0].decoded_values()?;
+    let vals = chs[1].decoded_values()?;
     assert_eq!(times.len(), 4);
     assert_eq!(vals.len(), 4);
     if let Some(DecodedValue::Float(t0)) = times[0] { assert!((t0 - 0.2).abs() < 1e-6); }
@@ -227,14 +227,14 @@ fn cut_does_not_double_apply_conversions() -> Result<(), MdfError> {
 
     let mut writer = MdfWriter::new(input.to_str().unwrap())?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let time_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let time_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Time".into());
     })?;
     writer.set_time_channel(&time_id)?;
-    let val_id = writer.add_channel(&cg_id, Some(&time_id), |ch| {
+    let val_id = writer.add_channel_with(&cg_id, Some(&time_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.bit_count = 32;
         ch.name = Some("Val".into());
@@ -282,9 +282,9 @@ fn cut_does_not_double_apply_conversions() -> Result<(), MdfError> {
 
     // Sanity: source reads back with conversion applied.
     {
-        let mdf = MDF::from_file(input.to_str().unwrap())?;
+        let mdf = Mdf::from_file(input.to_str().unwrap())?;
         let chs = mdf.channel_groups()[0].channels();
-        let vals = chs[1].values()?;
+        let vals = chs[1].decoded_values()?;
         assert_eq!(vals.len(), 10);
         if let Some(DecodedValue::Float(v3)) = vals[3] {
             assert!((v3 - 16.0).abs() < 1e-9, "source phys[3] = {}", v3);
@@ -306,9 +306,9 @@ fn cut_does_not_double_apply_conversions() -> Result<(), MdfError> {
     // The double-apply regression would manifest as cut having stored the
     // already-converted values in the raw slots; applying the preserved
     // conversion on top would then produce [42.0, 46.0, 50.0].
-    let mdf = MDF::from_file(output.to_str().unwrap())?;
+    let mdf = Mdf::from_file(output.to_str().unwrap())?;
     let chs = mdf.channel_groups()[0].channels();
-    let vals = chs[1].values()?;
+    let vals = chs[1].decoded_values()?;
     assert_eq!(vals.len(), 3);
     let phys: Vec<f64> = vals
         .iter()

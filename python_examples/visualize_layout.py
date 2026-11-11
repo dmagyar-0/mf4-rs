@@ -4,7 +4,7 @@ Example: Visualize the on-disk block structure of an MDF file.
 
 Shows how to:
   1. Build a FileLayout either through PyMDF.file_layout() or directly
-     from a path via mf4_rs.file_layout_from_file().
+     from a path via mf4_rs.FileLayout.from_file().
   2. Render it as a flat byte-sorted listing or an indented link tree.
   3. Dump it to JSON for further analysis.
   4. Walk the in-memory block list programmatically.
@@ -17,11 +17,11 @@ def main():
     path = "example.mf4"  # assumes write_file.py has been run
 
     # Option 1: through an MDF instance you already hold.
-    mdf = mf4_rs.PyMDF(path)
+    mdf = mf4_rs.Mdf.from_file(path)
     layout = mdf.file_layout()
 
     # Option 2: build directly from a path.
-    layout_direct = mf4_rs.file_layout_from_file(path)
+    layout_direct = mf4_rs.FileLayout.from_file(path)
     assert layout.file_size == layout_direct.file_size
 
     # ---- Flat listing ----

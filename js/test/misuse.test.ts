@@ -14,7 +14,7 @@ import { buildSampleFile } from "./helpers";
 test("Mdf.values() throws for an unknown channel name", () => {
   const { bytes } = buildSampleFile(10);
   const mdf = Mdf.fromBytes(bytes);
-  assert.throws(() => mdf.values("DoesNotExist", "Group1"));
+  assert.throws(() => mdf.values("DoesNotExist", { group: "Group1" }));
   mdf.dispose();
 });
 
@@ -29,7 +29,7 @@ test("MdfIndex.valuesFromFragments() throws for an unknown channel name", async 
   const { bytes } = buildSampleFile(10);
   const index = MdfIndex.fromBytes(bytes);
   const source = new BytesRangeSource(bytes);
-  await assert.rejects(() => index.values("DoesNotExist", source, "Group1"));
+  await assert.rejects(() => index.values("DoesNotExist", { source: source, group: "Group1" }));
   index.dispose();
 });
 
@@ -52,7 +52,7 @@ test("Mdf.fromFile() reads a file written to disk via MdfWriter", async () => {
   await fsp.writeFile(tmpPath, bytes);
 
   const mdf = await Mdf.fromFile(tmpPath);
-  const read = mdf.values("Value", "Group1");
+  const read = mdf.values("Value", { group: "Group1" });
   assert.equal(read.length, values.length);
   for (let i = 0; i < values.length; i++) {
     assert.ok(Math.abs(read[i]! - values[i]!) < 1e-9);

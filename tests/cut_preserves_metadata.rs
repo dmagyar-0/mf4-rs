@@ -1,7 +1,7 @@
 //! End-to-end checks that `cut_mdf_by_time` preserves the per-channel
 //! source/text/conversion blocks from the input file.
 
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::blocks::common::{BlockHeader, DataType};
 use mf4_rs::blocks::conversion::{ConversionBlock, ConversionType};
 use mf4_rs::blocks::text_block::TextBlock;
@@ -70,16 +70,16 @@ fn cut_preserves_conversion_unit_comment_and_source() -> Result<(), MdfError> {
     {
         let mut writer = MdfWriter::new(input.to_str().unwrap())?;
         writer.init_mdf_file()?;
-        let cg_id = writer.add_channel_group(None, |_| {})?;
+        let cg_id = writer.add_channel_group_with(None, |_| {})?;
 
-        let time_id = writer.add_channel(&cg_id, None, |ch| {
+        let time_id = writer.add_channel_with(&cg_id, None, |ch| {
             ch.data_type = DataType::FloatLE;
             ch.bit_count = 64;
             ch.name = Some("Time".into());
         })?;
         writer.set_time_channel(&time_id)?;
 
-        let val_id = writer.add_channel(&cg_id, Some(&time_id), |ch| {
+        let val_id = writer.add_channel_with(&cg_id, Some(&time_id), |ch| {
             ch.data_type = DataType::UnsignedIntegerLE;
             ch.bit_count = 32;
             ch.name = Some("Val".into());
@@ -144,7 +144,7 @@ fn cut_preserves_conversion_unit_comment_and_source() -> Result<(), MdfError> {
 
     // 2. Sanity check: the source file reads back the metadata as expected.
     {
-        let mdf = MDF::from_file(input.to_str().unwrap())?;
+        let mdf = Mdf::from_file(input.to_str().unwrap())?;
         let chs = mdf.channel_groups()[0].channels();
         let val = &chs[1];
         assert_eq!(val.unit()?.as_deref(), Some("kPa"));
@@ -155,7 +155,7 @@ fn cut_preserves_conversion_unit_comment_and_source() -> Result<(), MdfError> {
         assert_eq!(src.comment.as_deref(), Some("ecu comment"));
 
         // Conversion applied: raw=3 → phys=10.
-        let vals = val.values()?;
+        let vals = val.decoded_values()?;
         if let Some(DecodedValue::Float(v)) = vals[3] {
             assert!((v - 10.0).abs() < 1e-9, "source phys[3] = {}", v);
         } else {
@@ -171,7 +171,7 @@ fn cut_preserves_conversion_unit_comment_and_source() -> Result<(), MdfError> {
         0.5,
     )?;
 
-    let mdf = MDF::from_file(output.to_str().unwrap())?;
+    let mdf = Mdf::from_file(output.to_str().unwrap())?;
     let groups = mdf.channel_groups();
     assert_eq!(groups.len(), 1);
     let chs = groups[0].channels();
@@ -191,7 +191,7 @@ fn cut_preserves_conversion_unit_comment_and_source() -> Result<(), MdfError> {
     assert_eq!(src.comment.as_deref(), Some("ecu comment"));
 
     // Conversion still applied: raws [2,3,4,5] → phys [7,10,13,16].
-    let vals = val.values()?;
+    let vals = val.decoded_values()?;
     let phys: Vec<f64> = vals
         .iter()
         .map(|v| match v {
@@ -222,19 +222,19 @@ fn cut_preserves_chained_value_to_text_conversion() -> Result<(), MdfError> {
     {
         let mut writer = MdfWriter::new(input.to_str().unwrap())?;
         writer.init_mdf_file()?;
-        let cg_id = writer.add_channel_group(None, |_| {})?;
-        let time_id = writer.add_channel(&cg_id, None, |ch| {
+        let cg_id = writer.add_channel_group_with(None, |_| {})?;
+        let time_id = writer.add_channel_with(&cg_id, None, |ch| {
             ch.data_type = DataType::FloatLE;
             ch.bit_count = 64;
             ch.name = Some("Time".into());
         })?;
         writer.set_time_channel(&time_id)?;
-        let val_id = writer.add_channel(&cg_id, Some(&time_id), |ch| {
+        let val_id = writer.add_channel_with(&cg_id, Some(&time_id), |ch| {
             ch.data_type = DataType::UnsignedIntegerLE;
             ch.bit_count = 32;
             ch.name = Some("State".into());
         })?;
-        writer.add_value_to_text_conversion(
+        writer.write_value_to_text_conversion(
             &[(0, "OFF"), (1, "ON"), (2, "FAULT")],
             "UNKNOWN",
             Some(&val_id),
@@ -261,9 +261,9 @@ fn cut_preserves_chained_value_to_text_conversion() -> Result<(), MdfError> {
         1.0,
     )?;
 
-    let mdf = MDF::from_file(output.to_str().unwrap())?;
+    let mdf = Mdf::from_file(output.to_str().unwrap())?;
     let chs = mdf.channel_groups()[0].channels();
-    let vals = chs[1].values()?;
+    let vals = chs[1].decoded_values()?;
     let texts: Vec<String> = vals
         .iter()
         .map(|v| match v {

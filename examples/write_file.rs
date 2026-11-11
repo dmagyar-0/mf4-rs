@@ -1,86 +1,59 @@
-use mf4_rs::api::mdf::MDF;
-use mf4_rs::blocks::common::DataType;
-use mf4_rs::error::MdfError;
-use mf4_rs::parsing::decoder::DecodedValue;
-use mf4_rs::writer::MdfWriter;
+//! Write an MDF 4 file with the name-based writer API.
+//!
+//! Creates `example.mf4`, which `read_file` and the Python / TypeScript
+//! examples can read. The same calls exist in Python (`MdfWriter`) and
+//! TypeScript (`MdfWriter`) — see docs/API.md.
+
+use mf4_rs::{ColumnData, DecodedValue, Mdf, MdfError, MdfWriter};
 
 fn main() -> Result<(), MdfError> {
-    // Create writer and base structure
     let mut writer = MdfWriter::new("example.mf4")?;
-    let (_id, _hd) = writer.init_mdf_file()?;
-    // -------- Channel Group 1 with 2 channels --------
-    let cg1_id = writer.add_channel_group(None, |_| {})?;
-    let cn1_id = writer.add_channel(&cg1_id, None, |ch| {
-        ch.data_type = DataType::UnsignedIntegerLE;
-        ch.name = Some("Speed".into());
-    })?;
+    writer.init_mdf_file()?;
 
-    writer.add_channel(&cg1_id, Some(&cn1_id), |ch| {
-        ch.data_type = DataType::UnsignedIntegerLE;
-        ch.name = Some("RPM".into());
-    })?;
+    // One channel group with a time (master) channel and three data channels.
+    let group = writer.add_channel_group(Some("Engine"))?;
+    writer.set_channel_group_comment(&group, "Demo measurement")?;
+    writer.add_time_channel(&group, "Time")?; // add the master first
+    let temperature = writer.add_float_channel(&group, "Temperature")?;
+    let gear = writer.add_int_channel(&group, "Gear")?;
+    writer.add_string_channel(&group, "State")?;
 
-    // -------- Channel Group 2 with 3 channels --------
-    // A new data group is created automatically
-    let cg2_id = writer.add_channel_group(None, |_| {})?;
+    // Conversions turn raw values into physical ones when reading.
+    writer.add_linear_conversion(&temperature, -40.0, 0.5)?; // raw -> °C
+    writer.add_value_to_text_conversion(&gear, &[(0, "N"), (1, "D"), (2, "R")], "?")?;
 
-    let cn3_id = writer.add_channel(&cg2_id, None, |ch| {
-        ch.data_type = DataType::SignedIntegerLE;
-        ch.name = Some("Temperature".into());
-    })?;
-    let cn4_id = writer.add_channel(&cg2_id, Some(&cn3_id), |ch| {
-        ch.data_type = DataType::FloatLE;
-        ch.name = Some("Pressure".into());
-    })?;
-
-    let cn5_id = writer.add_channel(&cg2_id, Some(&cn4_id), |ch| {
-        ch.data_type = DataType::UnsignedIntegerLE;
-        ch.name = Some("Status".into());
-    })?;
-    let status_map = [(0i64, "OK"), (1i64, "WARN")];
-    writer.add_value_to_text_conversion(&status_map, "UNKNOWN", Some(&cn5_id))?;
-
-    // -------- Write sample data for both groups --------
-    writer.start_data_block_for_cg(&cg1_id, 0)?;
-    for i in 0u32..100 {
+    writer.start_data_block(&group)?;
+    for i in 0..100u64 {
         writer.write_record(
-            &cg1_id,
+            &group,
             &[
-                DecodedValue::UnsignedInteger(i.into()),
-                DecodedValue::UnsignedInteger((i * 2).into()),
-            ],
-        )?;
-    }
-    writer.finish_data_block(&cg1_id)?;
-
-    writer.start_data_block_for_cg(&cg2_id, 0)?;
-    for i in 0u32..100 {
-        writer.write_record(
-            &cg2_id,
-            &[
-                DecodedValue::SignedInteger(i as i64 - 50),
                 DecodedValue::Float(i as f64 * 0.1),
-                DecodedValue::UnsignedInteger((i % 2).into()),
+                DecodedValue::Float(120.0 + i as f64),
+                DecodedValue::UnsignedInteger(i % 3),
+                DecodedValue::String(if i % 2 == 0 { "idle" } else { "running" }.to_string()),
             ],
         )?;
     }
-    writer.finish_data_block(&cg2_id)?;
+    writer.finish_data_block(&group)?;
+
+    // A second, purely numeric group written column by column (the fast path).
+    let group = writer.add_channel_group(Some("Vehicle"))?;
+    writer.add_time_channel(&group, "Time")?;
+    writer.add_float_channel(&group, "Speed")?;
+    let time: Vec<f64> = (0..1000).map(|i| i as f64 * 0.01).collect();
+    let speed: Vec<f64> = time.iter().map(|t| 50.0 + 10.0 * t.sin()).collect();
+    writer.start_data_block(&group)?;
+    writer.write_columns(&group, &[ColumnData::F64(&time), ColumnData::F64(&speed)])?;
+    writer.finish_data_block(&group)?;
 
     writer.finalize()?;
 
-    // -------- Verify using the crate parser --------
-    let mdf = MDF::from_file("example.mf4")?;
-    println!("Channel groups: {}", mdf.channel_groups().len());
-    for (idx, group) in mdf.channel_groups().iter().enumerate() {
-        let chans = group.channels();
-        print!("  Group {} has {} channels", idx + 1, chans.len());
-        if let Some(ch) = chans.first() {
-            let values = ch.values()?;
-            println!(" and {} records", values.len());
-        } else {
-            println!();
-        }
+    // Read it back.
+    let mdf = Mdf::from_file("example.mf4")?;
+    for group in mdf.groups()? {
+        println!("{:?}: {} records, channels {:?}", group.name, group.record_count, group.channel_names);
     }
-
+    println!("first temperatures: {:?}", &mdf.values("Temperature", None)?[..3]);
+    println!("Created example.mf4");
     Ok(())
 }

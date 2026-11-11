@@ -1,4 +1,4 @@
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::block_layout::FileLayout;
 use mf4_rs::blocks::common::DataType;
 use mf4_rs::error::MdfError;
@@ -8,15 +8,15 @@ use mf4_rs::writer::MdfWriter;
 fn build_sample(path: &str) -> Result<(), MdfError> {
     let mut writer = MdfWriter::new(path)?;
     writer.init_mdf_file()?;
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let time_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let time_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Time".to_string());
         ch.unit_addr = 0;
     })?;
     writer.set_time_channel(&time_id)?;
-    writer.add_channel(&cg_id, Some(&time_id), |ch| {
+    writer.add_channel_with(&cg_id, Some(&time_id), |ch| {
         ch.data_type = DataType::FloatLE;
         ch.bit_count = 64;
         ch.name = Some("Value".to_string());
@@ -45,7 +45,7 @@ fn layout_covers_core_blocks() -> Result<(), MdfError> {
     }
     build_sample(path.to_str().unwrap())?;
 
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let layout = mdf.file_layout()?;
 
     assert!(layout.file_size > 0);
@@ -146,7 +146,7 @@ fn layout_from_file_matches_mdf() -> Result<(), MdfError> {
     }
     build_sample(path.to_str().unwrap())?;
 
-    let via_mdf = MDF::from_file(path.to_str().unwrap())?.file_layout()?;
+    let via_mdf = Mdf::from_file(path.to_str().unwrap())?.file_layout()?;
     let direct = FileLayout::from_file(path.to_str().unwrap())?;
     assert_eq!(via_mdf.file_size, direct.file_size);
     assert_eq!(via_mdf.blocks.len(), direct.blocks.len());

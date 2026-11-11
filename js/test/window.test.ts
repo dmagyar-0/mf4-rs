@@ -34,7 +34,7 @@ test("MdfIndex keeps its source: values/read need no source argument", async () 
   assert.deepEqual(Array.from(await fromBytes.values("Value")), values);
   assert.deepEqual(Array.from((await fromBytes.read("Value", { group: "Group1" })).timestamps), times);
   // The original (source, group) signature still works.
-  assert.deepEqual(Array.from(await fromBytes.values("Value", new BytesRangeSource(bytes), "Group1")), values);
+  assert.deepEqual(Array.from(await fromBytes.values("Value", { source: new BytesRangeSource(bytes), group: "Group1" })), values);
 
   const json = fromBytes.toJson();
   fromBytes.dispose();
@@ -181,7 +181,7 @@ test("Mdf time window on a group without master throws instead of using values a
   mdf.dispose();
 });
 
-test("MdfIndex accepts a group name as the second argument", async () => {
+test("MdfIndex selects a group through options", async () => {
   const w = new MdfWriter();
   w.initMdfFile();
   for (const [name, base] of [["A", 0], ["B", 100]] as const) {
@@ -195,8 +195,6 @@ test("MdfIndex accepts a group name as the second argument", async () => {
   }
   const idx = MdfIndex.fromBytes(w.finalize());
   w.dispose();
-  const asAny = idx as unknown as { values(n: string, g: string): Promise<Float64Array> };
-  assert.deepEqual(Array.from(await asAny.values("V", "B")), [100, 101, 102]);
   assert.deepEqual(Array.from(await idx.values("V", { group: "B" })), [100, 101, 102]);
   idx.dispose();
 });

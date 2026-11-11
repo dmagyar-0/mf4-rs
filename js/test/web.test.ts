@@ -34,6 +34,12 @@ test(
     const web = await dynamicImport(pathToFileURL(distWeb).href);
     const { init, Mdf, MdfIndex, BytesRangeSource, FetchRangeSource, toColumnOriented } = web;
 
+    // The web entry exports exactly what the API contract lists.
+    const contract = JSON.parse(
+      readFileSync(path.join(__dirname, "../../../docs/api-contract.json"), "utf8"),
+    );
+    assert.deepEqual(Object.keys(web).sort(), [...contract.module_exports.typescript_web].sort());
+
     // Feed the wasm bytes directly — Node's fetch cannot load a file:// URL.
     await init({ module_or_path: readFileSync(wasmPath) });
 
@@ -53,7 +59,7 @@ test(
 
     // Index built from bytes, read lazily via an in-memory RangeSource.
     const idx = MdfIndex.fromBytes(bytes);
-    const local = await idx.values("Value", new BytesRangeSource(bytes));
+    const local = await idx.values("Value", { source: new BytesRangeSource(bytes) });
     assert.deepEqual(Array.from(local), values);
     idx.dispose();
 

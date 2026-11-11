@@ -1,10 +1,10 @@
 //! A decoded signal: a channel's samples paired with their master (time) axis.
 //!
 //! [`Signal`] is the Rust equivalent of a pandas `Series` — `values` indexed by
-//! `timestamps`. It is produced by the high-level readers ([`MDF::signal`],
-//! [`crate::index::MdfReader::signal`], [`crate::index::MdfIndex::read`]).
-//!
-//! [`MDF::signal`]: crate::api::mdf::MDF::signal
+//! `timestamps`. It is what `read` returns on every reader
+//! ([`Mdf::read`](crate::api::mdf::Mdf::read),
+//! [`MdfIndex::read`](crate::index::MdfIndex::read),
+//! [`MdfReader::read`](crate::index::MdfReader::read)).
 
 use crate::parsing::decoder::DecodedValue;
 

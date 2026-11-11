@@ -38,13 +38,13 @@ fn build_fixture(path: &Path) -> Result<(), MdfError> {
     for g in 0..GROUPS {
         // Each add_channel_group creates a new ##DG, so prev_cg_id stays None
         // (it would chain CGs *within* a DG, which is not what we want).
-        let cg_id = writer.add_channel_group(None, |_| {})?;
+        let cg_id = writer.add_channel_group_with(None, |_| {})?;
         writer.set_channel_group_name(&cg_id, &format!("Group {g}"))?;
         writer.set_channel_group_comment(&cg_id, &format!("Comment for group {g}"))?;
 
         let group_name = format!("Group {g}");
         let time_name = format!("t_{g}");
-        let time_id = writer.add_channel(&cg_id, None, |ch| {
+        let time_id = writer.add_channel_with(&cg_id, None, |ch| {
             ch.data_type = DataType::FloatLE;
             ch.name = Some(time_name.clone());
             ch.bit_count = 64;
@@ -55,7 +55,7 @@ fn build_fixture(path: &Path) -> Result<(), MdfError> {
         for j in 1..CHANNELS_PER_GROUP {
             let prev = cn_ids.last().unwrap().clone();
             let chan_name = format!("ch_{g}_{j}");
-            let cn_id = writer.add_channel(&cg_id, Some(&prev), |ch| {
+            let cn_id = writer.add_channel_with(&cg_id, Some(&prev), |ch| {
                 if j % 2 == 0 {
                     ch.data_type = DataType::FloatLE;
                     ch.bit_count = 64;
@@ -71,7 +71,7 @@ fn build_fixture(path: &Path) -> Result<(), MdfError> {
         // One value-to-text conversion on group 0, channel 9.
         if g == 0 {
             let target = cn_ids[CHANNELS_PER_GROUP - 1].clone();
-            writer.add_value_to_text_conversion(&[(0, "OK"), (1, "WARN")], "UNK", Some(&target))?;
+            writer.write_value_to_text_conversion(&[(0, "OK"), (1, "WARN")], "UNK", Some(&target))?;
         }
 
         cg_ids.push(cg_id);
@@ -275,7 +275,7 @@ fn cloud_index_round_trips_within_budget() -> Result<(), MdfError> {
     ];
 
     for (gn, cn) in targets {
-        let vals = data.values_in(gn, cn)?;
+        let vals = data.read(cn, &mf4_rs::ReadOptions::new().group(*gn)).map(|s| s.values)?;
         assert_eq!(vals.len(), RECORDS, "{gn}/{cn} record count");
 
         if *gn == "Group 0" && *cn == "ch_0_9" {
@@ -341,11 +341,11 @@ fn cloud_index_handles_scattered_metadata() -> Result<(), MdfError> {
 
         for g in 0..SCATTER_GROUPS {
             // Each add_channel_group creates a new ##DG, so prev_cg_id stays None.
-            let cg_id = writer.add_channel_group(None, |_| {})?;
+            let cg_id = writer.add_channel_group_with(None, |_| {})?;
             writer.set_channel_group_name(&cg_id, &format!("Group {g}"))?;
             writer.set_channel_group_comment(&cg_id, &format!("Comment for group {g}"))?;
 
-            let time_id = writer.add_channel(&cg_id, None, |ch| {
+            let time_id = writer.add_channel_with(&cg_id, None, |ch| {
                 ch.data_type = DataType::FloatLE;
                 ch.name = Some(format!("t_{g}"));
                 ch.bit_count = 64;
@@ -354,7 +354,7 @@ fn cloud_index_handles_scattered_metadata() -> Result<(), MdfError> {
 
             let mut prev_cn = time_id;
             for j in 1..SCATTER_CHANNELS_PER_GROUP {
-                let cn = writer.add_channel(&cg_id, Some(&prev_cn), |ch| {
+                let cn = writer.add_channel_with(&cg_id, Some(&prev_cn), |ch| {
                     ch.data_type = DataType::FloatLE;
                     ch.bit_count = 64;
                     ch.name = Some(format!("ch_{g}_{j}"));
@@ -439,7 +439,7 @@ fn cloud_index_handles_scattered_metadata() -> Result<(), MdfError> {
         ("Group 4", "ch_4_3"),
     ];
     for (gn, cn) in targets {
-        let vals = data.values_in(gn, cn)?;
+        let vals = data.read(cn, &mf4_rs::ReadOptions::new().group(*gn)).map(|s| s.values)?;
         assert_eq!(vals.len(), SCATTER_RECORDS, "{gn}/{cn}");
         // Spot-check decoded value matches what was written.
         let group_idx: usize = gn

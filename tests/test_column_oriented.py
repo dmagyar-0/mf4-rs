@@ -85,7 +85,7 @@ def check_asammdf_roundtrip(src: str, col: str) -> None:
 def check_mf4rs_reads(src: str, col: str) -> None:
     a = MDF(src)
     readers = {
-        "Mdf": mf4_rs.Mdf(col),
+        "Mdf": mf4_rs.Mdf.from_file(col),
         "MdfIndex": mf4_rs.MdfIndex.from_file(col),
     }
     for label, r in readers.items():
@@ -98,7 +98,7 @@ def check_mf4rs_reads(src: str, col: str) -> None:
                 np.testing.assert_allclose(series.values.astype(float), ref.samples.astype(float),
                                            err_msg=f"{label} {name}")
                 np.testing.assert_allclose(r.values(name), ref.samples.astype(float))
-            assert len(series.index) == len(ref.timestamps), f"{label} {name} index"
+            assert len(series.timestamps) == len(ref.timestamps), f"{label} {name} index"
 
 
 def test_report_and_layout(tmp: str) -> None:
@@ -112,7 +112,7 @@ def test_report_and_layout(tmp: str) -> None:
     assert rep.file_size == os.path.getsize(col)
     assert rep.metadata_size < 16 * 1024, rep
     # Every non-data block sits before metadata_size.
-    layout = mf4_rs.file_layout_from_file(col)
+    layout = mf4_rs.FileLayout.from_file(col)
     for b in layout.blocks:
         is_data = b.block_type in ("##DV", "##DT", "##SD")
         assert (b.offset >= rep.metadata_size) == is_data, (b.block_type, b.offset)

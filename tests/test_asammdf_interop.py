@@ -101,9 +101,9 @@ def write_mf4rs_basic():
     w.start_data_block(cg)
     for i in range(100):
         w.write_record(cg, [
-            mf4_rs.create_float_value(i * 0.01),
-            mf4_rs.create_float_value(20.0 + i * 0.5),
-            mf4_rs.create_uint_value(i),
+            i * 0.01,
+            20.0 + i * 0.5,
+            i,
         ])
     w.finish_data_block(cg)
     w.finalize()
@@ -156,7 +156,7 @@ def test_mf4rs_reads_asammdf_basic():
     """mf4-rs can read a basic asammdf file and get correct values."""
     path = write_asammdf_basic()
     try:
-        mdf = mf4_rs.Mdf(path)
+        mdf = mf4_rs.Mdf.from_file(path)
         groups = mdf.groups
         assert len(groups) >= 1, f"expected >=1 groups, got {len(groups)}"
 
@@ -174,7 +174,7 @@ def test_cross_read_values_match():
     path = write_mf4rs_basic()
     try:
         # Read with mf4-rs (returns numpy arrays)
-        rs_mdf = mf4_rs.Mdf(path)
+        rs_mdf = mf4_rs.Mdf.from_file(path)
         rs_temp = rs_mdf.values("Temperature")
         rs_count = rs_mdf.values("Counter")
 
@@ -218,7 +218,7 @@ def test_all_integer_types_roundtrip():
             mdf.save(path, overwrite=True)
             mdf.close()
 
-            rs_mdf = mf4_rs.Mdf(path)
+            rs_mdf = mf4_rs.Mdf.from_file(path)
             rs_vals = rs_mdf.values(name)
             assert len(rs_vals) == len(values), f"{name}: expected {len(values)}, got {len(rs_vals)}"
             for orig, read in zip(values, rs_vals):
@@ -250,7 +250,7 @@ def test_float_types_roundtrip():
             mdf.save(path, overwrite=True)
             mdf.close()
 
-            rs_mdf = mf4_rs.Mdf(path)
+            rs_mdf = mf4_rs.Mdf.from_file(path)
             rs_vals = rs_mdf.values(name)
             assert len(rs_vals) == len(values), f"{name}: expected {len(values)}, got {len(rs_vals)}"
             for orig, read in zip(values, rs_vals):
@@ -273,8 +273,8 @@ def test_multi_group_cross_read():
         w.start_data_block(cg1)
         for i in range(10):
             w.write_record(cg1, [
-                mf4_rs.create_float_value(i * 0.1),
-                mf4_rs.create_float_value(20.0 + i),
+                i * 0.1,
+                20.0 + i,
             ])
         w.finish_data_block(cg1)
 
@@ -284,8 +284,8 @@ def test_multi_group_cross_read():
         w.start_data_block(cg2)
         for i in range(5):
             w.write_record(cg2, [
-                mf4_rs.create_float_value(i * 0.2),
-                mf4_rs.create_float_value(1013.0 + i),
+                i * 0.2,
+                1013.0 + i,
             ])
         w.finish_data_block(cg2)
         w.finalize()
@@ -348,7 +348,7 @@ def test_compressed_file_fails_gracefully():
         mdf.close()
 
         try:
-            rs_mdf = mf4_rs.Mdf(path)
+            rs_mdf = mf4_rs.Mdf.from_file(path)
             _ = rs_mdf.values("data")
             # If we get here without error, compression support was added
             print("    (NOTE: ##DZ reading now works - update comparison docs)")
@@ -375,10 +375,10 @@ def test_data_block_splitting_cross_read():
         n = 300_000
         for i in range(n):
             w.write_record(cg, [
-                mf4_rs.create_float_value(float(i)),
-                mf4_rs.create_float_value(float(i * 2)),
-                mf4_rs.create_float_value(float(i * 3)),
-                mf4_rs.create_float_value(float(i * 4)),
+                float(i),
+                float(i * 2),
+                float(i * 3),
+                float(i * 4),
             ])
         w.finish_data_block(cg)
         w.finalize()
@@ -404,21 +404,22 @@ def test_data_block_splitting_cross_read():
 
 def test_value_to_text_conversion_cross_read():
     """asammdf correctly applies value-to-text conversions from mf4-rs files."""
-    # This uses the Rust example file which has value-to-text conversions
     path = tmp("v2t")
     try:
-        # Write file with value-to-text conversion using Rust API via cargo
-        os.system(
-            f'cd /home/user/mf4-rs && cargo run --release --example write_file 2>/dev/null'
-        )
-        example_path = "/home/user/mf4-rs/example.mf4"
-        if not os.path.exists(example_path):
-            print("    (SKIP: example.mf4 not found)")
-            return
+        w = mf4_rs.MdfWriter(path)
+        w.init_mdf_file()
+        cg = w.add_channel_group("Group")
+        w.add_time_channel(cg, "Time")
+        status_id = w.add_int_channel(cg, "Status")
+        w.add_value_to_text_conversion(status_id, [(0, "OK"), (1, "WARN")], "UNKNOWN")
+        w.start_data_block(cg)
+        for i in range(100):
+            w.write_record(cg, [i * 0.1, i % 2])
+        w.finish_data_block(cg)
+        w.finalize()
 
-        mdf = AsamMDF(example_path)
-        # Group 1 has Status channel with value-to-text conversion
-        status = mdf.get("Status", group=1)
+        mdf = AsamMDF(path)
+        status = mdf.get("Status")
         assert status is not None, "Status channel not found"
         # With conversions applied, values should be byte strings
         assert status.samples[0] == b"OK" or status.samples[0] == "OK", \
@@ -428,18 +429,20 @@ def test_value_to_text_conversion_cross_read():
 
         # Check the conversion type - find Status channel by name
         status_ch = None
-        for ch in mdf.groups[1].channels:
+        for ch in mdf.groups[0].channels:
             if ch.name == "Status":
                 status_ch = ch
                 break
-        assert status_ch is not None, "Status channel not found in group 1"
+        assert status_ch is not None, "Status channel not found"
         assert status_ch.conversion is not None, "expected conversion block"
         assert status_ch.conversion.conversion_type == 7, \
             f"expected conversion type 7 (ValueToText), got {status_ch.conversion.conversion_type}"
+
+        # mf4-rs reads its own conversion back the same way.
+        assert list(mf4_rs.Mdf.from_file(path).read("Status").values[:3]) == ["OK", "WARN", "OK"]
         mdf.close()
     finally:
         cleanup(path)
-        cleanup("/home/user/mf4-rs/example.mf4")
 
 
 def test_units_and_comments_readable():
@@ -458,7 +461,7 @@ def test_units_and_comments_readable():
         mdf.save(path, overwrite=True)
         mdf.close()
 
-        rs_mdf = mf4_rs.Mdf(path)
+        rs_mdf = mf4_rs.Mdf.from_file(path)
         channels = [ch for g in rs_mdf.groups for ch in g.channels]
         temp_ch = [ch for ch in channels if ch.name == "Temperature"]
         assert len(temp_ch) >= 1, "Temperature channel not found"
@@ -488,10 +491,10 @@ def test_performance_write():
         for i in range(n):
             t = i * 0.001
             w.write_record(cg, [
-                mf4_rs.create_float_value(t),
-                mf4_rs.create_float_value(t * 2),
-                mf4_rs.create_float_value(t * 3),
-                mf4_rs.create_float_value(t * 4),
+                t,
+                t * 2,
+                t * 3,
+                t * 4,
             ])
         w.finish_data_block(cg)
         w.finalize()
@@ -548,7 +551,7 @@ def test_cut_asammdf_vlsd_string():
         # mf4-rs reads numeric channels of the cut output correctly. (The
         # Python binding's f64 fast path can't return strings — strings round
         # through native Rust APIs and through asammdf below.)
-        cut_mdf = mf4_rs.Mdf(out)
+        cut_mdf = mf4_rs.Mdf.from_file(out)
         ctrs = cut_mdf.values("Counter")
         assert ctrs is not None, "Counter not found in cut file"
         assert [int(c) for c in ctrs] == [20, 30, 40, 50, 60], list(ctrs)
@@ -576,7 +579,7 @@ def test_performance_read():
     try:
         start = time.time()
         for _ in range(10):
-            mdf = mf4_rs.Mdf(path)
+            mdf = mf4_rs.Mdf.from_file(path)
             for name in ["Time", "Temperature", "Counter"]:
                 mdf.values(name)
         elapsed = time.time() - start

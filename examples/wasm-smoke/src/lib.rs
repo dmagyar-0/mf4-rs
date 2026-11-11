@@ -1,5 +1,5 @@
 use wasm_bindgen::prelude::*;
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -32,7 +32,7 @@ pub struct FileSummary {
 /// ```
 #[wasm_bindgen]
 pub fn open_from_bytes(data: &[u8]) -> Result<JsValue, JsValue> {
-    let mdf = MDF::from_bytes(data.to_vec())
+    let mdf = Mdf::from_bytes(data.to_vec())
         .map_err(|e| JsValue::from_str(&format!("MDF parse error: {e}")))?;
 
     let start_time_ns = mdf.start_time_ns();

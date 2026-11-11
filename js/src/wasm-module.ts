@@ -22,10 +22,13 @@ export interface WasmMdf {
   free(): void;
   channelNames(): string[];
   groups(): unknown;
-  read(name: string, group?: string | null): unknown;
+  group(name: string): unknown;
+  channel(name: string, group?: string | null): unknown;
+  read(name: string, group: string | null | undefined, window: unknown): unknown;
   startTimeNs(): bigint | undefined;
-  values(name: string, group?: string | null): Float64Array;
-  conversionInfo(name: string, group?: string | null): unknown;
+  values(name: string, group: string | null | undefined, window: unknown): Float64Array;
+  timeRange(name: string, group?: string | null): unknown;
+  conversion(name: string, group?: string | null): unknown;
 }
 
 export interface WasmMdfConstructor {
@@ -45,6 +48,8 @@ export interface WasmMdfIndex {
   channelNames(): string[];
   fileSize(): number;
   groups(): unknown;
+  group(name: string): unknown;
+  channel(name: string, group?: string | null): unknown;
   conversionRangesStep(
     name: string,
     group: string | null | undefined,
@@ -73,6 +78,19 @@ export interface WasmMdfIndex {
     ranges: unknown,
     fragments: unknown,
   ): WasmWindowStep;
+  valuesWindowStep(
+    name: string,
+    group: string | null | undefined,
+    window: unknown,
+    ranges: unknown,
+    fragments: unknown,
+  ): { done: boolean; needed?: [number, number][]; values?: Float64Array };
+  timeRangeStep(
+    name: string,
+    group: string | null | undefined,
+    ranges: unknown,
+    fragments: unknown,
+  ): { done: boolean; needed?: [number, number][]; range?: unknown };
   toJson(): string;
   validate(): void;
   valuesFromFragments(
@@ -149,11 +167,13 @@ export interface WasmMdfWriter {
   finishDataBlock(group_id: string): void;
   initMdfFile(): void;
   setStartTime(abs_time_ns: bigint): void;
+  setChannelGroupComment(group_id: string, comment: string): void;
   setTimeChannel(channel_id: string): void;
   addLinearConversion(channel_id: string, offset: number, factor: number): void;
   addValueToTextConversion(channel_id: string, mapping: unknown, default_text: string): void;
   startDataBlock(group_id: string): void;
   writeRecord(group_id: string, values: unknown): void;
+  writeColumns(group_id: string, columns: unknown): void;
 }
 
 export interface WasmMdfWriterConstructor {

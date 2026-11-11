@@ -30,7 +30,7 @@ test("MdfIndex JSON round-trip (toJson -> fromJson) preserves reads", async () =
 
   const reloaded = MdfIndex.fromJson(json);
   const source = new BytesRangeSource(bytes);
-  const read = await reloaded.values("Value", source, "Group1");
+  const read = await reloaded.values("Value", { source: source, group: "Group1" });
   assert.equal(read.length, values.length);
   for (let i = 0; i < values.length; i++) {
     assert.ok(Math.abs(read[i]! - values[i]!) < 1e-9);
@@ -41,19 +41,19 @@ test("MdfIndex JSON round-trip (toJson -> fromJson) preserves reads", async () =
 test("MdfIndex lazy values()/read() over BytesRangeSource match Mdf.values()/read()", async () => {
   const { bytes } = buildSampleFile(75);
   const mdf = Mdf.fromBytes(bytes);
-  const direct = mdf.values("Value", "Group1");
-  const directSignal = mdf.read("Value", "Group1");
+  const direct = mdf.values("Value", { group: "Group1" });
+  const directSignal = mdf.read("Value", { group: "Group1" });
 
   const index = MdfIndex.fromBytes(bytes);
   const source = new BytesRangeSource(bytes);
 
-  const lazyValues = await index.values("Value", source, "Group1");
+  const lazyValues = await index.values("Value", { source: source, group: "Group1" });
   assert.equal(lazyValues.length, direct.length);
   for (let i = 0; i < direct.length; i++) {
     assert.equal(lazyValues[i], direct[i]);
   }
 
-  const lazySignal = await index.read("Value", source, "Group1");
+  const lazySignal = await index.read("Value", { source: source, group: "Group1" });
   assert.equal(lazySignal.name, directSignal.name);
   assert.deepEqual(Array.from(lazySignal.timestamps), Array.from(directSignal.timestamps));
   assert.deepEqual(lazySignal.values, directSignal.values);

@@ -81,11 +81,11 @@ test("toColumnOriented round-trips every signal through Mdf and MdfIndex", () =>
   const col = Mdf.fromBytes(bytes);
   const idx = MdfIndex.fromBytes(bytes);
   for (const [g, c] of SIGNALS) {
-    const expected = src.read(c, g);
-    const actual = col.read(c, g);
+    const expected = src.read(c, { group: g });
+    const actual = col.read(c, { group: g });
     assert.deepEqual(actual.values, expected.values, `${g}/${c}`);
     assert.deepEqual(actual.timestamps, expected.timestamps, `${g}/${c} timestamps`);
-    assert.deepEqual(Array.from(col.values(c, g)), Array.from(src.values(c, g)));
+    assert.deepEqual(Array.from(col.values(c, { group: g })), Array.from(src.values(c, { group: g })));
   }
   // Group metadata reports the shared time channel for signal groups.
   for (const g of idx.groups()) {
@@ -161,10 +161,10 @@ test("a column file indexes in one range request and reads a signal in at most t
   for (const [g, c] of SIGNALS) {
     const before = counter.reads;
     const beforeBytes = counter.bytes;
-    const signal = await index.read(c, counter, g);
+    const signal = await index.read(c, { source: counter, group: g });
     const reads = counter.reads - before;
     const transferred = counter.bytes - beforeBytes;
-    const expected = ref.read(c, g);
+    const expected = ref.read(c, { group: g });
     assert.deepEqual(signal.values, expected.values, `${g}/${c}`);
     assert.deepEqual(signal.timestamps, expected.timestamps, `${g}/${c} timestamps`);
     // Values and shared time channel: one contiguous span each (a single
@@ -177,7 +177,7 @@ test("a column file indexes in one range request and reads a signal in at most t
   // values(): the signal's own span only (no shared time channel).
   const before = counter.reads;
   const beforeBytes = counter.bytes;
-  await index.values("Speed", counter, "Engine");
+  await index.values("Speed", { source: counter, group: "Engine" });
   assert.equal(counter.reads - before, 1);
   assert.ok(counter.bytes - beforeBytes < 8 * FAST + 4096, `${counter.bytes - beforeBytes} bytes`);
   ref.dispose();

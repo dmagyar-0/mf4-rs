@@ -2,7 +2,7 @@
 //! `values_as_f64`, master-axis conversion in `signal()`, and the
 //! all-invalid channel flag.
 
-use mf4_rs::api::mdf::MDF;
+use mf4_rs::api::mdf::Mdf;
 use mf4_rs::blocks::common::{BlockHeader, DataType};
 use mf4_rs::blocks::conversion::{ConversionBlock, ConversionType};
 use mf4_rs::error::MdfError;
@@ -40,14 +40,14 @@ fn linear_cc(a: f64, b: f64) -> ConversionBlock {
 fn write_file(path: &str, all_invalid_flag: bool) -> Result<(), MdfError> {
     let mut w = MdfWriter::new(path)?;
     w.init_mdf_file()?;
-    let cg = w.add_channel_group(None, |_| {})?;
-    let tc = w.add_channel(&cg, None, |c| {
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let tc = w.add_channel_with(&cg, None, |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Time".to_string());
     })?;
     w.set_time_channel(&tc)?;
-    let vc = w.add_channel(&cg, Some(&tc), |c| {
+    let vc = w.add_channel_with(&cg, Some(&tc), |c| {
         c.data_type = DataType::FloatLE;
         c.bit_count = 64;
         c.name = Some("Value".to_string());
@@ -85,9 +85,9 @@ fn values_as_f64_applies_conversions() -> Result<(), MdfError> {
     let path = temp("phys");
     write_file(path.to_str().unwrap(), false)?;
 
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
-    let ch = mdf.channel("Value").expect("channel");
-    let phys = ch.values_as_f64()?;
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
+    let ch = mdf.find_channel("Value", None).unwrap().expect("channel");
+    let phys = ch.values()?;
     assert_eq!(phys.len(), 100);
     for (i, v) in phys.iter().enumerate() {
         let expect = 10.0 + 2.0 * i as f64;
@@ -95,7 +95,7 @@ fn values_as_f64_applies_conversions() -> Result<(), MdfError> {
     }
 
     // values() must agree.
-    let vals = ch.values()?;
+    let vals = ch.decoded_values()?;
     match vals[3] {
         Some(DecodedValue::Float(f)) => assert!((f - 16.0).abs() < 1e-12),
         ref other => panic!("unexpected {:?}", other),
@@ -110,8 +110,8 @@ fn signal_master_axis_is_physical() -> Result<(), MdfError> {
     let path = temp("master");
     write_file(path.to_str().unwrap(), false)?;
 
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
-    let sig = mdf.signal("Value")?.expect("signal");
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
+    let sig = mdf.read("Value", None)?;
     assert_eq!(sig.timestamps.len(), 100);
     // Master stored as ticks with a 0.001 linear conversion: physical seconds.
     assert!((sig.timestamps[50] - 0.050).abs() < 1e-12, "{}", sig.timestamps[50]);
@@ -125,14 +125,14 @@ fn all_invalid_flag_without_invalidation_bytes() -> Result<(), MdfError> {
     let path = temp("allinv");
     write_file(path.to_str().unwrap(), true)?;
 
-    let mdf = MDF::from_file(path.to_str().unwrap())?;
-    let ch = mdf.channel("Value").expect("channel");
+    let mdf = Mdf::from_file(path.to_str().unwrap())?;
+    let ch = mdf.find_channel("Value", None).unwrap().expect("channel");
 
-    let vals = ch.values()?;
+    let vals = ch.decoded_values()?;
     assert_eq!(vals.len(), 100);
     assert!(vals.iter().all(|v| v.is_none()), "cn_flags bit 0 must invalidate all samples");
 
-    let f64s = ch.values_as_f64()?;
+    let f64s = ch.values()?;
     assert!(f64s.iter().all(|v| v.is_nan()));
 
     std::fs::remove_file(&path).ok();

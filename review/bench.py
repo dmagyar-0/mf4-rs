@@ -25,9 +25,8 @@ def w_mf4rs_loop(n=100_000):
     for name in chans: w.add_float_channel(cg, name)
     w.start_data_block(cg)
     cols = list(chans.values())
-    fv = mf4_rs.create_float_value
     for i in range(n):
-        w.write_record(cg, [fv(t[i]), fv(cols[0][i]), fv(cols[1][i]), fv(cols[2][i]), fv(cols[3][i])])
+        w.write_record(cg, [t[i], cols[0][i], cols[1][i], cols[2][i], cols[3][i]])
     w.finish_data_block(cg); w.finalize()
 
 def w_mf4rs_cols():
@@ -36,7 +35,7 @@ def w_mf4rs_cols():
     tc = w.add_time_channel(cg, "Time"); w.set_time_channel(tc)
     for name in chans: w.add_float_channel(cg, name)
     w.start_data_block(cg)
-    w.write_columns_f64(cg, [t] + list(chans.values()))
+    w.write_columns(cg, [t] + list(chans.values()))
     w.finish_data_block(cg); w.finalize()
 
 def w_asammdf():
@@ -65,11 +64,11 @@ print(f"SIZE   mf4-rs: {os.path.getsize(p('w_cols.mf4'))/1e6:.1f} MB   asammdf: 
 # ---- READ (same mf4-rs-written file for both; then asammdf-written file) ----
 for src_label, path in [("mf4-rs-file", p("w_cols.mf4")), ("asammdf-file", p("w_amdf.mf4"))]:
     def r_mf4rs_values():
-        m = mf4_rs.Mdf(path)
+        m = mf4_rs.Mdf.from_file(path)
         return [m.values(f"ch{i}") for i in range(4)]
     def r_mf4rs_read():
-        m = mf4_rs.Mdf(path)
-        return [m.read(f"ch{i}") for i in range(4)]
+        m = mf4_rs.Mdf.from_file(path)
+        return [m.read(f"ch{i}").to_series() for i in range(4)]
     def r_index_values():
         ix = mf4_rs.MdfIndex.from_file(path)
         return [ix.values(f"ch{i}") for i in range(4)]
@@ -92,7 +91,7 @@ print(f"INDEX  build: {d5:.4f}s   load-json: {d6:.4f}s   json size: {os.path.get
 
 # single-channel partial read (the index's design win)
 def one_ch_index():
-    ix2 = mf4_rs.MdfIndex.load(p("ix.json")); ix2.source = p("w_cols.mf4")
+    ix2 = mf4_rs.MdfIndex.load(p("ix.json")); ix2.set_source(p("w_cols.mf4"))
     return ix2.values("ch0")
 def one_ch_asammdf():
     m = MDF(p("w_cols.mf4")); s = m.get("ch0").samples; m.close(); return s

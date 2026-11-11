@@ -122,36 +122,66 @@ impl<'a> ChannelGroup<'a> {
             .find(|c| c.name().ok().flatten().as_deref() == Some(name))
     }
 
-    /// Read a channel by name as a [`Signal`] (values paired with the group's
-    /// master/time axis).
+    /// Read a channel of this group by name as a [`Signal`] (values paired
+    /// with the group's master/time axis).
     ///
-    /// Returns `Ok(None)` if no channel with that name exists in this group.
     /// `timestamps` is empty when the group has no master channel or when the
     /// requested channel *is* the master. A remote master (MDF 4.2
     /// column-oriented files) is followed transparently.
-    pub fn signal(&self, name: &str) -> Result<Option<Signal>, MdfError> {
-        let channels = self.channels();
-        let mut target: Option<usize> = None;
-        for (i, ch) in channels.iter().enumerate() {
+    ///
+    /// Errors with [`MdfError::ChannelNotFound`] if the group has no such channel.
+    pub fn read(&self, name: &str) -> Result<Signal, MdfError> {
+        match self.position(name)? {
+            Some(ci) => self.read_at(ci),
+            None => Err(MdfError::channel_not_found(name, self.name()?.as_deref())),
+        }
+    }
+
+    /// Index of the first channel named `name` in this group.
+    pub(crate) fn position(&self, name: &str) -> Result<Option<usize>, MdfError> {
+        for (i, ch) in self.channels().iter().enumerate() {
             if ch.name()?.as_deref() == Some(name) {
-                target = Some(i);
-                break;
+                return Ok(Some(i));
             }
         }
-        let Some(ci) = target else { return Ok(None) };
+        Ok(None)
+    }
 
-        let values = channels[ci].values()?;
+    /// Read the channel at position `ci` as a [`Signal`].
+    pub(crate) fn read_at(&self, ci: usize) -> Result<Signal, MdfError> {
+        let channels = self.channels();
+        let channel = &channels[ci];
+        let values = channel.decoded_values()?;
         // First master wins (matches MdfIndex's master selection)
         let timestamps = match self.master_channel() {
-            Some(m) if !std::ptr::eq(m.block(), channels[ci].block()) => m.values_as_f64()?,
+            Some(m) if !std::ptr::eq(m.block(), channel.block()) => m.values()?,
             _ => Vec::new(),
         };
-        Ok(Some(Signal {
-            name: name.to_string(),
-            unit: channels[ci].unit()?,
+        Ok(Signal {
+            name: channel.name()?.unwrap_or_default(),
+            unit: channel.unit()?,
             timestamps,
             values,
-        }))
+        })
+    }
+
+    /// This group's metadata as a plain [`GroupInfo`](crate::types::GroupInfo).
+    pub fn info(&self) -> Result<crate::types::GroupInfo, MdfError> {
+        let mut channels = Vec::new();
+        for ch in self.channels() {
+            channels.push(ch.info()?);
+        }
+        Ok(crate::types::GroupInfo {
+            name: self.name()?,
+            comment: self.comment()?,
+            record_count: self.raw_channel_group.block.cycles_nr,
+            channel_names: channels.iter().filter_map(|c| c.name.clone()).collect(),
+            master_channel: match self.master_channel() {
+                Some(m) => m.name()?,
+                None => None,
+            },
+            channels,
+        })
     }
 
     /// Get the raw data group (for internal use)

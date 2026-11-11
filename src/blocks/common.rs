@@ -141,6 +141,69 @@ pub enum DataType {
 }
 
 impl DataType {
+    /// The canonical name of this data type, shared by every language binding
+    /// (`ChannelInfo.data_type`, the writer's `add_channel`): the variant name,
+    /// e.g. `"FloatLE"`, `"UnsignedIntegerLE"`, `"StringUtf8"`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            DataType::UnsignedIntegerLE => "UnsignedIntegerLE",
+            DataType::UnsignedIntegerBE => "UnsignedIntegerBE",
+            DataType::SignedIntegerLE => "SignedIntegerLE",
+            DataType::SignedIntegerBE => "SignedIntegerBE",
+            DataType::FloatLE => "FloatLE",
+            DataType::FloatBE => "FloatBE",
+            DataType::StringLatin1 => "StringLatin1",
+            DataType::StringUtf8 => "StringUtf8",
+            DataType::StringUtf16LE => "StringUtf16LE",
+            DataType::StringUtf16BE => "StringUtf16BE",
+            DataType::ByteArray => "ByteArray",
+            DataType::MimeSample => "MimeSample",
+            DataType::MimeStream => "MimeStream",
+            DataType::CanOpenDate => "CanOpenDate",
+            DataType::CanOpenTime => "CanOpenTime",
+            DataType::ComplexLE => "ComplexLE",
+            DataType::ComplexBE => "ComplexBE",
+            DataType::Unknown(_) => "Unknown",
+        }
+    }
+
+    /// Parse a canonical data-type name (the inverse of [`DataType::name`]).
+    pub fn from_name(name: &str) -> Result<DataType, crate::error::MdfError> {
+        Ok(match name {
+            "UnsignedIntegerLE" => DataType::UnsignedIntegerLE,
+            "UnsignedIntegerBE" => DataType::UnsignedIntegerBE,
+            "SignedIntegerLE" => DataType::SignedIntegerLE,
+            "SignedIntegerBE" => DataType::SignedIntegerBE,
+            "FloatLE" => DataType::FloatLE,
+            "FloatBE" => DataType::FloatBE,
+            "StringLatin1" => DataType::StringLatin1,
+            "StringUtf8" => DataType::StringUtf8,
+            "StringUtf16LE" => DataType::StringUtf16LE,
+            "StringUtf16BE" => DataType::StringUtf16BE,
+            "ByteArray" => DataType::ByteArray,
+            other => {
+                return Err(crate::error::MdfError::InvalidArgument(format!(
+                    "unknown data type '{}'. Expected one of: FloatLE, FloatBE, \
+                     UnsignedIntegerLE, UnsignedIntegerBE, SignedIntegerLE, \
+                     SignedIntegerBE, StringUtf8, StringLatin1, StringUtf16LE, \
+                     StringUtf16BE, ByteArray",
+                    other
+                )));
+            }
+        })
+    }
+
+    /// `true` for the text data types.
+    pub fn is_string(&self) -> bool {
+        matches!(
+            self,
+            DataType::StringLatin1
+                | DataType::StringUtf8
+                | DataType::StringUtf16LE
+                | DataType::StringUtf16BE
+        )
+    }
+
     /// Converts the DataType enum value to its corresponding u8 representation
     /// according to the MDF 4.1 specification.
     /// 

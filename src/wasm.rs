@@ -21,12 +21,13 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsError};
 
-use crate::api::mdf::MDF;
+use crate::api::mdf::Mdf;
 use crate::blocks::common::DataType;
 use crate::error::MdfError;
 use crate::index::{ByteRangeReader, MdfIndex};
 use crate::parsing::decoder::DecodedValue;
 use crate::signal::Signal;
+use crate::types::{ConversionInfo, ReadOptions};
 use crate::writer::MdfWriter;
 
 /// Largest integer exactly representable as a JS `number` (2^53 - 1).
@@ -37,67 +38,6 @@ fn err_to_js(e: MdfError) -> JsError {
 }
 
 /// Symbolic MDF data-type name (matches the Python `DataType.name`).
-fn data_type_name(dt: &DataType) -> &'static str {
-    match dt {
-        DataType::UnsignedIntegerLE => "UnsignedIntegerLE",
-        DataType::UnsignedIntegerBE => "UnsignedIntegerBE",
-        DataType::SignedIntegerLE => "SignedIntegerLE",
-        DataType::SignedIntegerBE => "SignedIntegerBE",
-        DataType::FloatLE => "FloatLE",
-        DataType::FloatBE => "FloatBE",
-        DataType::StringLatin1 => "StringLatin1",
-        DataType::StringUtf8 => "StringUtf8",
-        DataType::StringUtf16LE => "StringUtf16LE",
-        DataType::StringUtf16BE => "StringUtf16BE",
-        DataType::ByteArray => "ByteArray",
-        DataType::MimeSample => "MimeSample",
-        DataType::MimeStream => "MimeStream",
-        DataType::CanOpenDate => "CanOpenDate",
-        DataType::CanOpenTime => "CanOpenTime",
-        DataType::ComplexLE => "ComplexLE",
-        DataType::ComplexBE => "ComplexBE",
-        DataType::Unknown(_) => "Unknown",
-    }
-}
-
-/// Parse a symbolic data-type name (used by the writer's generic `addChannel`).
-fn data_type_from_str(name: &str) -> Result<DataType, JsError> {
-    Ok(match name {
-        "UnsignedIntegerLE" | "u" | "uint" => DataType::UnsignedIntegerLE,
-        "UnsignedIntegerBE" => DataType::UnsignedIntegerBE,
-        "SignedIntegerLE" | "i" | "int" => DataType::SignedIntegerLE,
-        "SignedIntegerBE" => DataType::SignedIntegerBE,
-        "FloatLE" | "f" | "float" => DataType::FloatLE,
-        "FloatBE" => DataType::FloatBE,
-        "StringLatin1" => DataType::StringLatin1,
-        "StringUtf8" | "string" => DataType::StringUtf8,
-        "StringUtf16LE" => DataType::StringUtf16LE,
-        "StringUtf16BE" => DataType::StringUtf16BE,
-        "ByteArray" | "bytes" => DataType::ByteArray,
-        other => {
-            return Err(JsError::new(&format!(
-                "Unknown data type '{}'. Expected one of: FloatLE, FloatBE, \
-                 UnsignedIntegerLE, UnsignedIntegerBE, SignedIntegerLE, \
-                 SignedIntegerBE, StringUtf8, StringLatin1, StringUtf16LE, \
-                 StringUtf16BE, ByteArray",
-                other
-            )));
-        }
-    })
-}
-
-/// `true` for the text data types, which this writer stores as variable-length
-/// (VLSD) channels rather than fixed-length record fields.
-fn is_string_type(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::StringLatin1
-            | DataType::StringUtf8
-            | DataType::StringUtf16LE
-            | DataType::StringUtf16BE
-    )
-}
-
 /// Convert a single decoded value to a JS value, matching the Python
 /// `decoded_value_to_pyobject` mapping (large integers become `BigInt`).
 fn decoded_to_js(dv: &DecodedValue) -> JsValue {
@@ -536,107 +476,66 @@ fn f64_to_u64(v: Option<f64>, what: &str) -> Result<u64, JsError> {
 // Serde info structs (serialized to plain JS objects via serde-wasm-bindgen)
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ChannelInfoJs {
-    name: Option<String>,
-    unit: Option<String>,
-    comment: Option<String>,
-    data_type: String,
-    is_master: bool,
-    bit_count: u32,
+/// Serialize a contract type (`GroupInfo`, `ChannelInfo`, `ConversionInfo`,
+/// …) to a plain JS object (maps become objects, `None` becomes `undefined`).
+fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsError> {
+    value
+        .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+        .map_err(|e| JsError::new(&e.to_string()))
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GroupInfoJs {
-    name: Option<String>,
-    comment: Option<String>,
-    record_count: u64,
-    channels: Vec<ChannelInfoJs>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IndexGroupInfoJs {
-    name: Option<String>,
-    comment: Option<String>,
-    record_count: u64,
-    channel_names: Vec<String>,
-    master_channel: Option<String>,
-    channels: Vec<IndexChannelInfoJs>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IndexChannelInfoJs {
-    name: Option<String>,
-    unit: Option<String>,
-    comment: Option<String>,
-    data_type: String,
-    is_master: bool,
-    bit_count: u32,
-    is_vlsd: bool,
-    has_conversion: bool,
-}
-
-/// A resolved conversion as handed to JS (`conversionInfo`).
-///
-/// `texts` / `refs` are keyed by the index into the block's `cc_ref` list;
-/// how `values` pair with those indices depends on `type` (MDF 4.1 §6.17):
-/// e.g. for `ValueToText` `values[i]` maps to ref `i` and ref
-/// `values.length` is the default.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ConversionInfoJs {
-    #[serde(rename = "type")]
-    cc_type: String,
-    values: Vec<f64>,
-    precision: u8,
-    flags: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    physical_range: Option<[f64; 2]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    formula: Option<String>,
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    texts: std::collections::BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    refs: std::collections::BTreeMap<String, ConversionInfoJs>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    default: Option<Box<ConversionInfoJs>>,
-}
-
-impl From<&crate::blocks::conversion::ConversionBlock> for ConversionInfoJs {
-    fn from(cc: &crate::blocks::conversion::ConversionBlock) -> Self {
-        ConversionInfoJs {
-            cc_type: format!("{:?}", cc.cc_type),
-            values: cc.cc_val.clone(),
-            precision: cc.cc_precision,
-            flags: cc.cc_flags,
-            physical_range: cc.cc_phy_range_min.zip(cc.cc_phy_range_max).map(|(a, b)| [a, b]),
-            formula: cc.formula.clone(),
-            texts: cc.resolved_texts.iter().flatten().map(|(k, v)| (k.to_string(), v.clone())).collect(),
-            refs: cc
-                .resolved_conversions
-                .iter()
-                .flatten()
-                .map(|(k, v)| (k.to_string(), ConversionInfoJs::from(v.as_ref())))
-                .collect(),
-            default: cc.default_conversion.as_deref().map(|d| Box::new(d.into())),
-        }
-    }
-}
-
-/// `conversion` as a plain JS object (maps become objects), or `null`.
+/// `conversion` as a plain JS `ConversionInfo` object, or `null`.
 fn conversion_to_js(
     conversion: Option<&crate::blocks::conversion::ConversionBlock>,
 ) -> Result<JsValue, JsError> {
     match conversion {
         None => Ok(JsValue::NULL),
-        Some(cc) => ConversionInfoJs::from(cc)
-            .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
-            .map_err(|e| JsError::new(&e.to_string())),
+        Some(cc) => to_js(&ConversionInfo::from(cc)),
     }
+}
+
+/// Finish one step of a gap-driven read: `{ done: false, needed }` while the
+/// probing reader recorded misses, otherwise `{ done: true, [key]: value }`
+/// (or the read's error).
+fn gap_step<T>(
+    misses: Vec<(u64, u64)>,
+    result: Result<T, MdfError>,
+    key: &str,
+    to_value: impl FnOnce(T) -> Result<JsValue, JsError>,
+) -> Result<JsValue, JsError> {
+    let out = Object::new();
+    let set = |k: &str, v: &JsValue| -> Result<(), JsError> {
+        Reflect::set(&out, &JsValue::from_str(k), v)
+            .map(|_| ())
+            .map_err(|_| JsError::new("failed to build step result"))
+    };
+    if !misses.is_empty() {
+        set("done", &JsValue::FALSE)?;
+        let needed = serde_wasm_bindgen::to_value(&misses_to_needed(misses))
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        set("needed", &needed)?;
+        return Ok(out.into());
+    }
+    set("done", &JsValue::TRUE)?;
+    set(key, &to_value(result.map_err(err_to_js)?)?)?;
+    Ok(out.into())
+}
+
+/// Build [`ReadOptions`] from a group name and a JS `ReadWindow` object.
+fn read_options(group: Option<String>, window: JsValue) -> Result<ReadOptions, JsError> {
+    let w: WindowJs = if window.is_undefined() || window.is_null() {
+        WindowJs::default()
+    } else {
+        serde_wasm_bindgen::from_value(window).map_err(|e| JsError::new(&e.to_string()))?
+    };
+    let integer = |v: Option<f64>, what: &str| v.map(|v| f64_to_u64(Some(v), what)).transpose();
+    Ok(ReadOptions {
+        group,
+        start_time: w.start_time,
+        end_time: w.end_time,
+        start_record: integer(w.start_record, "startRecord")?,
+        record_count: integer(w.record_count, "recordCount")?,
+    })
 }
 
 /// Record or time window passed to `readWindowStep` (all fields optional).
@@ -668,7 +567,7 @@ struct BuildStepJs {
 }
 
 // ---------------------------------------------------------------------------
-// Mdf (reader)
+// MDF (reader)
 // ---------------------------------------------------------------------------
 
 /// Read-only handle to an MDF 4 file parsed from an in-memory byte buffer.
@@ -677,34 +576,7 @@ struct BuildStepJs {
 /// samples are decoded lazily by `values`/`read`.
 #[wasm_bindgen(js_name = Mdf)]
 pub struct WasmMdf {
-    mdf: Box<MDF>,
-}
-
-impl WasmMdf {
-    fn build_groups(&self) -> Result<Vec<GroupInfoJs>, MdfError> {
-        let mut groups = Vec::new();
-        for g in self.mdf.channel_groups() {
-            let mut channels = Vec::new();
-            for ch in g.channels() {
-                let block = ch.block();
-                channels.push(ChannelInfoJs {
-                    name: ch.name()?,
-                    unit: ch.unit()?,
-                    comment: ch.comment()?,
-                    data_type: data_type_name(&block.data_type).to_string(),
-                    is_master: matches!(block.channel_type, 2 | 3),
-                    bit_count: block.bit_count,
-                });
-            }
-            groups.push(GroupInfoJs {
-                name: g.name()?,
-                comment: g.comment()?,
-                record_count: g.raw_channel_group().block.cycles_nr,
-                channels,
-            });
-        }
-        Ok(groups)
-    }
+    mdf: Box<Mdf>,
 }
 
 #[wasm_bindgen(js_class = Mdf)]
@@ -712,7 +584,7 @@ impl WasmMdf {
     /// Parse an MDF 4 file from an owned byte buffer (e.g. a `Uint8Array`).
     #[wasm_bindgen(constructor)]
     pub fn new(data: &[u8]) -> Result<WasmMdf, JsError> {
-        let mdf = MDF::from_bytes(data.to_vec()).map_err(err_to_js)?;
+        let mdf = Mdf::from_bytes(data.to_vec()).map_err(err_to_js)?;
         Ok(WasmMdf { mdf: Box::new(mdf) })
     }
 
@@ -723,77 +595,51 @@ impl WasmMdf {
         WasmMdf::new(data)
     }
 
-    /// Metadata for every channel group, each carrying its `channels`.
-    ///
-    /// Returns an array of
-    /// `{ name, comment, recordCount, channels: [{ name, unit, comment, dataType, isMaster, bitCount }] }`.
+    /// Metadata of every channel group (`GroupInfo[]`), in file order.
     #[wasm_bindgen(js_name = groups)]
     pub fn groups(&self) -> Result<JsValue, JsError> {
-        let groups = self.build_groups().map_err(err_to_js)?;
-        serde_wasm_bindgen::to_value(&groups).map_err(|e| JsError::new(&e.to_string()))
+        to_js(&self.mdf.groups().map_err(err_to_js)?)
+    }
+
+    /// Metadata of the first group named `name`, or `undefined`.
+    #[wasm_bindgen(js_name = group)]
+    pub fn group(&self, name: &str) -> Result<JsValue, JsError> {
+        to_js(&self.mdf.group(name).map_err(err_to_js)?)
+    }
+
+    /// Metadata of the first channel named `name` (in the group(s) named
+    /// `group`, when given), or `undefined`.
+    #[wasm_bindgen(js_name = channel)]
+    pub fn channel(&self, name: &str, group: Option<String>) -> Result<JsValue, JsError> {
+        to_js(&self.mdf.channel(name, group.as_deref()).map_err(err_to_js)?)
     }
 
     /// Names of every named channel across all groups (duplicates kept).
     #[wasm_bindgen(js_name = channelNames)]
     pub fn channel_names(&self) -> Result<Vec<String>, JsError> {
-        let mut names = Vec::new();
-        for g in self.mdf.channel_groups() {
-            for ch in g.channels() {
-                if let Some(n) = ch.name().map_err(err_to_js)? {
-                    names.push(n);
-                }
-            }
-        }
-        Ok(names)
+        self.mdf.channel_names().map_err(err_to_js)
     }
 
-    /// Read a numeric channel as a plain `Float64Array` (no timestamps).
-    ///
-    /// Conversions are applied; invalid / non-numeric samples become `NaN`.
-    /// Pass `group` to disambiguate a channel name shared by several groups.
+    /// Read a numeric channel as `Float64Array` (conversions applied; invalid
+    /// and non-numeric samples are `NaN`). `window` is a `ReadWindow` object.
     #[wasm_bindgen(js_name = values)]
-    pub fn values(&self, name: &str, group: Option<String>) -> Result<Vec<f64>, JsError> {
-        for g in self.mdf.channel_groups() {
-            if let Some(gn) = group.as_deref() {
-                if g.name().map_err(err_to_js)?.as_deref() != Some(gn) {
-                    continue;
-                }
-            }
-            for ch in g.channels() {
-                if ch.name().map_err(err_to_js)?.as_deref() == Some(name) {
-                    return ch.values_as_f64().map_err(err_to_js);
-                }
-            }
-        }
-        Err(JsError::new(&match group {
-            Some(gn) => format!("Channel '{}' not found in group '{}'", name, gn),
-            None => format!("Channel '{}' not found", name),
-        }))
+    pub fn values(&self, name: &str, group: Option<String>, window: JsValue) -> Result<Vec<f64>, JsError> {
+        let options = read_options(group, window)?;
+        self.mdf.values(name, &options).map_err(err_to_js)
     }
 
-    /// Read a channel as a `{ name, unit, timestamps, values }` object.
-    ///
-    /// `values` carry all conversions; numeric samples are `number`, integers
-    /// beyond `Number.MAX_SAFE_INTEGER` are `BigInt`, strings are `string`,
-    /// byte arrays are `Uint8Array`, and invalid samples are `null`.
+    /// Read a channel as a `Signal` object. `window` is a `ReadWindow` object.
     #[wasm_bindgen(js_name = read)]
-    pub fn read(&self, name: &str, group: Option<String>) -> Result<JsValue, JsError> {
-        let signal = match group.as_deref() {
-            Some(gn) => {
-                if self.mdf.group(gn).is_none() {
-                    return Err(JsError::new(&format!("Channel group '{}' not found", gn)));
-                }
-                self.mdf.signal_in(gn, name).map_err(err_to_js)?
-            }
-            None => self.mdf.signal(name).map_err(err_to_js)?,
-        };
-        let signal = signal.ok_or_else(|| {
-            JsError::new(&match group {
-                Some(gn) => format!("Channel '{}' not found in group '{}'", name, gn),
-                None => format!("Channel '{}' not found", name),
-            })
-        })?;
-        signal_to_js(signal)
+    pub fn read(&self, name: &str, group: Option<String>, window: JsValue) -> Result<JsValue, JsError> {
+        let options = read_options(group, window)?;
+        signal_to_js(self.mdf.read(name, &options).map_err(err_to_js)?)
+    }
+
+    /// `{ start, end }` of the group's master (time) channel, or `undefined`
+    /// for an empty group.
+    #[wasm_bindgen(js_name = timeRange)]
+    pub fn time_range(&self, name: &str, group: Option<String>) -> Result<JsValue, JsError> {
+        to_js(&self.mdf.time_range(name, group.as_deref()).map_err(err_to_js)?)
     }
 
     /// Measurement start time in nanoseconds since the Unix epoch, or
@@ -803,26 +649,13 @@ impl WasmMdf {
         self.mdf.start_time_ns()
     }
 
-    /// The conversion of channel `name` (fully resolved), or `null` when the
-    /// channel has none. See `MdfIndex.conversionInfo` for the shape.
-    #[wasm_bindgen(js_name = conversionInfo)]
-    pub fn conversion_info(&self, name: &str, group: Option<String>) -> Result<JsValue, JsError> {
-        for g in self.mdf.channel_groups() {
-            if let Some(gn) = group.as_deref() {
-                if g.name().map_err(err_to_js)?.as_deref() != Some(gn) {
-                    continue;
-                }
-            }
-            for ch in g.channels() {
-                if ch.name().map_err(err_to_js)?.as_deref() == Some(name) {
-                    return conversion_to_js(ch.conversion().map_err(err_to_js)?.as_ref());
-                }
-            }
+    /// The resolved conversion of channel `name` (`ConversionInfo`), or `null`.
+    #[wasm_bindgen(js_name = conversion)]
+    pub fn conversion(&self, name: &str, group: Option<String>) -> Result<JsValue, JsError> {
+        match self.mdf.conversion(name, group.as_deref()).map_err(err_to_js)? {
+            Some(info) => to_js(&info),
+            None => Ok(JsValue::NULL),
         }
-        Err(JsError::new(&match group {
-            Some(gn) => format!("Channel '{}' not found in group '{}'", name, gn),
-            None => format!("Channel '{}' not found", name),
-        }))
     }
 }
 
@@ -843,18 +676,8 @@ pub struct WasmMdfIndex {
 impl WasmMdfIndex {
     /// Resolve `(group_index, channel_index)` by name (+ optional group).
     fn locate(&self, name: &str, group: Option<&str>) -> Result<(usize, usize), JsError> {
-        let found = match group {
-            Some(gn) => self.index.locate_in(gn, name),
-            None => self.index.locate(name),
-        };
-        found.ok_or_else(|| {
-            JsError::new(&match group {
-                Some(gn) => format!("Channel '{}' not found in group '{}'", name, gn),
-                None => format!("Channel '{}' not found", name),
-            })
-        })
+        self.index.locate_checked(name, group).map_err(err_to_js)
     }
-
 
     /// Byte ranges covering every data block of the group owning `name`.
     ///
@@ -1054,47 +877,23 @@ impl WasmMdfIndex {
         self.index.validate().map_err(err_to_js)
     }
 
-    /// Metadata for every channel group.
-    ///
-    /// Returns an array of `{ name, recordCount, channelNames, masterChannel }`.
+    /// Metadata of every channel group (`GroupInfo[]`), in file order.
     #[wasm_bindgen(js_name = groups)]
     pub fn groups(&self) -> Result<JsValue, JsError> {
-        let groups: Vec<IndexGroupInfoJs> = self
-            .index
-            .groups()
-            .iter()
-            .map(|g| IndexGroupInfoJs {
-                name: g.name.clone(),
-                comment: g.comment.clone(),
-                record_count: g.record_count,
-                channel_names: g.channel_names().into_iter().map(String::from).collect(),
-                // A column-oriented (MDF 4.2) signal group reports the shared
-                // time channel it references.
-                master_channel: g
-                    .master_channel()
-                    .or_else(|| {
-                        g.master_group
-                            .and_then(|mg| self.index.channel_groups.get(mg))
-                            .and_then(|mg| mg.master_channel())
-                    })
-                    .and_then(|c| c.name.clone()),
-                channels: g
-                    .channels
-                    .iter()
-                    .map(|c| IndexChannelInfoJs {
-                        name: c.name.clone(),
-                        unit: c.unit.clone(),
-                        comment: c.comment.clone(),
-                        data_type: data_type_name(&c.data_type).to_string(),
-                        is_master: c.is_master(),
-                        bit_count: c.bit_count,
-                        is_vlsd: c.is_vlsd(),
-                        has_conversion: c.conversion.is_some() || c.conversion_addr != 0,
-                    })
-                    .collect(),
-            })
-            .collect();
-        serde_wasm_bindgen::to_value(&groups).map_err(|e| JsError::new(&e.to_string()))
+        to_js(&self.index.groups().map_err(err_to_js)?)
+    }
+
+    /// Metadata of the first group named `name`, or `undefined`.
+    #[wasm_bindgen(js_name = group)]
+    pub fn group(&self, name: &str) -> Result<JsValue, JsError> {
+        to_js(&self.index.group(name).map_err(err_to_js)?)
+    }
+
+    /// Metadata of the first channel named `name` (in the group(s) named
+    /// `group`, when given), or `undefined`.
+    #[wasm_bindgen(js_name = channel)]
+    pub fn channel(&self, name: &str, group: Option<String>) -> Result<JsValue, JsError> {
+        to_js(&self.index.channel(name, group.as_deref()).map_err(err_to_js)?)
     }
 
     /// Measurement start time in nanoseconds since the Unix epoch, or
@@ -1162,40 +961,12 @@ impl WasmMdfIndex {
         fragments: JsValue,
     ) -> Result<JsValue, JsError> {
         let (g, c) = self.locate(name, group.as_deref())?;
-        let w: WindowJs = if window.is_undefined() || window.is_null() {
-            WindowJs::default()
-        } else {
-            serde_wasm_bindgen::from_value(window).map_err(|e| JsError::new(&e.to_string()))?
-        };
-        let by_time = w.start_time.is_some() || w.end_time.is_some();
-        if by_time && (w.start_record.is_some() || w.record_count.is_some()) {
-            return Err(JsError::new(
-                "pass either startTime/endTime or startRecord/recordCount, not both",
-            ));
-        }
-        for t in [w.start_time, w.end_time].into_iter().flatten() {
-            if t.is_nan() {
-                return Err(JsError::new("startTime/endTime must not be NaN"));
-            }
-        }
-        let total = self.index.channel_groups[g].record_count;
-        let start_record = match w.start_record {
-            Some(v) => f64_to_u64(Some(v), "startRecord")?,
-            None => 0,
-        };
-        let record_count = match w.record_count {
-            Some(v) => f64_to_u64(Some(v), "recordCount")?,
-            None => total.saturating_sub(start_record),
-        };
+        let window = read_options(None, window)?.window().map_err(err_to_js)?;
 
         let parsed = build_fragment_reader(&ranges, &fragments)?;
         let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: true };
         let result = (|| {
-            let (start, count) = if by_time {
-                self.index.record_window_for_time(g, c, w.start_time, w.end_time, &mut reader)?
-            } else {
-                (start_record, record_count)
-            };
+            let (start, count) = self.index.resolve_window(g, c, window, &mut reader)?;
             let signal = crate::index::read_signal_window(&self.index, g, c, start, count, &mut reader)?;
             Ok::<_, MdfError>((start, count, signal))
         })();
@@ -1221,10 +992,53 @@ impl WasmMdfIndex {
         Ok(out.into())
     }
 
+    /// One step of a windowed `values` read: like `readWindowStep`, but reads
+    /// only the channel (not its time axis) once the window is located.
+    /// Finishes with `{ done: true, values: Float64Array }`.
+    #[wasm_bindgen(js_name = valuesWindowStep)]
+    pub fn values_window_step(
+        &self,
+        name: &str,
+        group: Option<String>,
+        window: JsValue,
+        ranges: JsValue,
+        fragments: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let (g, c) = self.locate(name, group.as_deref())?;
+        let window = read_options(None, window)?.window().map_err(err_to_js)?;
+        let parsed = build_fragment_reader(&ranges, &fragments)?;
+        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: true };
+        let result = (|| {
+            let (start, count) = self.index.resolve_window(g, c, window, &mut reader)?;
+            self.index.values_f64_window(g, c, start, count, &mut reader)
+        })();
+        gap_step(reader.misses, result, "values", |values| {
+            Ok(Float64Array::from(values.as_slice()).into())
+        })
+    }
+
+    /// One step of `timeRange`: reads the first and last record of the time
+    /// axis of `name`'s group. Finishes with `{ done: true, range }`, where
+    /// `range` is `{ start, end }` or `undefined` for an empty group.
+    #[wasm_bindgen(js_name = timeRangeStep)]
+    pub fn time_range_step(
+        &self,
+        name: &str,
+        group: Option<String>,
+        ranges: JsValue,
+        fragments: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let (g, c) = self.locate(name, group.as_deref())?;
+        let parsed = build_fragment_reader(&ranges, &fragments)?;
+        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: true };
+        let result = self.index.time_range_at(g, c, &mut reader);
+        gap_step(reader.misses, result, "range", |range| to_js(&range))
+    }
+
     /// Names of every named channel across all groups (duplicates kept).
     #[wasm_bindgen(js_name = channelNames)]
     pub fn channel_names(&self) -> Vec<String> {
-        self.index.channel_names().into_iter().map(String::from).collect()
+        self.index.channel_names().unwrap_or_default()
     }
 
     /// Total size of the source MDF file (bytes) when the index was built.
@@ -1245,10 +1059,7 @@ impl WasmMdfIndex {
     /// `group` to disambiguate.
     #[wasm_bindgen(js_name = byteRanges)]
     pub fn byte_ranges(&self, name: &str, group: Option<String>) -> Result<JsValue, JsError> {
-        let ranges = match group.as_deref() {
-            Some(gn) => self.index.byte_ranges_in(gn, name).map_err(err_to_js)?,
-            None => self.index.byte_ranges(name).map_err(err_to_js)?,
-        };
+        let ranges = self.index.byte_ranges(name, group.as_deref()).map_err(err_to_js)?;
         ranges_to_js(ranges)
     }
 
@@ -1261,18 +1072,10 @@ impl WasmMdfIndex {
         record_count: u64,
         group: Option<String>,
     ) -> Result<JsValue, JsError> {
-        let ranges = match group.as_deref() {
-            Some(gn) => {
-                let (g, c) = self.locate(name, Some(gn))?;
-                self.index
-                    .get_channel_byte_ranges_for_records(g, c, start_record, record_count)
-                    .map_err(err_to_js)?
-            }
-            None => self
-                .index
-                .byte_ranges_for_records(name, start_record, record_count)
-                .map_err(err_to_js)?,
-        };
+        let ranges = self
+            .index
+            .byte_ranges_for_records(name, start_record, record_count, group.as_deref())
+            .map_err(err_to_js)?;
         ranges_to_js(ranges)
     }
 
@@ -1320,10 +1123,8 @@ impl WasmMdfIndex {
     ) -> Result<Vec<f64>, JsError> {
         let reader = build_fragment_reader(&ranges, &fragments)?;
         let mut bound = self.index.open(reader);
-        match group.as_deref() {
-            Some(gn) => bound.values_f64_in(gn, name).map_err(err_to_js),
-            None => bound.values_f64(name).map_err(err_to_js),
-        }
+        let options = ReadOptions { group, ..ReadOptions::default() };
+        bound.values(name, &options).map_err(err_to_js)
     }
 
     /// Decode a channel to a `{ name, unit, timestamps, values }` object from
@@ -1341,11 +1142,8 @@ impl WasmMdfIndex {
     ) -> Result<JsValue, JsError> {
         let reader = build_fragment_reader(&ranges, &fragments)?;
         let mut bound = self.index.open(reader);
-        let signal = match group.as_deref() {
-            Some(gn) => bound.signal_in(gn, name).map_err(err_to_js)?,
-            None => bound.signal(name).map_err(err_to_js)?,
-        };
-        signal_to_js(signal)
+        let options = ReadOptions { group, ..ReadOptions::default() };
+        signal_to_js(bound.read(name, &options).map_err(err_to_js)?)
     }
 }
 
@@ -1463,64 +1261,51 @@ impl Seek for SharedBuf {
 pub struct WasmMdfWriter {
     writer: Option<MdfWriter>,
     sink: Rc<RefCell<Cursor<Vec<u8>>>>,
-    channel_groups: HashMap<String, String>,
-    channels: HashMap<String, String>,
-    last_channels: HashMap<String, String>,
-    channel_types: HashMap<String, Vec<DataType>>,
-    next_id: usize,
+    /// Channel data types per open group, cached for `writeRecord`.
+    record_types: HashMap<String, Vec<DataType>>,
 }
 
 impl WasmMdfWriter {
-    fn rust_channel_id(&self, channel_id: &str) -> Result<String, JsError> {
-        self.channels
-            .get(channel_id)
-            .cloned()
-            .ok_or_else(|| JsError::new("Channel not found"))
-    }
-
     fn writer_mut(&mut self) -> Result<&mut MdfWriter, JsError> {
         self.writer
             .as_mut()
             .ok_or_else(|| JsError::new("Writer has been finalized"))
     }
+}
 
-    fn add_channel_with_bits(
-        &mut self,
-        group_id: &str,
-        name: &str,
-        data_type: DataType,
-        bit_count: u32,
-    ) -> Result<String, JsError> {
-        let cg_id = self
-            .channel_groups
-            .get(group_id)
-            .ok_or_else(|| JsError::new("Channel group not found"))?
-            .clone();
-        let prev_channel_id = self
-            .last_channels
-            .get(group_id)
-            .and_then(|py_id| self.channels.get(py_id))
-            .cloned();
-        let dt = data_type.clone();
-        let ch_id = self
-            .writer_mut()?
-            .add_channel(&cg_id, prev_channel_id.as_deref(), |ch| {
-                ch.data_type = dt.clone();
-                ch.name = Some(name.to_string());
-                ch.bit_count = bit_count;
-            })
-            .map_err(err_to_js)?;
+/// Coerce one JS value to the `DecodedValue` its channel encodes. The rules
+/// live in the Rust core (`simple::record_value`), shared with Python.
+fn record_value(v: &JsValue, dt: &DataType, i: usize) -> Result<DecodedValue, JsError> {
+    use crate::writer::mdf_writer::simple::{record_value, PlainValue};
 
-        let py_id = format!("ch_{}", self.next_id);
-        self.next_id += 1;
-        self.channels.insert(py_id.clone(), ch_id);
-        self.last_channels.insert(group_id.to_string(), py_id.clone());
-        self.channel_types
-            .entry(group_id.to_string())
-            .or_default()
-            .push(data_type);
-        Ok(py_id)
-    }
+    let (text, bytes);
+    let plain = if v.as_bool().is_some() {
+        PlainValue::Bool
+    } else if let Some(s) = v.as_string() {
+        text = s;
+        PlainValue::Text(&text)
+    } else if let Some(array) = v.dyn_ref::<Uint8Array>() {
+        bytes = array.to_vec();
+        PlainValue::Bytes(&bytes)
+    } else if let Some(b) = v.dyn_ref::<js_sys::BigInt>() {
+        match (i64::try_from(b.clone()), u64::try_from(b.clone())) {
+            (Ok(n), _) => PlainValue::Int(n as i128),
+            (_, Ok(n)) => PlainValue::Int(n as i128),
+            // Outside the 64-bit range: too big for any integer channel, but
+            // a float channel takes it like any other number.
+            _ => PlainValue::Float(
+                b.to_string(10)
+                    .ok()
+                    .and_then(|s| String::from(s).parse::<f64>().ok())
+                    .unwrap_or(f64::NAN),
+            ),
+        }
+    } else if let Some(f) = v.as_f64() {
+        PlainValue::Float(f)
+    } else {
+        PlainValue::Other
+    };
+    record_value(plain, dt, i).map_err(err_to_js)
 }
 
 #[wasm_bindgen(js_class = MdfWriter)]
@@ -1531,15 +1316,7 @@ impl WasmMdfWriter {
     pub fn new() -> WasmMdfWriter {
         let sink = Rc::new(RefCell::new(Cursor::new(Vec::new())));
         let writer = MdfWriter::new_from_writer(SharedBuf(Rc::clone(&sink)));
-        WasmMdfWriter {
-            writer: Some(writer),
-            sink,
-            channel_groups: HashMap::new(),
-            channels: HashMap::new(),
-            last_channels: HashMap::new(),
-            channel_types: HashMap::new(),
-            next_id: 0,
-        }
+        WasmMdfWriter { writer: Some(writer), sink, record_types: HashMap::new() }
     }
 
     /// Write the identification (`##ID`) and header (`##HD`) blocks. Call once,
@@ -1550,152 +1327,82 @@ impl WasmMdfWriter {
         Ok(())
     }
 
-    /// Set the measurement start time (header `abs_time`) in nanoseconds since
-    /// the Unix epoch. Optional; call after `initMdfFile`.
+    /// Set the measurement start time (nanoseconds since the Unix epoch, UTC).
     #[wasm_bindgen(js_name = setStartTime)]
     pub fn set_start_time(&mut self, abs_time_ns: u64) -> Result<(), JsError> {
-        self.writer_mut()?
-            .set_start_time(abs_time_ns, 0, 0, 0, 0)
-            .map_err(err_to_js)?;
-        Ok(())
+        self.writer_mut()?.set_start_time(abs_time_ns).map_err(err_to_js)
     }
 
-    /// Append a new channel group. Returns an opaque group ID.
+    /// Add a channel group and return its id.
     #[wasm_bindgen(js_name = addChannelGroup)]
     pub fn add_channel_group(&mut self, name: Option<String>) -> Result<String, JsError> {
-        let cg_id = self.writer_mut()?.add_channel_group(None, |_cg| {}).map_err(err_to_js)?;
-        if let Some(n) = &name {
-            self.writer_mut()?.set_channel_group_name(&cg_id, n).map_err(err_to_js)?;
-        }
-        let py_id = format!("cg_{}", self.next_id);
-        self.next_id += 1;
-        self.channel_groups.insert(py_id.clone(), cg_id);
-        self.channel_types.insert(py_id.clone(), Vec::new());
-        Ok(py_id)
+        self.writer_mut()?.add_channel_group(name.as_deref()).map_err(err_to_js)
     }
 
-    /// Add a generic fixed-length channel using the data type's natural bit
-    /// width.
-    ///
-    /// `dataType` is a symbolic name such as `"FloatLE"`, `"UnsignedIntegerLE"`,
-    /// or `"SignedIntegerLE"` (float defaults to 32 bits — use
-    /// `addFloatChannel` for f64). String channels are **not** fixed-length in
-    /// this writer; use `addStringChannel` for text.
+    /// Set a channel group's comment.
+    #[wasm_bindgen(js_name = setChannelGroupComment)]
+    pub fn set_channel_group_comment(&mut self, group_id: &str, comment: &str) -> Result<(), JsError> {
+        self.writer_mut()?.set_channel_group_comment(group_id, comment).map_err(err_to_js)
+    }
+
+    /// Add a channel of the given canonical data type (e.g. `"FloatLE"`).
     #[wasm_bindgen(js_name = addChannel)]
-    pub fn add_channel(
-        &mut self,
-        group_id: &str,
-        name: &str,
-        data_type: &str,
-    ) -> Result<String, JsError> {
-        let dt = data_type_from_str(data_type)?;
-        if is_string_type(&dt) {
-            return Err(JsError::new(
-                "string data types are variable-length in this writer; use addStringChannel",
-            ));
-        }
-        let bits = dt.default_bits();
-        self.add_channel_with_bits(group_id, name, dt, bits)
+    pub fn add_channel(&mut self, group_id: &str, name: &str, data_type: &str) -> Result<String, JsError> {
+        let data_type = DataType::from_name(data_type).map_err(err_to_js)?;
+        self.writer_mut()?.add_channel(group_id, name, data_type).map_err(err_to_js)
     }
 
-    /// Add a variable-length (VLSD) UTF-8 string channel.
-    ///
-    /// Mirrors the Python `add_string_channel`: the record slot holds a `u64`
-    /// offset into a `##SD` block the writer manages automatically. Pass JS
-    /// `string` values for this channel to `writeRecord`.
+    /// Add a variable-length UTF-8 string channel.
     #[wasm_bindgen(js_name = addStringChannel)]
     pub fn add_string_channel(&mut self, group_id: &str, name: &str) -> Result<String, JsError> {
-        let cg_id = self
-            .channel_groups
-            .get(group_id)
-            .ok_or_else(|| JsError::new("Channel group not found"))?
-            .clone();
-        let prev_channel_id = self
-            .last_channels
-            .get(group_id)
-            .and_then(|py_id| self.channels.get(py_id))
-            .cloned();
-        let name_owned = name.to_string();
-        let ch_id = self
-            .writer_mut()?
-            .add_channel(&cg_id, prev_channel_id.as_deref(), |ch| {
-                ch.data_type = DataType::StringUtf8;
-                ch.name = Some(name_owned.clone());
-                ch.channel_type = 1; // VLSD
-                ch.data = 1; // routed to the SD-block writer; patched on finish
-                ch.bit_count = 64; // record slot holds a u64 offset
-            })
-            .map_err(err_to_js)?;
-
-        let py_id = format!("ch_{}", self.next_id);
-        self.next_id += 1;
-        self.channels.insert(py_id.clone(), ch_id);
-        self.last_channels.insert(group_id.to_string(), py_id.clone());
-        self.channel_types
-            .entry(group_id.to_string())
-            .or_default()
-            .push(DataType::StringUtf8);
-        Ok(py_id)
+        self.writer_mut()?.add_string_channel(group_id, name).map_err(err_to_js)
     }
 
-    /// Add a 64-bit float channel and mark it as the group's master/time
-    /// channel. Usually the first channel added to a group.
+    /// Add a 64-bit float channel marked as the group's master (time) channel.
     #[wasm_bindgen(js_name = addTimeChannel)]
     pub fn add_time_channel(&mut self, group_id: &str, name: &str) -> Result<String, JsError> {
-        let ch_id = self.add_channel_with_bits(group_id, name, DataType::FloatLE, 64)?;
-        self.set_time_channel(&ch_id)?;
-        Ok(ch_id)
+        self.writer_mut()?.add_time_channel(group_id, name).map_err(err_to_js)
     }
 
-    /// Add a 64-bit little-endian float (`f64`) data channel.
+    /// Add a 64-bit float channel.
     #[wasm_bindgen(js_name = addFloatChannel)]
     pub fn add_float_channel(&mut self, group_id: &str, name: &str) -> Result<String, JsError> {
-        self.add_channel_with_bits(group_id, name, DataType::FloatLE, 64)
+        self.writer_mut()?.add_float_channel(group_id, name).map_err(err_to_js)
     }
 
-    /// Add a 32-bit little-endian float (`f32`) data channel.
+    /// Add a 32-bit float channel.
     #[wasm_bindgen(js_name = addFloat32Channel)]
     pub fn add_float32_channel(&mut self, group_id: &str, name: &str) -> Result<String, JsError> {
-        self.add_channel_with_bits(group_id, name, DataType::FloatLE, 32)
+        self.writer_mut()?.add_float32_channel(group_id, name).map_err(err_to_js)
     }
 
-    /// Add a 64-bit little-endian unsigned integer (`u64`) data channel.
+    /// Add a 64-bit unsigned integer channel.
     #[wasm_bindgen(js_name = addIntChannel)]
     pub fn add_int_channel(&mut self, group_id: &str, name: &str) -> Result<String, JsError> {
-        self.add_channel_with_bits(group_id, name, DataType::UnsignedIntegerLE, 64)
+        self.writer_mut()?.add_int_channel(group_id, name).map_err(err_to_js)
     }
 
-    /// Add a 64-bit little-endian signed integer (`i64`) data channel.
+    /// Add a 64-bit signed integer channel.
     #[wasm_bindgen(js_name = addSintChannel)]
     pub fn add_sint_channel(&mut self, group_id: &str, name: &str) -> Result<String, JsError> {
-        self.add_channel_with_bits(group_id, name, DataType::SignedIntegerLE, 64)
+        self.writer_mut()?.add_sint_channel(group_id, name).map_err(err_to_js)
     }
 
-    /// Mark an existing channel as the group's master/time channel.
+    /// Mark an existing channel as its group's master (time) channel.
     #[wasm_bindgen(js_name = setTimeChannel)]
     pub fn set_time_channel(&mut self, channel_id: &str) -> Result<(), JsError> {
-        let ch_id = self
-            .channels
-            .get(channel_id)
-            .ok_or_else(|| JsError::new("Channel not found"))?
-            .clone();
-        self.writer_mut()?.set_time_channel(&ch_id).map_err(err_to_js)?;
-        Ok(())
+        self.writer_mut()?.set_time_channel(channel_id).map_err(err_to_js)
     }
 
-    /// Attach a linear conversion (`phys = offset + factor * raw`) to a channel.
+    /// Attach a linear conversion (`physical = offset + factor * raw`).
     #[wasm_bindgen(js_name = addLinearConversion)]
     pub fn add_linear_conversion(&mut self, channel_id: &str, offset: f64, factor: f64) -> Result<(), JsError> {
-        let ch_id = self.rust_channel_id(channel_id)?;
         self.writer_mut()?
-            .add_linear_conversion(offset, factor, Some(&ch_id))
-            .map_err(err_to_js)?;
-        Ok(())
+            .add_linear_conversion(channel_id, offset, factor)
+            .map_err(err_to_js)
     }
 
-    /// Attach a value-to-text conversion to an integer channel: `mapping` is an
-    /// array of `[value, text]` pairs, `defaultText` the text for any other
-    /// value.
+    /// Attach a value-to-text conversion; `mapping` is `[value, text][]`.
     #[wasm_bindgen(js_name = addValueToTextConversion)]
     pub fn add_value_to_text_conversion(
         &mut self,
@@ -1703,7 +1410,6 @@ impl WasmMdfWriter {
         mapping: JsValue,
         default_text: &str,
     ) -> Result<(), JsError> {
-        let ch_id = self.rust_channel_id(channel_id)?;
         let pairs: Vec<(f64, String)> = serde_wasm_bindgen::from_value(mapping)
             .map_err(|_| JsError::new("mapping must be an array of [value, text] pairs"))?;
         let mut ints = Vec::with_capacity(pairs.len());
@@ -1714,46 +1420,29 @@ impl WasmMdfWriter {
             ints.push((*v as i64, text.as_str()));
         }
         self.writer_mut()?
-            .add_value_to_text_conversion(&ints, default_text, Some(&ch_id))
-            .map_err(err_to_js)?;
-        Ok(())
+            .add_value_to_text_conversion(channel_id, &ints, default_text)
+            .map_err(err_to_js)
     }
 
-    /// Open a fresh `##DT` data block for a channel group. Call once, after all
-    /// channels have been added and before any `writeRecord`.
+    /// Open the data block of a channel group.
     #[wasm_bindgen(js_name = startDataBlock)]
     pub fn start_data_block(&mut self, group_id: &str) -> Result<(), JsError> {
-        let cg_id = self
-            .channel_groups
-            .get(group_id)
-            .ok_or_else(|| JsError::new("Channel group not found"))?
-            .clone();
-        self.writer_mut()?.start_data_block_for_cg(&cg_id, 0).map_err(err_to_js)?;
+        let types = self.writer_mut()?.channel_data_types(group_id).map_err(err_to_js)?;
+        self.writer_mut()?.start_data_block(group_id).map_err(err_to_js)?;
+        self.record_types.insert(group_id.to_string(), types);
         Ok(())
     }
 
-    /// Append a single record: one value per channel, in the order channels were
-    /// added. Each value is a `number` (encoded per the channel's data type), a
-    /// `string` (for string channels), or a `BigInt` — accepted for integer
-    /// channels so values beyond `Number.MAX_SAFE_INTEGER` round-trip (the
-    /// reader emits `BigInt` for those). A `BigInt` must fit the channel's
-    /// signed/unsigned 64-bit range.
+    /// Append one record: one plain value per channel, in channel order.
     #[wasm_bindgen(js_name = writeRecord)]
     pub fn write_record(&mut self, group_id: &str, values: JsValue) -> Result<(), JsError> {
-        let cg_id = self
-            .channel_groups
-            .get(group_id)
-            .ok_or_else(|| JsError::new("Channel group not found"))?
-            .clone();
         let types = self
-            .channel_types
+            .record_types
             .get(group_id)
-            .ok_or_else(|| JsError::new("Channel group not found"))?
-            .clone();
-        let arr: Array = values
+            .ok_or_else(|| JsError::new(&format!("no open data block for group '{group_id}'")))?;
+        let arr = values
             .dyn_ref::<Array>()
-            .ok_or_else(|| JsError::new("record values must be an array"))?
-            .clone();
+            .ok_or_else(|| JsError::new("record values must be an array"))?;
         if arr.length() as usize != types.len() {
             return Err(JsError::new(&format!(
                 "expected {} values for this group, got {}",
@@ -1761,82 +1450,64 @@ impl WasmMdfWriter {
                 arr.length()
             )));
         }
+        let record = types
+            .iter()
+            .enumerate()
+            .map(|(i, dt)| record_value(&arr.get(i as u32), dt, i))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.writer_mut()?.write_record(group_id, &record).map_err(err_to_js)
+    }
 
-        let mut rust_values = Vec::with_capacity(types.len());
-        for (i, dt) in types.iter().enumerate() {
-            let v = arr.get(i as u32);
-            let decoded = if let Some(s) = v.as_string() {
-                DecodedValue::String(s)
-            } else if let Some(b) = v.dyn_ref::<js_sys::BigInt>() {
-                match dt {
-                    DataType::SignedIntegerLE | DataType::SignedIntegerBE => {
-                        let n = i64::try_from(b.clone()).map_err(|_| {
-                            JsError::new(&format!(
-                                "record value at index {} (BigInt) does not fit in a signed 64-bit \
-                                 integer",
-                                i
-                            ))
-                        })?;
-                        DecodedValue::SignedInteger(n)
-                    }
-                    DataType::UnsignedIntegerLE | DataType::UnsignedIntegerBE => {
-                        let n = u64::try_from(b.clone()).map_err(|_| {
-                            JsError::new(&format!(
-                                "record value at index {} (BigInt) does not fit in an unsigned \
-                                 64-bit integer",
-                                i
-                            ))
-                        })?;
-                        DecodedValue::UnsignedInteger(n)
-                    }
-                    _ => {
-                        return Err(JsError::new(&format!(
-                            "record value at index {} is a BigInt but that channel is not an \
-                             integer channel",
-                            i
-                        )));
-                    }
-                }
-            } else if let Some(f) = v.as_f64() {
-                match dt {
-                    DataType::FloatLE | DataType::FloatBE => DecodedValue::Float(f),
-                    DataType::SignedIntegerLE | DataType::SignedIntegerBE => {
-                        DecodedValue::SignedInteger(f as i64)
-                    }
-                    DataType::UnsignedIntegerLE | DataType::UnsignedIntegerBE => {
-                        DecodedValue::UnsignedInteger(f as u64)
-                    }
-                    _ => DecodedValue::Float(f),
-                }
+    /// Append many records at once from one typed array per channel
+    /// (`Float64Array`, `Float32Array`, `BigUint64Array` or `BigInt64Array`,
+    /// matching the channel), all of the same length.
+    #[wasm_bindgen(js_name = writeColumns)]
+    pub fn write_columns(&mut self, group_id: &str, columns: JsValue) -> Result<(), JsError> {
+        enum Owned {
+            F64(Vec<f64>),
+            F32(Vec<f32>),
+            U64(Vec<u64>),
+            I64(Vec<i64>),
+        }
+        let arr = columns
+            .dyn_ref::<Array>()
+            .ok_or_else(|| JsError::new("columns must be an array of typed arrays"))?;
+        let mut owned = Vec::with_capacity(arr.length() as usize);
+        for (i, col) in arr.iter().enumerate() {
+            owned.push(if let Some(a) = col.dyn_ref::<Float64Array>() {
+                Owned::F64(a.to_vec())
+            } else if let Some(a) = col.dyn_ref::<js_sys::Float32Array>() {
+                Owned::F32(a.to_vec())
+            } else if let Some(a) = col.dyn_ref::<js_sys::BigUint64Array>() {
+                Owned::U64(a.to_vec())
+            } else if let Some(a) = col.dyn_ref::<js_sys::BigInt64Array>() {
+                Owned::I64(a.to_vec())
             } else {
                 return Err(JsError::new(&format!(
-                    "record value at index {} must be a number, string or BigInt",
-                    i
+                    "column {i} must be a Float64Array, Float32Array, BigUint64Array or BigInt64Array"
                 )));
-            };
-            rust_values.push(decoded);
+            });
         }
-
-        self.writer_mut()?.write_record(&cg_id, &rust_values).map_err(err_to_js)?;
-        Ok(())
+        let data: Vec<crate::writer::ColumnData<'_>> = owned
+            .iter()
+            .map(|c| match c {
+                Owned::F64(v) => crate::writer::ColumnData::F64(v),
+                Owned::F32(v) => crate::writer::ColumnData::F32(v),
+                Owned::U64(v) => crate::writer::ColumnData::U64(v),
+                Owned::I64(v) => crate::writer::ColumnData::I64(v),
+            })
+            .collect();
+        self.writer_mut()?.write_columns(group_id, &data).map_err(err_to_js)
     }
 
-    /// Close the open `##DT` block for a channel group (writing a `##DL` block
-    /// if the data was split). Call once per group after all records.
+    /// Close a channel group's data block.
     #[wasm_bindgen(js_name = finishDataBlock)]
     pub fn finish_data_block(&mut self, group_id: &str) -> Result<(), JsError> {
-        let cg_id = self
-            .channel_groups
-            .get(group_id)
-            .ok_or_else(|| JsError::new("Channel group not found"))?
-            .clone();
-        self.writer_mut()?.finish_data_block(&cg_id).map_err(err_to_js)?;
-        Ok(())
+        self.record_types.remove(group_id);
+        self.writer_mut()?.finish_data_block(group_id).map_err(err_to_js)
     }
 
-    /// Flush the writer and return the finished MDF file as a `Uint8Array`.
-    ///
-    /// After this the writer is consumed; any further call raises.
+    /// Finish the file and return its bytes. The writer cannot be used afterwards.
     #[wasm_bindgen(js_name = finalize)]
     pub fn finalize(&mut self) -> Result<Vec<u8>, JsError> {
         let writer = self

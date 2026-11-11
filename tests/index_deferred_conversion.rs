@@ -22,20 +22,20 @@ fn build_fixture() -> Result<Vec<u8>, MdfError> {
     let mut writer = MdfWriter::new(&path)?;
     writer.init_mdf_file()?;
 
-    let cg_id = writer.add_channel_group(None, |_| {})?;
-    let time_id = writer.add_channel(&cg_id, None, |ch| {
+    let cg_id = writer.add_channel_group_with(None, |_| {})?;
+    let time_id = writer.add_channel_with(&cg_id, None, |ch| {
         ch.data_type = DataType::FloatLE;
         ch.name = Some("Time".to_string());
         ch.bit_count = 64;
     })?;
     writer.set_time_channel(&time_id)?;
 
-    let state_id = writer.add_channel(&cg_id, Some(&time_id), |ch| {
+    let state_id = writer.add_channel_with(&cg_id, Some(&time_id), |ch| {
         ch.data_type = DataType::UnsignedIntegerLE;
         ch.name = Some("State".to_string());
         ch.bit_count = 32;
     })?;
-    writer.add_value_to_text_conversion(&[(0, "OFF"), (1, "ON")], "UNKNOWN", Some(&state_id))?;
+    writer.write_value_to_text_conversion(&[(0, "OFF"), (1, "ON")], "UNKNOWN", Some(&state_id))?;
 
     writer.start_data_block_for_cg(&cg_id, 0)?;
     for r in 0..6u64 {
@@ -66,7 +66,7 @@ fn range_reader_build_defers_conversion_and_reads_lazily() -> Result<(), MdfErro
 
     // The conversion must NOT be resolved at build time — only its location
     // recorded.
-    let state = index.channel("State").expect("State channel present");
+    let state = index.indexed_channel("State", None).expect("State channel present");
     assert!(
         state.conversion.is_none(),
         "conversion should be resolved lazily, not at build time"
@@ -79,7 +79,7 @@ fn range_reader_build_defers_conversion_and_reads_lazily() -> Result<(), MdfErro
     // Reading applies the (now lazily fetched) conversion: raw 0/1/2 map to
     // OFF / ON / UNKNOWN (the default).
     let mut bound = index.open(SliceRangeReader::new(bytes));
-    let values = bound.values("State")?;
+    let values = bound.decoded_values("State", None)?;
     let strings: Vec<String> = values
         .into_iter()
         .map(|v| match v {
