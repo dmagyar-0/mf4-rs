@@ -1,0 +1,225 @@
+/**
+ * Guards the cross-language API contract (`docs/api-contract.json`).
+ *
+ * The public names of the TypeScript package must be exactly what the
+ * contract lists (camelCased): adding, renaming or removing a class member,
+ * a type field or an export fails this test until the contract — and with it
+ * the Rust and Python bindings, which have the same test — is updated.
+ *
+ * Also checks that `Mdf` and `MdfIndex` answer every contract call
+ * identically for the same file.
+ */
+
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+
+import * as api from "../src/index";
+import {
+  BytesRangeSource,
+  ChannelNotFoundError,
+  Mdf,
+  MdfIndex,
+  MdfWriter,
+  type ReadOptions,
+  type Signal,
+} from "../src/index";
+
+interface ClassSpec {
+  constructors: string[];
+  accessors: string[];
+  methods: string[];
+  only: Record<string, string[]>;
+  extra: Record<string, string[]>;
+}
+
+const contract = JSON.parse(
+  readFileSync(join(__dirname, "..", "..", "..", "docs", "api-contract.json"), "utf8"),
+) as {
+  classes: Record<string, ClassSpec>;
+  types: Record<string, { fields: string[] }>;
+  functions: Record<string, string[]>;
+  module_exports: Record<string, string[]>;
+};
+
+const LANG = "typescript";
+const camel = (name: string): string => name.replace(/_(\w)/g, (_, c: string) => c.toUpperCase());
+const sorted = (names: Iterable<string>): string[] => [...names].sort();
+
+function available(spec: ClassSpec, names: string[]): string[] {
+  return names.filter((n) => !spec.only[n] || spec.only[n]!.includes(LANG)).map(camel);
+}
+
+test("class members match the contract", () => {
+  const classes: Record<string, { prototype: object }> = { Mdf, MdfIndex, MdfWriter };
+  for (const [name, spec] of Object.entries(contract.classes)) {
+    const cls = classes[name]!;
+    const extra = spec.extra[LANG]!.map(camel);
+    const statics = Object.getOwnPropertyNames(cls).filter(
+      (n) => !["length", "name", "prototype"].includes(n),
+    );
+    const members = Object.getOwnPropertyNames(cls.prototype).filter((n) => n !== "constructor");
+    const expectedStatics = available(spec, spec.constructors);
+    const expectedMembers = [...available(spec, spec.accessors), ...available(spec, spec.methods)];
+    for (const e of extra) {
+      (statics.includes(e) ? expectedStatics : expectedMembers).push(e);
+    }
+    assert.deepEqual(sorted(statics), sorted(expectedStatics), `${name}: static members`);
+    assert.deepEqual(sorted(members), sorted(expectedMembers), `${name}: instance members`);
+  }
+});
+
+test("module exports match the contract", () => {
+  assert.deepEqual(sorted(Object.keys(api)), sorted(contract.module_exports[LANG]!));
+  for (const [name, languages] of Object.entries(contract.functions)) {
+    assert.equal(camel(name) in api, languages.includes(LANG), name);
+  }
+});
+
+function buildFile(): Uint8Array {
+  const w = new MdfWriter();
+  w.initMdfFile();
+  w.setStartTime(1_700_000_000_000_000_000n);
+  for (const [group, base] of [["Engine", 0], ["Body", 100]] as const) {
+    const g = w.addChannelGroup(group);
+    w.setChannelGroupComment(g, "a comment");
+    w.addTimeChannel(g, "Time");
+    const speed = w.addFloatChannel(g, "Speed");
+    const gear = w.addIntChannel(g, "Gear");
+    w.addStringChannel(g, "Label");
+    w.addChannel(g, "Raw", "SignedIntegerLE");
+    w.addLinearConversion(speed, 1, 2);
+    w.addValueToTextConversion(gear, [[0, "N"], [1, "D"]], "?");
+    w.startDataBlock(g);
+    for (let i = 0; i < 20; i++) w.writeRecord(g, [i * 0.5, base + i, i % 3, `L${i}`, -i]);
+    w.finishDataBlock(g);
+  }
+  const bytes = w.finalize();
+  w.dispose();
+  return bytes;
+}
+
+const WINDOWS: ReadOptions[] = [
+  {},
+  { group: "Body" },
+  { startTime: 2, endTime: 4.5 },
+  { group: "Body", endTime: 1 },
+  { startTime: 100 },
+  { startRecord: 3, recordCount: 5 },
+  { group: "Body", startRecord: 19, recordCount: 1 },
+];
+
+function plain(signal: Signal): unknown {
+  return { ...signal, timestamps: Array.from(signal.timestamps) };
+}
+
+test("type fields match the contract and every reader gives the same answers", async () => {
+  const bytes = buildFile();
+  const mdf = Mdf.fromBytes(bytes);
+  const dir = mkdtempSync(join(tmpdir(), "mf4-contract-"));
+  const file = join(dir, "contract.mf4");
+  writeFileSync(file, bytes);
+
+  const index = MdfIndex.fromBytes(bytes);
+  const fromJson = MdfIndex.fromJson(index.toJson(), new BytesRangeSource(bytes));
+  fromJson.validate();
+  await index.save(join(dir, "index.json"));
+  const loaded = await MdfIndex.load(join(dir, "index.json"));
+  assert.equal(loaded.source(), undefined);
+  loaded.setSource(new BytesRangeSource(bytes));
+  const lazy = await MdfIndex.fromRangeSource(new BytesRangeSource(bytes));
+  const fromFile = await MdfIndex.fromFile(file);
+  const mdfFromFile = await Mdf.fromFile(file);
+
+  const groups = mdf.groups();
+  const fields = (type: string): string[] => sorted(contract.types[type]!.fields.map(camel));
+  assert.deepEqual(sorted(Object.keys(groups[0]!)), fields("GroupInfo"));
+  assert.deepEqual(sorted(Object.keys(groups[0]!.channels[0]!)), fields("ChannelInfo"));
+  assert.deepEqual(sorted(Object.keys(mdf.read("Speed"))), fields("Signal"));
+  assert.deepEqual(sorted(Object.keys(mdf.timeRange("Speed")!)), fields("TimeRange"));
+  for (const key of Object.keys(mdf.conversion("Gear")!)) {
+    assert.ok(fields("ConversionInfo").includes(key), `ConversionInfo.${key}`);
+  }
+  assert.deepEqual(groups[0]!.channelNames, ["Time", "Speed", "Gear", "Label", "Raw"]);
+  assert.equal(groups[0]!.masterChannel, "Time");
+  assert.equal(groups[0]!.comment, "a comment");
+  assert.equal(mdf.channel("Speed")!.dataType, "FloatLE");
+
+  assert.deepEqual(mdfFromFile.groups(), groups);
+  assert.deepEqual(plain(mdfFromFile.read("Speed", { group: "Body" })), plain(mdf.read("Speed", { group: "Body" })));
+
+  for (const [label, reader] of Object.entries({ index, fromJson, loaded, lazy, fromFile })) {
+    assert.deepEqual(reader.groups(), groups, `${label}: groups`);
+    assert.deepEqual(reader.group("Body"), mdf.group("Body"), `${label}: group`);
+    assert.equal(reader.group("Nope"), undefined);
+    assert.equal(reader.channel("Nope"), undefined);
+    assert.deepEqual(reader.channelNames(), mdf.channelNames());
+    assert.equal(reader.startTimeNs(), 1_700_000_000_000_000_000n);
+    assert.equal(mdf.startTimeNs(), 1_700_000_000_000_000_000n);
+    assert.equal(reader.fileSize(), bytes.length);
+    for (const name of ["Time", "Speed", "Gear", "Label", "Raw"]) {
+      for (const group of [undefined, "Body"]) {
+        assert.deepEqual(reader.channel(name, group), mdf.channel(name, group), `${label}: channel ${name}`);
+        assert.deepEqual(await reader.timeRange(name, group), mdf.timeRange(name, group), `${label}: timeRange`);
+        assert.deepEqual(await reader.conversion(name, group), mdf.conversion(name, group), `${label}: conversion`);
+      }
+      for (const window of WINDOWS) {
+        const what = `${label}: ${name} ${JSON.stringify(window)}`;
+        assert.deepEqual(plain(await reader.read(name, window)), plain(mdf.read(name, window)), what);
+        assert.deepEqual(Array.from(await reader.values(name, window)), Array.from(mdf.values(name, window)), what);
+      }
+    }
+    await assert.rejects(reader.read("Nope"), ChannelNotFoundError);
+    await assert.rejects(reader.values("Nope", { group: "Body" }), ChannelNotFoundError);
+    await assert.rejects(reader.timeRange("Nope"), ChannelNotFoundError);
+    await assert.rejects(reader.conversion("Nope"), ChannelNotFoundError);
+    assert.throws(() => reader.byteRanges("Nope"), ChannelNotFoundError);
+    await assert.rejects(reader.read("Speed", { startTime: 0, startRecord: 0 }));
+    reader.dispose();
+  }
+  assert.throws(() => mdf.read("Nope"), ChannelNotFoundError);
+  assert.throws(() => mdf.values("Nope", { group: "Body" }), ChannelNotFoundError);
+  assert.throws(() => mdf.timeRange("Nope"), ChannelNotFoundError);
+  assert.throws(() => mdf.conversion("Nope"), ChannelNotFoundError);
+  assert.throws(() => mdf.read("Speed", { startTime: 0, startRecord: 0 }));
+
+  const window = mdf.read("Speed", { startTime: 2, endTime: 3 });
+  assert.deepEqual(Array.from(window.timestamps), [2, 2.5, 3]);
+  assert.deepEqual(window.values, [9, 11, 13]);
+  assert.equal(mdf.read("Time").timestamps.length, 0);
+  assert.deepEqual(mdf.timeRange("Speed"), { start: 0, end: 9.5 });
+  assert.equal(mdf.conversion("Gear")!.texts!["2"], "?");
+  assert.equal(mdf.conversion("Time"), null);
+  assert.deepEqual(mdf.read("Gear").values.slice(0, 4), ["N", "D", "?", "N"]);
+  mdf.dispose();
+  mdfFromFile.dispose();
+});
+
+test("writeColumns matches writeRecord", () => {
+  const w = new MdfWriter();
+  w.initMdfFile();
+  const g = w.addChannelGroup();
+  w.addTimeChannel(g, "Time");
+  w.addFloat32Channel(g, "F32");
+  w.addIntChannel(g, "U64");
+  w.addSintChannel(g, "I64");
+  w.startDataBlock(g);
+  w.writeRecord(g, [0, 1.5, 7, -7]);
+  w.writeColumns(g, [
+    new Float64Array([1, 2]),
+    new Float32Array([2.5, 3.5]),
+    new BigUint64Array([8n, 9n]),
+    new BigInt64Array([-8n, -9n]),
+  ]);
+  w.finishDataBlock(g);
+  const mdf = Mdf.fromBytes(w.finalize());
+  w.dispose();
+  assert.deepEqual(Array.from(mdf.values("Time")), [0, 1, 2]);
+  assert.deepEqual(Array.from(mdf.values("F32")), [1.5, 2.5, 3.5]);
+  assert.deepEqual(Array.from(mdf.values("U64")), [7, 8, 9]);
+  assert.deepEqual(Array.from(mdf.values("I64")), [-7, -8, -9]);
+  assert.throws(() => w.writeRecord(g, [0, 0, 0, 0]));
+  mdf.dispose();
+});

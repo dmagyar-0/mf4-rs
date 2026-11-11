@@ -298,11 +298,11 @@ impl ByteRangeReader for SourceReader {
 
     #[allow(unused_variables)]
     fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
-        match self {
+        match *self {
             #[cfg(not(target_arch = "wasm32"))]
-            SourceReader::File(r) => r.read_range(offset, length),
+            SourceReader::File(ref mut r) => r.read_range(offset, length),
             #[cfg(feature = "http")]
-            SourceReader::Url(r) => r.read_range(offset, length),
+            SourceReader::Url(ref mut r) => r.read_range(offset, length),
         }
     }
 }

@@ -54,14 +54,14 @@ function closeServer(server: http.Server): Promise<void> {
 test("FetchRangeSource over a Range-honouring server matches direct read", async () => {
   const { bytes } = buildSampleFile(60);
   const mdf = Mdf.fromBytes(bytes);
-  const direct = mdf.values("Value", "Group1");
+  const direct = mdf.values("Value", { group: "Group1" });
   mdf.dispose();
 
   const { server, url } = await startServer(bytes, true);
   try {
     const index = MdfIndex.fromBytes(bytes);
     const source = new FetchRangeSource(url);
-    const lazy = await index.values("Value", source, "Group1");
+    const lazy = await index.values("Value", { source: source, group: "Group1" });
     assert.equal(lazy.length, direct.length);
     for (let i = 0; i < direct.length; i++) {
       assert.equal(lazy[i], direct[i]);
@@ -76,14 +76,14 @@ test("FetchRangeSource over a Range-honouring server matches direct read", async
 test("FetchRangeSource over a Range-ignoring (200-only) server matches direct read", async () => {
   const { bytes } = buildSampleFile(60);
   const mdf = Mdf.fromBytes(bytes);
-  const direct = mdf.read("Value", "Group1");
+  const direct = mdf.read("Value", { group: "Group1" });
   mdf.dispose();
 
   const { server, url } = await startServer(bytes, false);
   try {
     const index = MdfIndex.fromBytes(bytes);
     const source = new FetchRangeSource(url);
-    const lazy = await index.read("Value", source, "Group1");
+    const lazy = await index.read("Value", { source: source, group: "Group1" });
     assert.equal(lazy.name, direct.name);
     assert.deepEqual(Array.from(lazy.timestamps), Array.from(direct.timestamps));
     assert.deepEqual(lazy.values, direct.values);

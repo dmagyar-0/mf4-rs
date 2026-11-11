@@ -99,14 +99,20 @@ pub struct ConversionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub formula: Option<String>,
     /// Text references, keyed by reference index.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", serialize_with = "string_keys")]
     pub texts: BTreeMap<usize, String>,
     /// Nested conversions, keyed by reference index.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", serialize_with = "string_keys")]
     pub refs: BTreeMap<usize, ConversionInfo>,
     /// Default (fallback) conversion, when it is itself a conversion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<Box<ConversionInfo>>,
+}
+
+/// Serialize reference-index maps with string keys, so the JSON / JS object
+/// form is `{ "0": ..., "1": ... }`.
+fn string_keys<V: Serialize, S: serde::Serializer>(map: &BTreeMap<usize, V>, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(map.iter().map(|(k, v)| (k.to_string(), v)))
 }
 
 impl From<&ConversionBlock> for ConversionInfo {

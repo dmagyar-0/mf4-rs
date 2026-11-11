@@ -41,7 +41,7 @@ test("MdfIndex.fromRangeSource fetches only metadata, not the bulk data", async 
   );
 
   // The index is correct: reading a channel (over the full source) matches.
-  const read = await index.values("Value", new BytesRangeSource(bytes));
+  const read = await index.values("Value", { source: new BytesRangeSource(bytes) });
   assert.deepEqual(Array.from(read), values);
 
   // And it agrees with a full-bytes build.
@@ -55,7 +55,7 @@ test("MdfIndex.fromRangeSource fetches only metadata, not the bulk data", async 
 test("MdfIndex.fromRangeSource handles files smaller than the seed prefix", async () => {
   const { bytes, values } = buildSampleFile(10);
   const index = await MdfIndex.fromRangeSource(new BytesRangeSource(bytes));
-  const read = await index.values("Value", new BytesRangeSource(bytes));
+  const read = await index.values("Value", { source: new BytesRangeSource(bytes) });
   assert.deepEqual(Array.from(read), values);
   index.dispose();
 });

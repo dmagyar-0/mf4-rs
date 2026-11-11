@@ -27,7 +27,7 @@ test("MdfWriter -> Mdf round-trip: values() matches written data", () => {
   const { bytes, values } = buildSampleFile(100);
   const mdf = Mdf.fromBytes(bytes);
 
-  const read = mdf.values("Value", "Group1");
+  const read = mdf.values("Value", { group: "Group1" });
   assert.equal(read.length, values.length);
   for (let i = 0; i < values.length; i++) {
     assert.ok(Math.abs(read[i]! - values[i]!) < 1e-9, `index ${i}: ${read[i]} vs ${values[i]}`);
@@ -39,7 +39,7 @@ test("MdfWriter -> Mdf round-trip: read() pairs values with timestamps", () => {
   const { bytes, times, values, counts } = buildSampleFile(100);
   const mdf = Mdf.fromBytes(bytes);
 
-  const signal = mdf.read("Value", "Group1");
+  const signal = mdf.read("Value", { group: "Group1" });
   assert.equal(signal.name, "Value");
   assert.equal(signal.timestamps.length, times.length);
   assert.equal(signal.values.length, values.length);
@@ -48,7 +48,7 @@ test("MdfWriter -> Mdf round-trip: read() pairs values with timestamps", () => {
     assert.ok(Math.abs((signal.values[i] as number) - values[i]!) < 1e-9);
   }
 
-  const countSignal = mdf.read("Count", "Group1");
+  const countSignal = mdf.read("Count", { group: "Group1" });
   for (let i = 0; i < counts.length; i++) {
     assert.equal(Number(countSignal.values[i]), counts[i]);
   }

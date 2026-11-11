@@ -1,6 +1,6 @@
 /**
  * Hooks for the few Node-only conveniences (`Mdf.fromFile`,
- * `MdfIndex.fromFile`) used by classes shared with the browser entry.
+ * `MdfIndex.fromFile` / `load` / `save`) used by classes shared with the browser entry.
  *
  * This module must never import a `node:` built-in: the shared classes are
  * bundled into `mf4-rs/web`, and bundlers such as webpack 5 fail on any
@@ -27,4 +27,24 @@ export function readFileNodeOnly(path: string, caller: string): Promise<Uint8Arr
     );
   }
   return readFileImpl(path);
+}
+
+type WriteFile = (path: string, data: Uint8Array) => Promise<void>;
+
+let writeFileImpl: WriteFile | undefined;
+
+/** Install the Node file writer (done by the `mf4-rs` Node entry point). */
+export function registerWriteFile(fn: WriteFile): void {
+  writeFileImpl = fn;
+}
+
+/** Write a whole file through the registered Node writer. */
+export function writeFileNodeOnly(path: string, data: Uint8Array, caller: string): Promise<void> {
+  if (!writeFileImpl) {
+    throw new Error(
+      `${caller} is only available from the Node entry point ('mf4-rs'). In the ` +
+        "browser, use toJson() and store the string yourself.",
+    );
+  }
+  return writeFileImpl(path, data);
 }

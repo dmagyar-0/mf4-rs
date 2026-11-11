@@ -51,7 +51,8 @@ export function init(input?: InitInput): Promise<void> {
 
 export { Mdf } from "./mdf";
 export { MdfIndex, type IndexBuildOptions } from "./mdf-index";
-export { MdfWriter, type RecordValue } from "./mdf-writer";
+export { MdfWriter, type RecordValue, type ColumnValues } from "./mdf-writer";
+export { ChannelNotFoundError } from "./errors";
 export {
   toColumnOriented,
   toColumnOrientedStream,
@@ -77,8 +78,6 @@ export type {
   Signal,
   ChannelInfo,
   GroupInfo,
-  IndexGroupInfo,
-  IndexChannelInfo,
   ConversionInfo,
   ReadOptions,
   ReadWindow,

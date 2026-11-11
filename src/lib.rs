@@ -44,7 +44,9 @@ pub mod api {
 pub use api::mdf::Mdf;
 pub use block_layout::FileLayout;
 pub use blocks::common::DataType;
-pub use column::{to_column_oriented, ColumnOptions, ColumnReport};
+#[cfg(not(target_arch = "wasm32"))]
+pub use column::to_column_oriented;
+pub use column::{ColumnOptions, ColumnReport};
 #[cfg(not(target_arch = "wasm32"))]
 pub use cut::{cut_mdf_by_time, cut_mdf_by_utc};
 pub use error::MdfError;

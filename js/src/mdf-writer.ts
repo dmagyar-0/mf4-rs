@@ -2,20 +2,24 @@ import { getWasmModule, type WasmMdfWriter } from "./wasm-module";
 
 /**
  * A single record value: `number` for numeric channels, `string` for string
- * channels, or `bigint` for integer channels whose value exceeds
- * `Number.MAX_SAFE_INTEGER`.
+ * channels, `bigint` for integer channels whose value exceeds
+ * `Number.MAX_SAFE_INTEGER`, or `Uint8Array` for byte-array channels.
  */
-export type RecordValue = number | string | bigint;
+export type RecordValue = number | string | bigint | Uint8Array;
+
+/** One channel's values for `writeColumns`, typed to match the channel. */
+export type ColumnValues = Float64Array | Float32Array | BigUint64Array | BigInt64Array;
 
 /**
  * Streaming writer that produces an MDF 4 file entirely in memory.
  *
- * Mirrors the Python `MdfWriter`: `initMdfFile()`, then define structure
- * (`addChannelGroup`, `addTimeChannel`, `addFloatChannel`, `addIntChannel`,
- * `addChannel`, `setTimeChannel`), then write data (`startDataBlock`,
- * `writeRecord`, `finishDataBlock`), then `finalize()` to get a
- * `Uint8Array`. Group/channel IDs are opaque strings — pass them back to
- * later calls.
+ * The same writer API as Rust and Python (see `docs/API.md`):
+ * `initMdfFile()`, then define structure (`addChannelGroup`,
+ * `addTimeChannel`, `addFloatChannel`, …, conversions), then write data
+ * (`startDataBlock`, `writeRecord` / `writeColumns`, `finishDataBlock`), then
+ * `finalize()` — which here returns the file as a `Uint8Array`, since wasm
+ * has no filesystem. Group/channel IDs are opaque strings — pass them back
+ * to later calls.
  */
 export class MdfWriter {
   private readonly inner: WasmMdfWriter;
@@ -40,11 +44,17 @@ export class MdfWriter {
     return this.inner.addChannelGroup(name);
   }
 
+  /** Set a channel group's comment. */
+  setChannelGroupComment(groupId: string, comment: string): void {
+    this.inner.setChannelGroupComment(groupId, comment);
+  }
+
   /**
-   * Add a generic channel using the data type's natural bit width.
-   * `dataType` is a symbolic name such as `"FloatLE"`, `"UnsignedIntegerLE"`,
-   * `"SignedIntegerLE"`, `"StringUtf8"` (float defaults to 32 bits — use
-   * `addFloatChannel` for f64).
+   * Add a channel using the data type's default bit width. `dataType` is a
+   * canonical name as reported by `ChannelInfo.dataType`: `"FloatLE"`,
+   * `"UnsignedIntegerLE"`, `"SignedIntegerLE"`, `"StringUtf8"`, `"ByteArray"`,
+   * … (float defaults to 32 bits — use `addFloatChannel` for f64). Text
+   * types are written as variable-length channels.
    */
   addChannel(groupId: string, name: string, dataType: string): string {
     return this.inner.addChannel(groupId, name, dataType);
@@ -117,6 +127,15 @@ export class MdfWriter {
   /** Append a single record: one value per channel, in the order channels were added. */
   writeRecord(groupId: string, values: RecordValue[]): void {
     this.inner.writeRecord(groupId, values);
+  }
+
+  /**
+   * Append many records at once from one typed array per channel (the fast
+   * path): `Float64Array`, `Float32Array`, `BigUint64Array` or
+   * `BigInt64Array` matching each channel, all of the same length.
+   */
+  writeColumns(groupId: string, columns: ColumnValues[]): void {
+    this.inner.writeColumns(groupId, columns);
   }
 
   /** Close the open `##DT` block for a channel group. Call once per group after all records. */

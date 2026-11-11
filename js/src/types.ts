@@ -1,5 +1,7 @@
 /**
- * Public data-transfer types shared by `Mdf` and `MdfIndex`.
+ * The plain data types of the cross-language API contract, shared by `Mdf`
+ * and `MdfIndex`. The Rust and Python APIs expose the same types with the
+ * same fields in `snake_case` — see `docs/API.md`.
  */
 
 /** A decoded channel value: numeric, a big integer, text, raw bytes, or invalid (`null`). */
@@ -7,55 +9,53 @@ export type ChannelValue = number | string | bigint | Uint8Array | null;
 
 /** A decoded channel paired with its group's time axis. */
 export interface Signal {
+  /** Channel name. */
   name: string;
+  /** Physical unit. */
   unit?: string | null;
+  /**
+   * Master-channel values (seconds relative to the measurement start for a
+   * time master). Empty when the group has no master, or when this channel
+   * *is* the master (its `values` are the time axis).
+   */
   timestamps: Float64Array;
+  /** One value per record, conversions applied (`null` = invalid sample). */
   values: ChannelValue[];
 }
 
-/** Metadata for a single channel within a group. */
+/** Metadata of one channel. */
 export interface ChannelInfo {
-  name: string;
-  unit?: string | null;
-  comment?: string | null;
-  dataType: string;
-  isMaster: boolean;
-  bitCount: number;
-}
-
-/** Metadata for a channel group, as returned by `Mdf.groups()`. */
-export interface GroupInfo {
-  name?: string | null;
-  comment?: string | null;
-  recordCount: number;
-  channels: ChannelInfo[];
-}
-
-/** Metadata for a single channel, as returned by `MdfIndex.groups()` / `MdfIndex.channel()`. */
-export interface IndexChannelInfo {
   name?: string | null;
   unit?: string | null;
   /** Channel comment (`##TX` text, or the raw `##MD` XML). */
   comment?: string | null;
-  /** MDF data type, e.g. `"FloatLE"`, `"UnsignedIntegerLE"`, `"StringUtf8"`. */
+  /**
+   * Canonical data-type name, e.g. `"FloatLE"`, `"UnsignedIntegerLE"`,
+   * `"StringUtf8"` — the same names `MdfWriter.addChannel` takes.
+   */
   dataType: string;
-  isMaster: boolean;
+  /** Width of the stored value in bits. */
   bitCount: number;
+  /** The channel is its group's master (time) channel. */
+  isMaster: boolean;
   /** Variable-length (VLSD) channel, e.g. strings. */
   isVlsd: boolean;
-  /** The channel carries a conversion (applied by `values`/`read`). */
+  /** The channel carries a conversion (applied by `read` / `values`). */
   hasConversion: boolean;
 }
 
-/** Metadata for a channel group, as returned by `MdfIndex.groups()`. */
-export interface IndexGroupInfo {
+/** Metadata of one channel group. */
+export interface GroupInfo {
   name?: string | null;
   comment?: string | null;
+  /** Number of records (samples per channel). */
   recordCount: number;
+  /** Names of the group's named channels, in file order. */
   channelNames: string[];
   /** Name of the group's master (time) channel, local or MDF 4.2 remote. */
   masterChannel?: string | null;
-  channels: IndexChannelInfo[];
+  /** The group's channels, in file order. */
+  channels: ChannelInfo[];
 }
 
 /**
@@ -71,12 +71,14 @@ export interface ReadWindow {
   recordCount?: number;
 }
 
-/** Options accepted by `values` / `read`. */
+/** Options accepted by `read` / `values`. */
 export interface ReadOptions extends ReadWindow {
   /** Group name, to disambiguate a channel name used by several groups. */
   group?: string | null;
-  /** Where to read sample bytes from (`MdfIndex` only). Defaults to the
-   * index's bound source. */
+  /**
+   * TypeScript only, `MdfIndex` only: read sample bytes from this source for
+   * this one call instead of the index's bound source.
+   */
   source?: import("./range-source").RangeSource;
 }
 

@@ -45,24 +45,24 @@ test("writer conversions are applied on read", () => {
 
 test("Mdf.conversionInfo describes a channel's conversion", () => {
   const mdf = Mdf.fromBytes(buildFile());
-  assert.deepEqual(mdf.conversionInfo("Temp"), expectedLinear);
-  checkGear(mdf.conversionInfo("Gear", "Engine"));
-  assert.equal(mdf.conversionInfo("Plain"), null);
-  assert.throws(() => mdf.conversionInfo("Nope"), /not found/);
+  assert.deepEqual(mdf.conversion("Temp"), expectedLinear);
+  checkGear(mdf.conversion("Gear", "Engine"));
+  assert.equal(mdf.conversion("Plain"), null);
+  assert.throws(() => mdf.conversion("Nope"), /not found/);
   mdf.dispose();
 });
 
 test("MdfIndex.conversionInfo: local index and lazily over a RangeSource", async () => {
   const bytes = buildFile();
   const local = MdfIndex.fromBytes(bytes);
-  assert.deepEqual(await local.conversionInfo("Temp"), expectedLinear);
-  checkGear(await local.conversionInfo("Gear"));
-  assert.equal(await local.conversionInfo("Plain"), null);
+  assert.deepEqual(await local.conversion("Temp"), expectedLinear);
+  checkGear(await local.conversion("Gear"));
+  assert.equal(await local.conversion("Plain"), null);
   // A local index stores conversions resolved: no source needed.
   const json = local.toJson();
   local.dispose();
   const loaded = MdfIndex.fromJson(json);
-  checkGear(await loaded.conversionInfo("Gear"));
+  checkGear(await loaded.conversion("Gear"));
   loaded.dispose();
 
   // A network-built index fetches the conversion block on demand.
@@ -78,11 +78,11 @@ test("MdfIndex.conversionInfo: local index and lazily over a RangeSource", async
   const remote = await MdfIndex.fromRangeSource(counting);
   assert.equal(remote.channel("Gear")?.hasConversion, true);
   requests = 0;
-  checkGear(await remote.conversionInfo("Gear"));
-  assert.deepEqual(await remote.conversionInfo("Temp", { group: "Engine" }), expectedLinear);
+  checkGear(await remote.conversion("Gear"));
+  assert.deepEqual(await remote.conversion("Temp", "Engine"), expectedLinear);
   assert.ok(requests <= 4, `${requests} requests`);
   remote.setSource(undefined);
-  await assert.rejects(remote.conversionInfo("Gear"), /no source/);
-  assert.equal(await remote.conversionInfo("Plain"), null);
+  await assert.rejects(remote.conversion("Gear"), /no source/);
+  assert.equal(await remote.conversion("Plain"), null);
   remote.dispose();
 });

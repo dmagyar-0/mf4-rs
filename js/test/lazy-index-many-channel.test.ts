@@ -78,7 +78,7 @@ test("MdfIndex.fromRangeSource builds a many-channel file in few requests", asyn
   assert.equal(index.fileSize(), bytes.length);
 
   // And a real read still works end to end.
-  const values = await index.values("Signal_0_0", new BytesRangeSource(bytes), "Group_0");
+  const values = await index.values("Signal_0_0", { source: new BytesRangeSource(bytes), group: "Group_0" });
   assert.equal(values.length, 200);
 
   index.dispose();
