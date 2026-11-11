@@ -62,6 +62,7 @@ asammdf_*.mf4
 !js/package-lock.json
 # ...and so must the cross-language API contract.
 !docs/api-contract.json
+!tests/contract/*.json
 
 # Benchmark Data
 # Generated test data and results (optional - remove if you want to commit test data)

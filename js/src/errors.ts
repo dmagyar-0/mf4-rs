@@ -21,7 +21,7 @@ export class ChannelNotFoundError extends Error {
   }
 }
 
-const NOT_FOUND = /^Channel '(.*)' not found(?: in group '(.*)')?$/;
+const NOT_FOUND = /^Channel '(.*)' not found(?: in group '(.*)')?$/s;
 
 /**
  * Run a wasm call, turning the core library's "channel not found" error into

@@ -1,0 +1,708 @@
+{
+  "channel_names": [
+    "Time",
+    "Speed",
+    "Gear",
+    "Raw",
+    "Small",
+    "Label",
+    "Latin",
+    "Wide",
+    "Blob",
+    "Count",
+    "Time",
+    "Value"
+  ],
+  "channels": {
+    "Blob": {
+      "channel": {
+        "bit_count": 64.0,
+        "data_type": "ByteArray",
+        "has_conversion": false,
+        "is_master": false,
+        "is_vlsd": true,
+        "name": "Blob"
+      },
+      "time_range": [
+        0.0,
+        2.5
+      ]
+    },
+    "Count": {
+      "channel": {
+        "bit_count": 64.0,
+        "data_type": "UnsignedIntegerLE",
+        "has_conversion": false,
+        "is_master": false,
+        "is_vlsd": false,
+        "name": "Count"
+      },
+      "time_range": "error"
+    },
+    "Gear group=Engine": {
+      "channel": {
+        "bit_count": 64.0,
+        "data_type": "UnsignedIntegerLE",
+        "has_conversion": true,
+        "is_master": false,
+        "is_vlsd": false,
+        "name": "Gear"
+      },
+      "conversion": {
+        "flags": 2.0,
+        "physical_range": [
+          0.0,
+          0.0
+        ],
+        "precision": 0.0,
+        "texts": {
+          "0": "N",
+          "1": "D",
+          "2": "?"
+        },
+        "type": "ValueToText",
+        "values": [
+          0.0,
+          1.0
+        ]
+      },
+      "time_range": [
+        0.0,
+        2.5
+      ]
+    },
+    "Label": {
+      "channel": {
+        "bit_count": 64.0,
+        "data_type": "StringUtf8",
+        "has_conversion": false,
+        "is_master": false,
+        "is_vlsd": true,
+        "name": "Label"
+      },
+      "time_range": [
+        0.0,
+        2.5
+      ]
+    },
+    "Nope": {
+      "conversion": "error: channel not found",
+      "time_range": "error: channel not found"
+    },
+    "Speed": {
+      "channel": {
+        "bit_count": 64.0,
+        "data_type": "FloatLE",
+        "has_conversion": true,
+        "is_master": false,
+        "is_vlsd": false,
+        "name": "Speed"
+      },
+      "conversion": {
+        "flags": 0.0,
+        "precision": 0.0,
+        "type": "Linear",
+        "values": [
+          1.0,
+          2.0
+        ]
+      },
+      "time_range": [
+        0.0,
+        2.5
+      ]
+    },
+    "Speed group=NoMaster": {
+      "conversion": "error: channel not found",
+      "time_range": "error: channel not found"
+    },
+    "Time": {
+      "channel": {
+        "bit_count": 64.0,
+        "data_type": "FloatLE",
+        "has_conversion": false,
+        "is_master": true,
+        "is_vlsd": false,
+        "name": "Time"
+      },
+      "time_range": [
+        0.0,
+        2.5
+      ]
+    },
+    "Value group=Empty": {
+      "channel": {
+        "bit_count": 64.0,
+        "data_type": "FloatLE",
+        "has_conversion": false,
+        "is_master": false,
+        "is_vlsd": false,
+        "name": "Value"
+      }
+    }
+  },
+  "groups": [
+    {
+      "channel_names": [
+        "Time",
+        "Speed",
+        "Gear",
+        "Raw",
+        "Small",
+        "Label",
+        "Latin",
+        "Wide",
+        "Blob"
+      ],
+      "channels": [
+        {
+          "bit_count": 64.0,
+          "data_type": "FloatLE",
+          "has_conversion": false,
+          "is_master": true,
+          "is_vlsd": false,
+          "name": "Time"
+        },
+        {
+          "bit_count": 64.0,
+          "data_type": "FloatLE",
+          "has_conversion": true,
+          "is_master": false,
+          "is_vlsd": false,
+          "name": "Speed"
+        },
+        {
+          "bit_count": 64.0,
+          "data_type": "UnsignedIntegerLE",
+          "has_conversion": true,
+          "is_master": false,
+          "is_vlsd": false,
+          "name": "Gear"
+        },
+        {
+          "bit_count": 64.0,
+          "data_type": "SignedIntegerLE",
+          "has_conversion": false,
+          "is_master": false,
+          "is_vlsd": false,
+          "name": "Raw"
+        },
+        {
+          "bit_count": 32.0,
+          "data_type": "FloatLE",
+          "has_conversion": false,
+          "is_master": false,
+          "is_vlsd": false,
+          "name": "Small"
+        },
+        {
+          "bit_count": 64.0,
+          "data_type": "StringUtf8",
+          "has_conversion": false,
+          "is_master": false,
+          "is_vlsd": true,
+          "name": "Label"
+        },
+        {
+          "bit_count": 64.0,
+          "data_type": "StringLatin1",
+          "has_conversion": false,
+          "is_master": false,
+          "is_vlsd": true,
+          "name": "Latin"
+        },
+        {
+          "bit_count": 64.0,
+          "data_type": "StringUtf16LE",
+          "has_conversion": false,
+          "is_master": false,
+          "is_vlsd": true,
+          "name": "Wide"
+        },
+        {
+          "bit_count": 64.0,
+          "data_type": "ByteArray",
+          "has_conversion": false,
+          "is_master": false,
+          "is_vlsd": true,
+          "name": "Blob"
+        }
+      ],
+      "comment": "engine data",
+      "master_channel": "Time",
+      "name": "Engine",
+      "record_count": 6.0
+    },
+    {
+      "channel_names": [
+        "Count"
+      ],
+      "channels": [
+        {
+          "bit_count": 64.0,
+          "data_type": "UnsignedIntegerLE",
+          "has_conversion": false,
+          "is_master": false,
+          "is_vlsd": false,
+          "name": "Count"
+        }
+      ],
+      "name": "NoMaster",
+      "record_count": 3.0
+    },
+    {
+      "channel_names": [
+        "Time",
+        "Value"
+      ],
+      "channels": [
+        {
+          "bit_count": 64.0,
+          "data_type": "FloatLE",
+          "has_conversion": false,
+          "is_master": true,
+          "is_vlsd": false,
+          "name": "Time"
+        },
+        {
+          "bit_count": 64.0,
+          "data_type": "FloatLE",
+          "has_conversion": false,
+          "is_master": false,
+          "is_vlsd": false,
+          "name": "Value"
+        }
+      ],
+      "master_channel": "Time",
+      "name": "Empty",
+      "record_count": 0.0
+    }
+  ],
+  "reads": {
+    "Blob": {
+      "read": {
+        "name": "Blob",
+        "timestamps": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ],
+        "values": [
+          {
+            "bytes": [
+              0.0,
+              1.0
+            ]
+          },
+          {
+            "bytes": [
+              1.0,
+              2.0
+            ]
+          },
+          {
+            "bytes": [
+              2.0,
+              3.0
+            ]
+          },
+          {
+            "bytes": [
+              3.0,
+              4.0
+            ]
+          },
+          {
+            "bytes": [
+              4.0,
+              5.0
+            ]
+          },
+          {
+            "bytes": [
+              5.0,
+              6.0
+            ]
+          }
+        ]
+      },
+      "values": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    "Count": {
+      "read": {
+        "name": "Count",
+        "timestamps": [],
+        "values": [
+          10.0,
+          11.0,
+          12.0
+        ]
+      },
+      "values": [
+        10.0,
+        11.0,
+        12.0
+      ]
+    },
+    "Count group=NoMaster start_record=1 record_count=1": {
+      "read": {
+        "name": "Count",
+        "timestamps": [],
+        "values": [
+          11.0
+        ]
+      },
+      "values": [
+        11.0
+      ]
+    },
+    "Count start_time=0": {
+      "read": "error",
+      "values": "error"
+    },
+    "Gear": {
+      "read": {
+        "name": "Gear",
+        "timestamps": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ],
+        "values": [
+          "N",
+          "D",
+          "?",
+          "N",
+          "D",
+          "?"
+        ]
+      },
+      "values": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    "Label start_record=1 record_count=2": {
+      "read": {
+        "name": "Label",
+        "timestamps": [
+          0.5,
+          1.0
+        ],
+        "values": [
+          "L1",
+          "L2"
+        ]
+      },
+      "values": [
+        null,
+        null
+      ]
+    },
+    "Latin": {
+      "read": {
+        "name": "Latin",
+        "timestamps": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ],
+        "values": [
+          "é0",
+          "é1",
+          "é2",
+          "é3",
+          "é4",
+          "é5"
+        ]
+      },
+      "values": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    "Nope": {
+      "read": "error: channel not found",
+      "values": "error: channel not found"
+    },
+    "Nope start_time=0 start_record=0": {
+      "read": "error",
+      "values": "error"
+    },
+    "Raw": {
+      "read": {
+        "name": "Raw",
+        "timestamps": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ],
+        "values": [
+          0.0,
+          -1.0,
+          -2.0,
+          -3.0,
+          -4.0,
+          -5.0
+        ]
+      },
+      "values": [
+        0.0,
+        -1.0,
+        -2.0,
+        -3.0,
+        -4.0,
+        -5.0
+      ]
+    },
+    "Small": {
+      "read": {
+        "name": "Small",
+        "timestamps": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ],
+        "values": [
+          0.25,
+          1.25,
+          2.25,
+          3.25,
+          4.25,
+          5.25
+        ]
+      },
+      "values": [
+        0.25,
+        1.25,
+        2.25,
+        3.25,
+        4.25,
+        5.25
+      ]
+    },
+    "Speed": {
+      "read": {
+        "name": "Speed",
+        "timestamps": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ],
+        "values": [
+          1.0,
+          3.0,
+          5.0,
+          7.0,
+          9.0,
+          11.0
+        ]
+      },
+      "values": [
+        1.0,
+        3.0,
+        5.0,
+        7.0,
+        9.0,
+        11.0
+      ]
+    },
+    "Speed end_time=0.75": {
+      "read": {
+        "name": "Speed",
+        "timestamps": [
+          0.0,
+          0.5
+        ],
+        "values": [
+          1.0,
+          3.0
+        ]
+      },
+      "values": [
+        1.0,
+        3.0
+      ]
+    },
+    "Speed group=Empty": {
+      "read": "error: channel not found",
+      "values": "error: channel not found"
+    },
+    "Speed group=Engine start_time=1 end_time=2": {
+      "read": {
+        "name": "Speed",
+        "timestamps": [
+          1.0,
+          1.5,
+          2.0
+        ],
+        "values": [
+          5.0,
+          7.0,
+          9.0
+        ]
+      },
+      "values": [
+        5.0,
+        7.0,
+        9.0
+      ]
+    },
+    "Speed start_record=4 record_count=2": {
+      "read": {
+        "name": "Speed",
+        "timestamps": [
+          2.0,
+          2.5
+        ],
+        "values": [
+          9.0,
+          11.0
+        ]
+      },
+      "values": [
+        9.0,
+        11.0
+      ]
+    },
+    "Speed start_record=4 record_count=5": {
+      "read": "error",
+      "values": "error"
+    },
+    "Speed start_record=6": {
+      "read": {
+        "name": "Speed",
+        "timestamps": [],
+        "values": []
+      },
+      "values": []
+    },
+    "Speed start_time=0 start_record=0": {
+      "read": "error",
+      "values": "error"
+    },
+    "Speed start_time=2 end_time=1": {
+      "read": {
+        "name": "Speed",
+        "timestamps": [],
+        "values": []
+      },
+      "values": []
+    },
+    "Time": {
+      "read": {
+        "name": "Time",
+        "timestamps": [],
+        "values": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ]
+      },
+      "values": [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        2.5
+      ]
+    },
+    "Time start_time=0.5 end_time=1": {
+      "read": {
+        "name": "Time",
+        "timestamps": [],
+        "values": [
+          0.5,
+          1.0
+        ]
+      },
+      "values": [
+        0.5,
+        1.0
+      ]
+    },
+    "Value": {
+      "read": {
+        "name": "Value",
+        "timestamps": [],
+        "values": []
+      },
+      "values": []
+    },
+    "Value group=Empty start_time=0": {
+      "read": {
+        "name": "Value",
+        "timestamps": [],
+        "values": []
+      },
+      "values": []
+    },
+    "Wide": {
+      "read": {
+        "name": "Wide",
+        "timestamps": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ],
+        "values": [
+          "ü€0",
+          "ü€1",
+          "ü€2",
+          "ü€3",
+          "ü€4",
+          "ü€5"
+        ]
+      },
+      "values": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    }
+  },
+  "start_time_ns": "1700000000123456789"
+}

@@ -62,7 +62,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: cargo install wasm-pack --locked
+      # Same installer as release.yml (prebuilt binary).
+      - name: Install wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
       - run: npm ci
       - run: npm run build:wasm
       - run: npm run build:wasm:web

@@ -99,7 +99,8 @@ export class Mdf {
    * `ChannelNotFoundError` if no such channel exists.
    */
   read(name: string, options: ReadOptions = {}): Signal {
-    return guard(() => this.inner.read(name, options.group, windowOf(options)) as Signal);
+    const window = windowOf(options);
+    return guard(() => this.inner.read(name, options.group, window) as Signal);
   }
 
   /**
@@ -108,7 +109,8 @@ export class Mdf {
    * `options` as for {@link read}.
    */
   values(name: string, options: ReadOptions = {}): Float64Array {
-    return guard(() => this.inner.values(name, options.group, windowOf(options)));
+    const window = windowOf(options);
+    return guard(() => this.inner.values(name, options.group, window));
   }
 
   /**

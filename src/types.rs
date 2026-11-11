@@ -266,17 +266,25 @@ pub(crate) fn resolve_records(start: u64, count: Option<u64>, total: u64) -> Res
 /// A time window searches the signal's time axis: its `timestamps`, or its own
 /// values when it is the master (`is_master`).
 pub(crate) fn slice_signal(mut signal: Signal, window: Window, is_master: bool) -> Result<Signal, MdfError> {
-    let total = signal.values.len() as u64;
+    // A (malformed) file may give the master a different record count than
+    // the channel; only the records both have can be selected.
+    let total = if signal.timestamps.is_empty() {
+        signal.values.len()
+    } else {
+        signal.values.len().min(signal.timestamps.len())
+    };
     let (start, count) = match window {
         Window::All => return Ok(signal),
-        Window::Records(start, count) => resolve_records(start, count, total)?,
+        Window::Records(start, count) => resolve_records(start, count, total as u64)?,
         Window::Time(t0, t1) => {
-            let axis: Vec<f64> = if !signal.timestamps.is_empty() {
-                signal.timestamps.clone()
+            let own_values;
+            let axis: &[f64] = if !signal.timestamps.is_empty() {
+                &signal.timestamps[..total]
             } else if is_master {
-                signal.values_f64()
+                own_values = signal.values_f64();
+                &own_values
             } else if signal.values.is_empty() {
-                Vec::new()
+                &[]
             } else {
                 return Err(MdfError::InvalidArgument(format!(
                     "channel '{}' has no master (time) channel; cannot select by time",
@@ -289,9 +297,11 @@ pub(crate) fn slice_signal(mut signal: Signal, window: Window, is_master: bool) 
         }
     };
     let (s, e) = (start as usize, (start + count) as usize);
-    signal.values = signal.values[s..e].to_vec();
+    signal.values.truncate(e);
+    signal.values.drain(..s);
     if !signal.timestamps.is_empty() {
-        signal.timestamps = signal.timestamps[s..e].to_vec();
+        signal.timestamps.truncate(e);
+        signal.timestamps.drain(..s);
     }
     Ok(signal)
 }

@@ -234,7 +234,7 @@ and `finalize()` closes it. TypeScript runs in wasm without a filesystem:
 | | `add_float_channel` / `add_float32_channel` | 64 / 32-bit float. |
 | | `add_int_channel` / `add_sint_channel` | 64-bit **unsigned** / **signed** integer. |
 | | `add_string_channel` | Variable-length UTF-8 text. |
-| | `add_channel(group, name, data_type)` | Any data type, at its default width. |
+| | `add_channel(group, name, data_type)` | Any data type by name. Integers and floats get **32 bits**; text types and `ByteArray` become variable-length channels, text in the type's own encoding. |
 | | `set_time_channel(channel)` | Mark an existing channel as the master. |
 | | `add_linear_conversion(channel, offset, factor)` | `physical = offset + factor * raw`. |
 | | `add_value_to_text_conversion(channel, mapping, default_text)` | `mapping` is a list of `(raw integer, text)` pairs. |
@@ -246,7 +246,17 @@ and `finalize()` closes it. TypeScript runs in wasm without a filesystem:
 
 Record values are plain values in Python and TypeScript (`float` / `int` /
 `str` / `bytes`; `number` / `bigint` / `string` / `Uint8Array`) and
-`DecodedValue`s in Rust. Columns are `numpy` arrays (`float64`, `float32`,
+`DecodedValue`s in Rust. Python and TypeScript accept and refuse exactly the
+same values (the rules live once, in the Rust core):
+
+- float channels take any number;
+- integer channels take integers, and numbers with an integral value — never
+  a fraction, `NaN`, a negative into an unsigned channel, or a value that does
+  not fit the channel's width;
+- text channels take text only, `ByteArray` channels bytes only;
+- booleans are refused.
+
+A refused value is an error; nothing is ever silently truncated. Columns are `numpy` arrays (`float64`, `float32`,
 `uint64`, `int64`), typed arrays (`Float64Array`, `Float32Array`,
 `BigUint64Array`, `BigInt64Array`) or `ColumnData` slices.
 
@@ -310,10 +320,18 @@ in `api-contract.json`, so they are deliberate rather than drift.
 
 ## Keeping it in sync
 
-[`api-contract.json`](api-contract.json) lists every class, method, accessor,
-type field, function and export. Three tests compare it with what each
-binding really exposes, and each also checks that `Mdf` and `MdfIndex` give
-identical answers for the same file:
+Two things are checked, by one test file per language:
+
+- **Names.** [`api-contract.json`](api-contract.json) lists every class,
+  method, accessor, type field, function and export; each test compares it
+  with what its binding really exposes.
+- **Behaviour.** Each language builds the same file with its own `MdfWriter`,
+  answers the calls listed in
+  [`tests/contract/scenario.json`](../tests/contract/scenario.json) with both
+  `Mdf` and `MdfIndex` — whole and windowed reads, groups without a master,
+  empty groups, text encodings, error cases — and must reproduce
+  [`tests/contract/golden.json`](../tests/contract/golden.json) exactly. The
+  same file lists which values `write_record` must accept and refuse.
 
 | Language | Test | Run |
 |---|---|---|
@@ -327,5 +345,6 @@ To change the API:
 2. Implement the change in Rust (`src/api/mdf.rs`, `src/index.rs`, `src/writer/mdf_writer/simple.rs`, `src/types.rs`).
 3. Mirror it in `src/python.rs` (then regenerate the stubs: `cargo run --features pyo3 --bin stub_gen`) and in `src/wasm.rs` + `js/src/`.
 4. Run the three tests. A name that exists in only one language must be listed under that language's `extra`, or the tests fail.
+5. If answers change on purpose, regenerate the golden file with `UPDATE_GOLDEN=1 cargo test --test api_contract` — the Python and TypeScript tests must then match it without further changes. New behaviour deserves a new case in `scenario.json`.
 
 The `.github/workflows/tests.yml` workflow runs all three on every pull request.

@@ -1,4 +1,4 @@
-import type { ChannelValue, ReadWindow, Signal, TimeRange } from "./types";
+import type { ReadWindow } from "./types";
 
 /** `true` when `options` selects a window rather than the whole channel. */
 export function hasWindow(options: ReadWindow): boolean {
@@ -38,27 +38,6 @@ export function windowOf(w: ReadWindow): ReadWindow {
   if (w.startRecord !== undefined) out.startRecord = w.startRecord;
   if (w.recordCount !== undefined) out.recordCount = w.recordCount;
   return out;
-}
-
-/** Numeric view of decoded values: numbers kept, bigints converted, anything
- * else (text, bytes, invalid) becomes `NaN` — the `values()` semantics. */
-export function toFloat64(values: ChannelValue[]): Float64Array {
-  const out = new Float64Array(values.length);
-  for (let i = 0; i < values.length; i++) {
-    const v = values[i];
-    out[i] = typeof v === "number" ? v : typeof v === "bigint" ? Number(v) : NaN;
-  }
-  return out;
-}
-
-/** Time axis of a signal: its timestamps, or its own values for a master. */
-export function timeAxisOf(signal: Signal): ArrayLike<number> {
-  return signal.timestamps.length ? signal.timestamps : toFloat64(signal.values);
-}
-
-/** First/last entry of a time axis, or `undefined` when empty. */
-export function rangeOf(axis: ArrayLike<number>): TimeRange | undefined {
-  return axis.length ? { start: axis[0]!, end: axis[axis.length - 1]! } : undefined;
 }
 
 /**

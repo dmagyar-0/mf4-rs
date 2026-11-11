@@ -54,6 +54,7 @@ impl ChannelEncoder {
     fn encode(&self, buf: &mut [u8], value: &DecodedValue) -> Result<(), MdfError> {
         match (self, value) {
             (ChannelEncoder::UInt { offset, bytes }, DecodedValue::UnsignedInteger(v)) => {
+                check_unsigned_fits(*v, *bytes)?;
                 let b = v.to_le_bytes();
                 buf[*offset..*offset + *bytes].copy_from_slice(&b[..*bytes]);
                 Ok(())
@@ -67,11 +68,13 @@ impl ChannelEncoder {
                         v
                     )));
                 }
+                check_unsigned_fits(*v as u64, *bytes)?;
                 let b = (*v as u64).to_le_bytes();
                 buf[*offset..*offset + *bytes].copy_from_slice(&b[..*bytes]);
                 Ok(())
             }
             (ChannelEncoder::Int { offset, bytes }, DecodedValue::SignedInteger(v)) => {
+                check_signed_fits(*v, *bytes)?;
                 let b = v.to_le_bytes();
                 buf[*offset..*offset + *bytes].copy_from_slice(&b[..*bytes]);
                 Ok(())
@@ -85,6 +88,7 @@ impl ChannelEncoder {
                         v
                     )));
                 }
+                check_signed_fits(*v as i64, *bytes)?;
                 let b = (*v as i64).to_le_bytes();
                 buf[*offset..*offset + *bytes].copy_from_slice(&b[..*bytes]);
                 Ok(())
@@ -126,6 +130,50 @@ impl ChannelEncoder {
 
 }
 
+/// Error unless `v` fits an unsigned field of `bytes` bytes.
+fn check_unsigned_fits(v: u64, bytes: usize) -> Result<(), MdfError> {
+    if bytes < 8 && v >> (bytes * 8) != 0 {
+        return Err(MdfError::InvalidArgument(format!(
+            "value {v} does not fit a {}-bit unsigned integer channel",
+            bytes * 8
+        )));
+    }
+    Ok(())
+}
+
+/// Error unless `v` fits a signed field of `bytes` bytes.
+fn check_signed_fits(v: i64, bytes: usize) -> Result<(), MdfError> {
+    if bytes < 8 {
+        let shift = 64 - bytes * 8;
+        if (v << shift) >> shift != v {
+            return Err(MdfError::InvalidArgument(format!(
+                "value {v} does not fit a {}-bit signed integer channel",
+                bytes * 8
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Encode text for a variable-length channel in the channel's own encoding.
+fn encode_text(text: &str, data_type: &DataType) -> Result<Vec<u8>, MdfError> {
+    match data_type {
+        DataType::StringLatin1 => text
+            .chars()
+            .map(|c| {
+                u8::try_from(c as u32).map_err(|_| {
+                    MdfError::InvalidArgument(format!(
+                        "character {c:?} cannot be written to a StringLatin1 channel"
+                    ))
+                })
+            })
+            .collect(),
+        DataType::StringUtf16LE => Ok(text.encode_utf16().flat_map(u16::to_le_bytes).collect()),
+        DataType::StringUtf16BE => Ok(text.encode_utf16().flat_map(u16::to_be_bytes).collect()),
+        _ => Ok(text.as_bytes().to_vec()),
+    }
+}
+
 const MAX_DT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 
 
@@ -150,11 +198,15 @@ fn encode_record(dt: &mut super::OpenDataBlock, values: &[DecodedValue]) -> Resu
             ChannelEncoder::VlsdOffset { offset, channel_index } => {
                 let off = *offset;
                 let ch_idx = *channel_index;
+                let encoded;
                 let bytes: &[u8] = match val {
                     DecodedValue::ByteArray(b)
                     | DecodedValue::MimeSample(b)
                     | DecodedValue::MimeStream(b) => b.as_slice(),
-                    DecodedValue::String(s) => s.as_bytes(),
+                    DecodedValue::String(s) => {
+                        encoded = encode_text(s, &dt.channels[i].data_type)?;
+                        &encoded
+                    }
                     other => {
                         return Err(MdfError::BlockSerializationError(format!(
                             "value {:?} cannot be written to a VLSD channel (expected String or ByteArray)",
@@ -845,7 +897,7 @@ impl MdfWriter {
                 None => 0,
             };
             let mut total_channel_bytes = 0usize;
-            for (col, enc) in columns.iter().zip(dt.encoders.iter()) {
+            for (column_index, (col, enc)) in columns.iter().zip(dt.encoders.iter()).enumerate() {
                 let col_len = match col {
                     ColumnData::F64(s) => s.len(),
                     ColumnData::F32(s) => s.len(),
@@ -853,7 +905,9 @@ impl MdfWriter {
                     ColumnData::I64(s) => s.len(),
                 };
                 if col_len != nrows {
-                    return Err(MdfError::BlockSerializationError("column length mismatch".into()));
+                    return Err(MdfError::InvalidArgument(format!(
+                        "column length mismatch: column 0 has {nrows} values, another has {col_len}"
+                    )));
                 }
                 let type_ok = match (col, enc) {
                     (ColumnData::F64(_), ChannelEncoder::F64 { .. }) => true,
@@ -863,7 +917,16 @@ impl MdfWriter {
                     _ => false,
                 };
                 if !type_ok {
-                    return Err(MdfError::BlockSerializationError("column type does not match encoder type".into()));
+                    let given = match col {
+                        ColumnData::F64(_) => "64-bit float",
+                        ColumnData::F32(_) => "32-bit float",
+                        ColumnData::U64(_) => "unsigned 64-bit integer",
+                        ColumnData::I64(_) => "signed 64-bit integer",
+                    };
+                    return Err(MdfError::InvalidArgument(format!(
+                        "column {column_index} holds {given} values but its channel is a {} channel",
+                        enc.kind()
+                    )));
                 }
             }
             let enc_info: Vec<(usize, usize)> = dt.encoders.iter().map(|e| match e {

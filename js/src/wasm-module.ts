@@ -78,6 +78,19 @@ export interface WasmMdfIndex {
     ranges: unknown,
     fragments: unknown,
   ): WasmWindowStep;
+  valuesWindowStep(
+    name: string,
+    group: string | null | undefined,
+    window: unknown,
+    ranges: unknown,
+    fragments: unknown,
+  ): { done: boolean; needed?: [number, number][]; values?: Float64Array };
+  timeRangeStep(
+    name: string,
+    group: string | null | undefined,
+    ranges: unknown,
+    fragments: unknown,
+  ): { done: boolean; needed?: [number, number][]; range?: unknown };
   toJson(): string;
   validate(): void;
   valuesFromFragments(

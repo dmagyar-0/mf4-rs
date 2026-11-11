@@ -2123,12 +2123,18 @@ impl MdfIndex {
         t_end: Option<f64>,
         reader: &mut R,
     ) -> Result<(u64, u64), MdfError> {
-        let (mg, m) = self.time_axis_location(g, c).ok_or_else(|| {
-            MdfError::BlockSerializationError(
-                "channel group has no master (time) channel; cannot select by time".to_string(),
-            )
-        })?;
-        let (group, _) = self.group_and_channel(g, c)?;
+        let (group, channel) = self.group_and_channel(g, c)?;
+        let Some((mg, m)) = self.time_axis_location(g, c) else {
+            // Same rule as the in-memory reader (`types::slice_signal`): an
+            // empty group selects nothing, otherwise a master is required.
+            if group.record_count == 0 {
+                return Ok((0, 0));
+            }
+            return Err(MdfError::InvalidArgument(format!(
+                "channel '{}' has no master (time) channel; cannot select by time",
+                channel.name.as_deref().unwrap_or_default()
+            )));
+        };
         let (mgroup, mchannel) = self.group_and_channel(mg, m)?;
         let n = group.record_count.min(mgroup.record_count);
         let conversion = Self::resolve_conversion(mchannel, reader)?;
@@ -2447,7 +2453,7 @@ impl MdfIndex {
         Ok(values)
     }
 
-    /// Map VLSD decoded values to `f64`, matching `Channel::values_as_f64`:
+    /// Map VLSD decoded values to `f64`, matching `Channel::values`:
     /// numeric variants convert, everything else (strings, bytes, invalid) is
     /// NaN.
     fn vlsd_values_to_f64(values: Vec<Option<DecodedValue>>) -> Vec<f64> {
@@ -2990,6 +2996,8 @@ impl MdfIndex {
         g: usize,
         c: usize,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
+        #[cfg(target_arch = "wasm32")]
+        let _ = (g, c);
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
             Source::File(path) => {
@@ -3056,6 +3064,8 @@ impl MdfIndex {
         g: usize,
         c: usize,
     ) -> Result<Vec<f64>, MdfError> {
+        #[cfg(target_arch = "wasm32")]
+        let _ = (g, c);
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
             Source::File(path) => {

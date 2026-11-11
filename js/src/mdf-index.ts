@@ -8,7 +8,7 @@ import {
   type FetchLike,
 } from "./range-source";
 import { ChannelNotFoundError, guard } from "./errors";
-import { hasWindow, rangeOf, timeAxisOf, toFloat64, windowOf } from "./signal-util";
+import { hasWindow, windowOf } from "./signal-util";
 import type {
   ByteRange,
   ChannelInfo,
@@ -526,10 +526,14 @@ export class MdfIndex {
    * `ChannelNotFoundError` if no such channel exists.
    */
   async read(name: string, options: ReadOptions = {}): Promise<Signal> {
+    const window = windowOf(options);
     this.#requireChannel(name, options.group);
     const source = this.#requireSource(options);
     if (hasWindow(options)) {
-      return this.#windowStep(name, options.group, windowOf(options), source);
+      const step = await this.#gapLoop(source, (ranges, fragments) =>
+        this.inner.readWindowStep(name, options.group, window, ranges, fragments),
+      );
+      return step.signal as Signal;
     }
     const ranges = this.signalByteRanges(name, options.group);
     const fragments = await readAllRanges(source, ranges);
@@ -545,11 +549,14 @@ export class MdfIndex {
    * non-numeric samples are `NaN`. `options` as for {@link read}.
    */
   async values(name: string, options: ReadOptions = {}): Promise<Float64Array> {
+    const window = windowOf(options);
     this.#requireChannel(name, options.group);
     const source = this.#requireSource(options);
     if (hasWindow(options)) {
-      const signal = await this.#windowStep(name, options.group, windowOf(options), source);
-      return toFloat64(signal.values);
+      const step = await this.#gapLoop(source, (ranges, fragments) =>
+        this.inner.valuesWindowStep(name, options.group, window, ranges, fragments),
+      );
+      return step.values!;
     }
     const ranges = this.signalByteRanges(name, options.group, false);
     const fragments = await readAllRanges(source, ranges);
@@ -566,19 +573,12 @@ export class MdfIndex {
    * throws if the group has no master channel.
    */
   async timeRange(name: string, group?: string | null): Promise<TimeRange | undefined> {
-    const info = this.#requireChannel(name, group);
+    this.#requireChannel(name, group);
     const source = this.#requireSource({});
-    const total = this.#recordCount(name, group);
-    if (total === 0) return undefined;
-    const one = (startRecord: number) =>
-      this.#windowStep(name, group, { startRecord, recordCount: 1 }, source);
-    const [first, last] = await Promise.all([one(0), one(total - 1)]);
-    if (first.timestamps.length === 0 && !info.isMaster) {
-      throw new Error(`Channel '${name}' has no master (time) channel.`);
-    }
-    const a = rangeOf(timeAxisOf(first));
-    const b = rangeOf(timeAxisOf(last));
-    return a && b ? { start: a.start, end: b.end } : undefined;
+    const step = await this.#gapLoop(source, (ranges, fragments) =>
+      this.inner.timeRangeStep(name, group, ranges, fragments),
+    );
+    return step.range as TimeRange | undefined;
   }
 
   /**
@@ -625,28 +625,25 @@ export class MdfIndex {
     return source;
   }
 
-  /** Drive `readWindowStep` until every byte the windowed read needs is in. */
-  async #windowStep(
-    name: string,
-    group: string | null | undefined,
-    window: object,
+  /**
+   * Drive a wasm step function until every byte its read needs is in: each
+   * call either finishes or reports the byte ranges still missing, which are
+   * fetched from `source` and handed back on the next call.
+   */
+  async #gapLoop<T extends { done: boolean; needed?: [number, number][] }>(
     source: RangeSource,
-  ): Promise<Signal> {
+    step: (ranges: ByteRange[], fragments: Uint8Array[]) => T,
+  ): Promise<T> {
     const size = this.fileSize();
     const ranges: ByteRange[] = [];
     const fragments: Uint8Array[] = [];
     const maxRounds = 10_000;
     for (let round = 0; round < maxRounds; round++) {
-      const step = this.inner.readWindowStep(name, group, window, ranges, fragments);
-      if (step.done) {
-        return step.signal as Signal;
+      const result = guard(() => step(ranges, fragments));
+      if (result.done) {
+        return result;
       }
-      const spans = coalesceNeeded(
-        step.needed as [number, number][],
-        WINDOW_BRIDGE_BYTES,
-        0,
-        size,
-      );
+      const spans = coalesceNeeded(result.needed!, WINDOW_BRIDGE_BYTES, 0, size);
       const fetched = await Promise.all(
         spans.map(async ([offset, length]): Promise<[ByteRange, Uint8Array]> => {
           const bytes = await source.read(offset, length);
@@ -658,16 +655,7 @@ export class MdfIndex {
         fragments.push(bytes);
       }
     }
-    throw new Error("MdfIndex: windowed read did not converge; the index or source may be inconsistent.");
-  }
-
-  /** Record count of the group `name` resolves to (first match / in `group`). */
-  #recordCount(name: string, group: string | null | undefined): number {
-    for (const g of this.groups()) {
-      if (group != null && g.name !== group) continue;
-      if (g.channelNames.includes(name)) return g.recordCount;
-    }
-    return 0;
+    throw new Error("MdfIndex: read did not converge; the index or source may be inconsistent.");
   }
 
   /**

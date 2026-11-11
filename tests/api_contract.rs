@@ -385,3 +385,240 @@ fn every_reader_gives_the_same_answers() -> Result<(), MdfError> {
     assert_eq!(index.byte_ranges_for_records("Speed", 2, 3, Some("Body"))?.len(), 1);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Cross-language golden test
+// ---------------------------------------------------------------------------
+//
+// Every language builds the same file with its own writer, answers the calls
+// listed in tests/contract/scenario.json with both readers, and must
+// reproduce tests/contract/golden.json. Regenerate the golden file with
+// `UPDATE_GOLDEN=1 cargo test --test api_contract` after an intended change.
+
+fn build_scenario_file(path: &Path) -> Result<(), MdfError> {
+    let mut w = MdfWriter::new(path.to_str().unwrap())?;
+    w.init_mdf_file()?;
+    w.set_start_time(1_700_000_000_123_456_789)?;
+
+    let g = w.add_channel_group(Some("Engine"))?;
+    w.set_channel_group_comment(&g, "engine data")?;
+    w.add_time_channel(&g, "Time")?;
+    let speed = w.add_float_channel(&g, "Speed")?;
+    let gear = w.add_int_channel(&g, "Gear")?;
+    w.add_sint_channel(&g, "Raw")?;
+    w.add_float32_channel(&g, "Small")?;
+    w.add_string_channel(&g, "Label")?;
+    w.add_channel(&g, "Latin", DataType::StringLatin1)?;
+    w.add_channel(&g, "Wide", DataType::StringUtf16LE)?;
+    w.add_channel(&g, "Blob", DataType::ByteArray)?;
+    w.add_linear_conversion(&speed, 1.0, 2.0)?;
+    w.add_value_to_text_conversion(&gear, &[(0, "N"), (1, "D")], "?")?;
+    w.start_data_block(&g)?;
+    for i in 0..6u8 {
+        w.write_record(
+            &g,
+            &[
+                DecodedValue::Float(i as f64 * 0.5),
+                DecodedValue::Float(i as f64),
+                DecodedValue::UnsignedInteger((i % 3) as u64),
+                DecodedValue::SignedInteger(-(i as i64)),
+                DecodedValue::Float(i as f64 + 0.25),
+                DecodedValue::String(format!("L{i}")),
+                DecodedValue::String(format!("\u{e9}{i}")),
+                DecodedValue::String(format!("\u{fc}\u{20ac}{i}")),
+                DecodedValue::ByteArray(vec![i, i + 1]),
+            ],
+        )?;
+    }
+    w.finish_data_block(&g)?;
+
+    let g = w.add_channel_group(Some("NoMaster"))?;
+    w.add_int_channel(&g, "Count")?;
+    w.start_data_block(&g)?;
+    for i in 0..3u64 {
+        w.write_record(&g, &[DecodedValue::UnsignedInteger(10 + i)])?;
+    }
+    w.finish_data_block(&g)?;
+
+    let g = w.add_channel_group(Some("Empty"))?;
+    w.add_time_channel(&g, "Time")?;
+    w.add_float_channel(&g, "Value")?;
+    w.start_data_block(&g)?;
+    w.finish_data_block(&g)?;
+
+    w.finalize()
+}
+
+fn case_options(case: &Value) -> ReadOptions {
+    ReadOptions {
+        group: case["group"].as_str().map(str::to_string),
+        start_time: case["start_time"].as_f64(),
+        end_time: case["end_time"].as_f64(),
+        start_record: case["start_record"].as_u64(),
+        record_count: case["record_count"].as_u64(),
+    }
+}
+
+fn error_kind(error: &MdfError) -> Value {
+    Value::from(match error {
+        MdfError::ChannelNotFound { .. } => "error: channel not found",
+        _ => "error",
+    })
+}
+
+fn floats(values: &[f64]) -> Value {
+    Value::from(values.iter().map(|v| if v.is_nan() { Value::Null } else { Value::from(*v) }).collect::<Vec<_>>())
+}
+
+fn signal_json(signal: &Signal) -> Value {
+    let values: Vec<Value> = signal
+        .values
+        .iter()
+        .map(|v| match v {
+            None => Value::Null,
+            Some(DecodedValue::Float(f)) => Value::from(*f),
+            Some(DecodedValue::UnsignedInteger(u)) => Value::from(*u as f64),
+            Some(DecodedValue::SignedInteger(i)) => Value::from(*i as f64),
+            Some(DecodedValue::String(s)) => Value::from(s.as_str()),
+            Some(DecodedValue::ByteArray(b)) => serde_json::json!({ "bytes": b }),
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    serde_json::json!({
+        "name": signal.name,
+        "unit": signal.unit,
+        "timestamps": floats(&signal.timestamps),
+        "values": values,
+    })
+}
+
+/// Canonical form shared by the three languages: snake_case keys, no
+/// null-valued object fields, every number a float.
+fn canonical(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| {
+                    // camelCase field names only; case labels (which start
+                    // with a channel name) are kept as they are.
+                    if !k.starts_with(|c: char| c.is_ascii_lowercase()) {
+                        return (k, canonical(v));
+                    }
+                    let mut key = String::new();
+                    for ch in k.chars() {
+                        if ch.is_ascii_uppercase() {
+                            key.push('_');
+                            key.push(ch.to_ascii_lowercase());
+                        } else {
+                            key.push(ch);
+                        }
+                    }
+                    (key, canonical(v))
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(canonical).collect()),
+        Value::Number(n) => Value::from(n.as_f64().unwrap()),
+        other => other,
+    }
+}
+
+fn case_label(case: &Value) -> String {
+    let mut parts = vec![case["name"].as_str().unwrap().to_string()];
+    for key in ["group", "start_time", "end_time", "start_record", "record_count"] {
+        match &case[key] {
+            Value::Null => {}
+            Value::String(text) => parts.push(format!("{key}={text}")),
+            // `1.0` prints as `1`, in every language.
+            number => parts.push(format!("{key}={}", number.as_f64().unwrap())),
+        }
+    }
+    parts.join(" ")
+}
+
+fn dump(reader: &mut dyn Reader, scenario: &Value) -> Value {
+    let mut reads = serde_json::Map::new();
+    for case in scenario["read_cases"].as_array().unwrap() {
+        let options = case_options(case);
+        let name = case["name"].as_str().unwrap();
+        let read = match reader.read(name, &options) {
+            Ok(signal) => signal_json(&signal),
+            Err(e) => error_kind(&e),
+        };
+        let values = match reader.values(name, &options) {
+            Ok(values) => floats(&values),
+            Err(e) => error_kind(&e),
+        };
+        reads.insert(case_label(case), serde_json::json!({ "read": read, "values": values }));
+    }
+    let mut channels = serde_json::Map::new();
+    for case in scenario["channel_cases"].as_array().unwrap() {
+        let (name, group) = (case["name"].as_str().unwrap(), case["group"].as_str());
+        let time_range = match reader.time_range(name, group) {
+            Ok(range) => serde_json::to_value(range.map(|r| [r.start, r.end])).unwrap(),
+            Err(e) => error_kind(&e),
+        };
+        let conversion = match reader.conversion(name, group) {
+            Ok(info) => serde_json::to_value(info).unwrap(),
+            Err(e) => error_kind(&e),
+        };
+        channels.insert(
+            case_label(case),
+            serde_json::json!({
+                "channel": serde_json::to_value(reader.channel(name, group)).unwrap(),
+                "time_range": time_range,
+                "conversion": conversion,
+            }),
+        );
+    }
+    canonical(serde_json::json!({
+        "start_time_ns": reader.start_time_ns().map(|ns| ns.to_string()),
+        "channel_names": reader.channel_names(),
+        "groups": serde_json::to_value(reader.groups()).unwrap(),
+        "reads": reads,
+        "channels": channels,
+    }))
+}
+
+#[test]
+fn golden_dump_matches() -> Result<(), MdfError> {
+    let scenario: Value =
+        serde_json::from_str(&std::fs::read_to_string(root().join("tests/contract/scenario.json")).unwrap()).unwrap();
+    let dir = tempfile::tempdir().map_err(MdfError::IOError)?;
+    let path = dir.path().join("scenario.mf4");
+    build_scenario_file(&path)?;
+    let path = path.to_str().unwrap();
+
+    let mut mdf = Mdf::from_file(path)?;
+    let mut index = MdfIndex::from_file(path)?;
+    let from_mdf = dump(&mut mdf, &scenario);
+    let from_index = dump(&mut index, &scenario);
+    assert_eq!(from_index, from_mdf, "Mdf and MdfIndex disagree");
+
+    let golden_path = root().join("tests/contract/golden.json");
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+        let text = serde_json::to_string_pretty(&from_mdf).unwrap();
+        std::fs::write(&golden_path, text + "\n").map_err(MdfError::IOError)?;
+    }
+    let golden: Value = serde_json::from_str(&std::fs::read_to_string(&golden_path).map_err(MdfError::IOError)?).unwrap();
+    assert_eq!(
+        from_mdf,
+        canonical(golden),
+        "the Rust answers differ from tests/contract/golden.json — if the change is intended, \
+         regenerate it with UPDATE_GOLDEN=1 and make sure the Python and TypeScript tests still match"
+    );
+    Ok(())
+}
+
+#[test]
+fn type_methods_match_the_contract() {
+    let contract = contract();
+    for (name, file) in [("Signal", "src/signal.rs"), ("GroupInfo", "src/types.rs"), ("ReadOptions", "src/types.rs")] {
+        assert_eq!(
+            public_methods(&[file], name),
+            strings(&contract["types"][name]["methods"]["rust"]),
+            "public methods of `{name}` differ from docs/api-contract.json"
+        );
+    }
+}

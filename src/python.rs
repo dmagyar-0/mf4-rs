@@ -876,29 +876,30 @@ impl PyMdfWriter {
     }
 }
 
-/// Coerce one Python value to the `DecodedValue` its channel encodes.
+/// Coerce one Python value to the `DecodedValue` its channel encodes. The
+/// rules live in the Rust core (`simple::record_value`), shared with wasm.
 fn record_value(value: &Bound<'_, PyAny>, data_type: &DataType, index: usize) -> PyResult<DecodedValue> {
-    let wrong = |expected: &str| {
-        MdfException::new_err(format!(
-            "record value at index {index} must be {expected} for a {} channel",
-            data_type.name()
-        ))
+    use crate::writer::mdf_writer::simple::{record_value, PlainValue};
+    use pyo3::types::{PyBool, PyBytes, PyFloat, PyString};
+
+    let text;
+    let plain = if value.is_instance_of::<PyBool>() {
+        PlainValue::Bool
+    } else if value.is_instance_of::<PyFloat>() {
+        PlainValue::Float(value.extract()?)
+    } else if let Ok(s) = value.downcast::<PyString>() {
+        text = s.to_string();
+        PlainValue::Text(&text)
+    } else if let Ok(b) = value.downcast::<PyBytes>() {
+        PlainValue::Bytes(b.as_bytes())
+    } else if let Ok(i) = value.extract::<i128>() {
+        PlainValue::Int(i)
+    } else if let Ok(f) = value.extract::<f64>() {
+        PlainValue::Float(f)
+    } else {
+        PlainValue::Other
     };
-    Ok(match data_type {
-        DataType::FloatLE | DataType::FloatBE => {
-            DecodedValue::Float(value.extract::<f64>().map_err(|_| wrong("a number"))?)
-        }
-        DataType::UnsignedIntegerLE | DataType::UnsignedIntegerBE => {
-            DecodedValue::UnsignedInteger(value.extract::<u64>().map_err(|_| wrong("a non-negative int"))?)
-        }
-        DataType::SignedIntegerLE | DataType::SignedIntegerBE => {
-            DecodedValue::SignedInteger(value.extract::<i64>().map_err(|_| wrong("an int"))?)
-        }
-        dt if dt.is_string() => {
-            DecodedValue::String(value.extract::<String>().map_err(|_| wrong("a str"))?)
-        }
-        _ => DecodedValue::ByteArray(value.extract::<&[u8]>().map_err(|_| wrong("bytes"))?.to_vec()),
-    })
+    Ok(record_value(plain, data_type, index)?)
 }
 
 #[gen_stub_pymethods]

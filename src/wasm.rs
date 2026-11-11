@@ -494,6 +494,33 @@ fn conversion_to_js(
     }
 }
 
+/// Finish one step of a gap-driven read: `{ done: false, needed }` while the
+/// probing reader recorded misses, otherwise `{ done: true, [key]: value }`
+/// (or the read's error).
+fn gap_step<T>(
+    misses: Vec<(u64, u64)>,
+    result: Result<T, MdfError>,
+    key: &str,
+    to_value: impl FnOnce(T) -> Result<JsValue, JsError>,
+) -> Result<JsValue, JsError> {
+    let out = Object::new();
+    let set = |k: &str, v: &JsValue| -> Result<(), JsError> {
+        Reflect::set(&out, &JsValue::from_str(k), v)
+            .map(|_| ())
+            .map_err(|_| JsError::new("failed to build step result"))
+    };
+    if !misses.is_empty() {
+        set("done", &JsValue::FALSE)?;
+        let needed = serde_wasm_bindgen::to_value(&misses_to_needed(misses))
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        set("needed", &needed)?;
+        return Ok(out.into());
+    }
+    set("done", &JsValue::TRUE)?;
+    set(key, &to_value(result.map_err(err_to_js)?)?)?;
+    Ok(out.into())
+}
+
 /// Build [`ReadOptions`] from a group name and a JS `ReadWindow` object.
 fn read_options(group: Option<String>, window: JsValue) -> Result<ReadOptions, JsError> {
     let w: WindowJs = if window.is_undefined() || window.is_null() {
@@ -965,6 +992,49 @@ impl WasmMdfIndex {
         Ok(out.into())
     }
 
+    /// One step of a windowed `values` read: like `readWindowStep`, but reads
+    /// only the channel (not its time axis) once the window is located.
+    /// Finishes with `{ done: true, values: Float64Array }`.
+    #[wasm_bindgen(js_name = valuesWindowStep)]
+    pub fn values_window_step(
+        &self,
+        name: &str,
+        group: Option<String>,
+        window: JsValue,
+        ranges: JsValue,
+        fragments: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let (g, c) = self.locate(name, group.as_deref())?;
+        let window = read_options(None, window)?.window().map_err(err_to_js)?;
+        let parsed = build_fragment_reader(&ranges, &fragments)?;
+        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: true };
+        let result = (|| {
+            let (start, count) = self.index.resolve_window(g, c, window, &mut reader)?;
+            self.index.values_f64_window(g, c, start, count, &mut reader)
+        })();
+        gap_step(reader.misses, result, "values", |values| {
+            Ok(Float64Array::from(values.as_slice()).into())
+        })
+    }
+
+    /// One step of `timeRange`: reads the first and last record of the time
+    /// axis of `name`'s group. Finishes with `{ done: true, range }`, where
+    /// `range` is `{ start, end }` or `undefined` for an empty group.
+    #[wasm_bindgen(js_name = timeRangeStep)]
+    pub fn time_range_step(
+        &self,
+        name: &str,
+        group: Option<String>,
+        ranges: JsValue,
+        fragments: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let (g, c) = self.locate(name, group.as_deref())?;
+        let parsed = build_fragment_reader(&ranges, &fragments)?;
+        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: true };
+        let result = self.index.time_range_at(g, c, &mut reader);
+        gap_step(reader.misses, result, "range", |range| to_js(&range))
+    }
+
     /// Names of every named channel across all groups (duplicates kept).
     #[wasm_bindgen(js_name = channelNames)]
     pub fn channel_names(&self) -> Vec<String> {
@@ -1203,45 +1273,33 @@ impl WasmMdfWriter {
     }
 }
 
-/// Coerce one JS value to the `DecodedValue` its channel encodes.
+/// Coerce one JS value to the `DecodedValue` its channel encodes. The rules
+/// live in the Rust core (`simple::record_value`), shared with Python.
 fn record_value(v: &JsValue, dt: &DataType, i: usize) -> Result<DecodedValue, JsError> {
-    if let Some(s) = v.as_string() {
-        return Ok(DecodedValue::String(s));
-    }
-    if let Some(bytes) = v.dyn_ref::<Uint8Array>() {
-        return Ok(DecodedValue::ByteArray(bytes.to_vec()));
-    }
-    if let Some(b) = v.dyn_ref::<js_sys::BigInt>() {
-        return match dt {
-            DataType::SignedIntegerLE | DataType::SignedIntegerBE => i64::try_from(b.clone())
-                .map(DecodedValue::SignedInteger)
-                .map_err(|_| {
-                    JsError::new(&format!(
-                        "record value at index {i} (BigInt) does not fit in a signed 64-bit integer"
-                    ))
-                }),
-            DataType::UnsignedIntegerLE | DataType::UnsignedIntegerBE => u64::try_from(b.clone())
-                .map(DecodedValue::UnsignedInteger)
-                .map_err(|_| {
-                    JsError::new(&format!(
-                        "record value at index {i} (BigInt) does not fit in an unsigned 64-bit integer"
-                    ))
-                }),
-            _ => Err(JsError::new(&format!(
-                "record value at index {i} is a BigInt but that channel is not an integer channel"
-            ))),
-        };
-    }
-    if let Some(f) = v.as_f64() {
-        return Ok(match dt {
-            DataType::SignedIntegerLE | DataType::SignedIntegerBE => DecodedValue::SignedInteger(f as i64),
-            DataType::UnsignedIntegerLE | DataType::UnsignedIntegerBE => DecodedValue::UnsignedInteger(f as u64),
-            _ => DecodedValue::Float(f),
-        });
-    }
-    Err(JsError::new(&format!(
-        "record value at index {i} must be a number, string, BigInt or Uint8Array"
-    )))
+    use crate::writer::mdf_writer::simple::{record_value, PlainValue};
+
+    let (text, bytes);
+    let plain = if v.as_bool().is_some() {
+        PlainValue::Bool
+    } else if let Some(s) = v.as_string() {
+        text = s;
+        PlainValue::Text(&text)
+    } else if let Some(array) = v.dyn_ref::<Uint8Array>() {
+        bytes = array.to_vec();
+        PlainValue::Bytes(&bytes)
+    } else if let Some(b) = v.dyn_ref::<js_sys::BigInt>() {
+        match (i64::try_from(b.clone()), u64::try_from(b.clone())) {
+            (Ok(n), _) => PlainValue::Int(n as i128),
+            (_, Ok(n)) => PlainValue::Int(n as i128),
+            // Outside the 64-bit range: out of range for every channel.
+            _ => PlainValue::Int(i128::MAX),
+        }
+    } else if let Some(f) = v.as_f64() {
+        PlainValue::Float(f)
+    } else {
+        PlainValue::Other
+    };
+    record_value(plain, dt, i).map_err(err_to_js)
 }
 
 #[wasm_bindgen(js_class = MdfWriter)]

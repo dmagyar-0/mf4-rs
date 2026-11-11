@@ -25,9 +25,8 @@ def w_mf4rs_loop(n=100_000):
     for name in chans: w.add_float_channel(cg, name)
     w.start_data_block(cg)
     cols = list(chans.values())
-    fv = mf4_rs.create_float_value
     for i in range(n):
-        w.write_record(cg, [fv(t[i]), fv(cols[0][i]), fv(cols[1][i]), fv(cols[2][i]), fv(cols[3][i])])
+        w.write_record(cg, [t[i], cols[0][i], cols[1][i], cols[2][i], cols[3][i]])
     w.finish_data_block(cg); w.finalize()
 
 def w_mf4rs_cols():

@@ -8,6 +8,75 @@
 use super::MdfWriter;
 use crate::blocks::common::DataType;
 use crate::error::MdfError;
+use crate::parsing::decoder::DecodedValue;
+
+/// A record value as a dynamically typed binding (Python, JavaScript) hands
+/// it over, before it is matched against its channel's data type.
+pub(crate) enum PlainValue<'a> {
+    /// An integer (`int`, `bigint`).
+    Int(i128),
+    /// A floating-point number (`float`, `number`).
+    Float(f64),
+    Text(&'a str),
+    Bytes(&'a [u8]),
+    /// A boolean — never a valid record value.
+    Bool,
+    /// Anything else — never a valid record value.
+    Other,
+}
+
+/// Turn a binding's plain value into the [`DecodedValue`] a channel of
+/// `data_type` encodes. The one place the coercion rules live, so Python and
+/// TypeScript accept and refuse exactly the same values:
+///
+/// * float channels take any number;
+/// * integer channels take integers, and numbers with an integral value, that
+///   are in range — never fractions, `NaN` or (for unsigned) negatives;
+/// * text channels take text, `ByteArray` channels take bytes;
+/// * booleans are refused.
+pub(crate) fn record_value(value: PlainValue<'_>, data_type: &DataType, index: usize) -> Result<DecodedValue, MdfError> {
+    let refuse = |expected: &str| {
+        MdfError::InvalidArgument(format!(
+            "record value at index {index} must be {expected} for a {} channel",
+            data_type.name()
+        ))
+    };
+    match data_type {
+        DataType::FloatLE | DataType::FloatBE => match value {
+            PlainValue::Float(f) => Ok(DecodedValue::Float(f)),
+            PlainValue::Int(i) => Ok(DecodedValue::Float(i as f64)),
+            _ => Err(refuse("a number")),
+        },
+        DataType::UnsignedIntegerLE | DataType::UnsignedIntegerBE => {
+            let expected = "a non-negative integer";
+            match value {
+                PlainValue::Int(i) => u64::try_from(i).map(DecodedValue::UnsignedInteger).map_err(|_| refuse(expected)),
+                PlainValue::Float(f) if f.fract() == 0.0 && (0.0..18446744073709551616.0).contains(&f) => {
+                    Ok(DecodedValue::UnsignedInteger(f as u64))
+                }
+                _ => Err(refuse(expected)),
+            }
+        }
+        DataType::SignedIntegerLE | DataType::SignedIntegerBE => {
+            let expected = "an integer";
+            match value {
+                PlainValue::Int(i) => i64::try_from(i).map(DecodedValue::SignedInteger).map_err(|_| refuse(expected)),
+                PlainValue::Float(f) if f.fract() == 0.0 && (-9223372036854775808.0..9223372036854775808.0).contains(&f) => {
+                    Ok(DecodedValue::SignedInteger(f as i64))
+                }
+                _ => Err(refuse(expected)),
+            }
+        }
+        dt if dt.is_string() => match value {
+            PlainValue::Text(s) => Ok(DecodedValue::String(s.to_string())),
+            _ => Err(refuse("a string")),
+        },
+        _ => match value {
+            PlainValue::Bytes(b) => Ok(DecodedValue::ByteArray(b.to_vec())),
+            _ => Err(refuse("bytes")),
+        },
+    }
+}
 
 impl MdfWriter {
     /// Set the measurement start time (nanoseconds since the Unix epoch, UTC).
@@ -28,13 +97,18 @@ impl MdfWriter {
         Ok(cg_id)
     }
 
-    /// Add a channel of `data_type` with that type's default width, and
-    /// return its id. Text types are written as variable-length channels.
+    /// Add a channel of `data_type` and return its id.
+    ///
+    /// Numeric types get their default width — **32 bits** for integers and
+    /// floats (use `add_float_channel` / `add_int_channel` / `add_sint_channel`
+    /// for 64-bit channels); a value that does not fit is refused by
+    /// `write_record`. Text types and `ByteArray` are written as
+    /// variable-length channels, text in the type's own encoding.
     ///
     /// Channels are laid out in the order they are added; `write_record`
     /// expects one value per channel in that order.
     pub fn add_channel(&mut self, group_id: &str, name: &str, data_type: DataType) -> Result<String, MdfError> {
-        if data_type.is_string() {
+        if data_type.is_string() || data_type == DataType::ByteArray {
             return self.add_vlsd_channel(group_id, name, data_type);
         }
         let bits = data_type.default_bits();
