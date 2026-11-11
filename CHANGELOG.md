@@ -1,3 +1,11 @@
+## v4.0.0 — 2026-11-11
+
+### BREAKING CHANGES
+- unify the Rust, Python and TypeScript APIs on one contract (#96)
+
+### Features
+- unify the Rust, Python and TypeScript APIs on one contract (#96)
+
 ## v3.8.0 — 2026-10-28
 
 ### Features
