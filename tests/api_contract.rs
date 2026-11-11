@@ -667,3 +667,51 @@ fn integers_are_never_truncated() -> Result<(), MdfError> {
     w.finish_data_block(&g)?;
     w.finalize()
 }
+
+#[test]
+fn a_refused_record_leaves_no_trace() -> Result<(), MdfError> {
+    let dir = tempfile::tempdir().map_err(MdfError::IOError)?;
+    let path = dir.path().join("refused.mf4");
+    let mut w = MdfWriter::new(path.to_str().unwrap())?;
+    w.init_mdf_file()?;
+    let g = w.add_channel_group(None)?;
+    w.add_time_channel(&g, "t")?;
+    w.add_string_channel(&g, "s")?;
+    w.add_channel(&g, "u", DataType::UnsignedIntegerLE)?;
+    w.start_data_block(&g)?;
+    let record = |t: f64, s: &str, u: u64| {
+        [DecodedValue::Float(t), DecodedValue::String(s.to_string()), DecodedValue::UnsignedInteger(u)]
+    };
+    w.write_record(&g, &record(0.0, "a", 1))?;
+    // The text value is encoded before the integer is refused.
+    assert!(w.write_record(&g, &record(1.0, "ORPHAN", 1 << 33)).is_err());
+    w.write_record(&g, &record(2.0, "b", 2))?;
+    // A batch that fails midway keeps the records before the refused one.
+    let batch = [record(3.0, "c", 3), record(4.0, "ORPHAN", 1 << 33), record(5.0, "never", 5)];
+    assert!(w.write_records(&g, batch.iter().map(|r| r.as_slice())).is_err());
+    w.write_record(&g, &record(6.0, "d", 6))?;
+    w.finish_data_block(&g)?;
+
+    let g = w.add_channel_group(None)?;
+    w.add_channel(&g, "n", DataType::UnsignedIntegerLE)?;
+    w.start_data_block(&g)?;
+    let batch: [&[u64]; 3] = [&[1], &[2], &[1 << 40]];
+    assert!(w.write_records_u64(&g, batch).is_err());
+    w.write_record_u64(&g, &[7])?;
+    w.finish_data_block(&g)?;
+    w.finalize()?;
+
+    let path = path.to_str().unwrap();
+    let mdf = Mdf::from_file(path)?;
+    let index = MdfIndex::from_file(path)?;
+    for signal in [mdf.read("s", None)?, index.read("s", None)?] {
+        let text: Vec<_> = signal.values.iter().map(|v| format!("{v:?}")).collect();
+        assert_eq!(signal.timestamps, [0.0, 2.0, 3.0, 6.0]);
+        assert_eq!(text.len(), 4, "{text:?}");
+        assert!(!text.iter().any(|t| t.contains("ORPHAN")), "{text:?}");
+    }
+    assert_eq!(mdf.values("u", None)?, [1.0, 2.0, 3.0, 6.0]);
+    assert_eq!(mdf.values("n", None)?, [1.0, 2.0, 7.0]);
+    assert_eq!(index.values("n", None)?, [1.0, 2.0, 7.0]);
+    Ok(())
+}

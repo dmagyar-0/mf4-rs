@@ -526,7 +526,7 @@ This section documents tested interoperability and differences between `mf4-rs` 
 | JSON index system | Yes (unique to mf4-rs) | No equivalent |
 | Byte range calculation | Yes (for HTTP range requests) | No equivalent |
 | Data block auto-splitting | Yes (at 4MB boundary) | Yes |
-| String channels (write) | Via Rust API only (not in Python bindings) | Via numpy byte-string arrays |
+| String channels (write) | `add_string_channel` / text types via `add_channel` (variable-length), in all three languages | Via numpy byte-string arrays |
 
 ### Python API Surface
 

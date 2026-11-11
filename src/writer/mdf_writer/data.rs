@@ -192,7 +192,25 @@ fn encode_values(
 /// per-channel buffers in `dt.vlsd_payloads` and writing the running offset
 /// into `dt.record_buf`. Non-VLSD channels are encoded in-place via
 /// `ChannelEncoder::encode`.
+///
+/// All or nothing: if any value is refused, the payloads appended for earlier
+/// VLSD channels of the same record are rolled back, so a refused record
+/// leaves no trace in the `##SD` streams.
 fn encode_record(dt: &mut super::OpenDataBlock, values: &[DecodedValue]) -> Result<(), MdfError> {
+    let payload_lengths: Vec<Option<usize>> =
+        dt.vlsd_payloads.iter().map(|p| p.as_ref().map(Vec::len)).collect();
+    let result = encode_record_values(dt, values);
+    if result.is_err() {
+        for (payload, length) in dt.vlsd_payloads.iter_mut().zip(payload_lengths) {
+            if let (Some(payload), Some(length)) = (payload.as_mut(), length) {
+                payload.truncate(length);
+            }
+        }
+    }
+    result
+}
+
+fn encode_record_values(dt: &mut super::OpenDataBlock, values: &[DecodedValue]) -> Result<(), MdfError> {
     for (i, val) in values.iter().enumerate() {
         match &dt.encoders[i] {
             ChannelEncoder::VlsdOffset { offset, channel_index } => {
@@ -503,15 +521,19 @@ impl MdfWriter {
                 && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
         };
 
+        // Encode first: a refused record must not start a new block.
+        {
+            let dt = self.open_dts.get_mut(cg_id).unwrap();
+            dt.record_buf.copy_from_slice(&dt.record_template);
+            encode_record(dt, values)?;
+        }
+
         if potential_new_block {
             let mut empty = Vec::new();
             self.split_dt_block(cg_id, &mut empty)?;
         }
 
         let dt = self.open_dts.get_mut(cg_id).unwrap();
-        dt.record_buf.copy_from_slice(&dt.record_template);
-        encode_record(dt, values)?;
-
         self.file.write_all(&dt.record_buf)?;
         dt.record_count += 1;
         self.offset += dt.record_buf.len() as u64;
@@ -570,16 +592,21 @@ impl MdfWriter {
                 && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
         };
 
+        // Encode first: a refused record must not start a new block.
+        {
+            let dt = self.open_dts.get_mut(cg_id).unwrap();
+            dt.record_buf.copy_from_slice(&dt.record_template);
+            for (enc, &v) in dt.encoders.iter().zip(values.iter()) {
+                enc.encode_u64(&mut dt.record_buf, v)?;
+            }
+        }
+
         if potential_new_block {
             let mut empty = Vec::new();
             self.split_dt_block(cg_id, &mut empty)?;
         }
 
         let dt = self.open_dts.get_mut(cg_id).unwrap();
-        dt.record_buf.copy_from_slice(&dt.record_template);
-        for (enc, &v) in dt.encoders.iter().zip(values.iter()) {
-            enc.encode_u64(&mut dt.record_buf, v)?;
-        }
         self.file.write_all(&dt.record_buf)?;
         dt.record_count += 1;
         self.offset += dt.record_buf.len() as u64;
@@ -613,13 +640,23 @@ impl MdfWriter {
                     && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
             };
 
+            // Encode first; on a refused record, keep the records already
+            // accepted (they are counted) and stop.
+            let encoded = {
+                let dt = self.open_dts.get_mut(cg_id).unwrap();
+                dt.record_buf.copy_from_slice(&dt.record_template);
+                encode_record(dt, record)
+            };
+            if let Err(error) = encoded {
+                self.flush_records(&mut buffer)?;
+                return Err(error);
+            }
+
             if potential_new_block {
                 self.split_dt_block(cg_id, &mut buffer)?;
             }
 
             let dt = self.open_dts.get_mut(cg_id).unwrap();
-            dt.record_buf.copy_from_slice(&dt.record_template);
-            encode_record(dt, record)?;
             buffer.extend_from_slice(&dt.record_buf);
             dt.record_count += 1;
         }
@@ -665,15 +702,26 @@ impl MdfWriter {
                     && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
             };
 
+            // Encode first; on a refused record, keep the records already
+            // accepted (they are counted) and stop.
+            let encoded = {
+                let dt = self.open_dts.get_mut(cg_id).unwrap();
+                dt.record_buf.copy_from_slice(&dt.record_template);
+                dt.encoders
+                    .iter()
+                    .zip(rec.iter())
+                    .try_for_each(|(enc, &v)| enc.encode_u64(&mut dt.record_buf, v))
+            };
+            if let Err(error) = encoded {
+                self.flush_records(&mut buffer)?;
+                return Err(error);
+            }
+
             if potential_new_block {
                 self.split_dt_block(cg_id, &mut buffer)?;
             }
 
             let dt = self.open_dts.get_mut(cg_id).unwrap();
-            dt.record_buf.copy_from_slice(&dt.record_template);
-            for (enc, &v) in dt.encoders.iter().zip(rec.iter()) {
-                enc.encode_u64(&mut dt.record_buf, v)?;
-            }
             buffer.extend_from_slice(&dt.record_buf);
             dt.record_count += 1;
         }
@@ -681,6 +729,16 @@ impl MdfWriter {
         if !buffer.is_empty() {
             self.file.write_all(&buffer)?;
             self.offset += buffer.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Write buffered, already counted records to the file.
+    fn flush_records(&mut self, buffer: &mut Vec<u8>) -> Result<(), MdfError> {
+        if !buffer.is_empty() {
+            self.file.write_all(buffer)?;
+            self.offset += buffer.len() as u64;
+            buffer.clear();
         }
         Ok(())
     }

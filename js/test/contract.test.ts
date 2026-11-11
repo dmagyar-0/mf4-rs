@@ -446,3 +446,29 @@ test("writeRecord accepts and refuses the same values as Python", () => {
   }
   w.dispose();
 });
+
+test("a refused record leaves no trace", async () => {
+  // The text value is encoded before the integer is refused; it must not
+  // stay behind in the file.
+  const w = new MdfWriter();
+  w.initMdfFile();
+  const g = w.addChannelGroup();
+  w.addTimeChannel(g, "t");
+  w.addStringChannel(g, "s");
+  w.addChannel(g, "u", "UnsignedIntegerLE");
+  w.startDataBlock(g);
+  w.writeRecord(g, [0, "a", 1]);
+  assert.throws(() => w.writeRecord(g, [1, "ORPHAN", 2 ** 33]));
+  w.writeRecord(g, [2, "b", 2]);
+  w.finishDataBlock(g);
+  const bytes = w.finalize();
+  w.dispose();
+  const mdf = Mdf.fromBytes(bytes);
+  const index = MdfIndex.fromBytes(bytes);
+  for (const signal of [mdf.read("s"), await index.read("s")]) {
+    assert.deepEqual(signal.values, ["a", "b"]);
+    assert.deepEqual(Array.from(signal.timestamps), [0, 2]);
+  }
+  mdf.dispose();
+  index.dispose();
+});

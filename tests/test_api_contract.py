@@ -465,6 +465,33 @@ def test_write_record_coercion():
             assert ok == case["ok"], f"write_record({case['channel']}, {case['value']}) ok={ok}, expected {case['ok']}"
 
 
+def test_refused_record_leaves_no_trace():
+    """A record refused halfway (text already encoded, then an integer that
+    does not fit) must not leave its text value in the file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "refused.mf4")
+        w = mf4_rs.MdfWriter(path)
+        w.init_mdf_file()
+        g = w.add_channel_group()
+        w.add_time_channel(g, "t")
+        w.add_string_channel(g, "s")
+        w.add_channel(g, "u", "UnsignedIntegerLE")
+        w.start_data_block(g)
+        w.write_record(g, [0.0, "a", 1])
+        try:
+            w.write_record(g, [1.0, "ORPHAN", 2**33])
+        except mf4_rs.MdfException:
+            pass
+        else:
+            raise AssertionError("out-of-range value accepted")
+        w.write_record(g, [2.0, "b", 2])
+        w.finish_data_block(g)
+        w.finalize()
+        for reader in (mf4_rs.Mdf.from_file(path), mf4_rs.MdfIndex.from_file(path)):
+            signal = reader.read("s")
+            assert list(signal.values) == ["a", "b"] and list(signal.timestamps) == [0.0, 2.0], signal.values
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

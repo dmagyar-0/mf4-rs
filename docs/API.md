@@ -120,7 +120,7 @@ const lazySpeed = await index.read("Speed");               // range requests hap
 |---|---|---|
 | `read(name, options?)` | `Signal` | Values with conversions applied, paired with the group's time axis. |
 | `values(name, options?)` | `float64` array | Just the numbers — no timestamps. Invalid and non-numeric samples are `NaN`. |
-| `time_range(name, group?)` | `TimeRange` or nothing | First and last master (time) value of the channel's group; nothing for an empty group. On `MdfIndex` this reads two records. |
+| `time_range(name, group?)` | `TimeRange` or nothing | First and last master (time) value of the channel's group; nothing for an empty group, an error for a non-empty group without a master. On `MdfIndex` this reads two records. |
 | `conversion(name, group?)` | `ConversionInfo` or nothing | The conversion `read` / `values` apply, fully resolved. |
 
 `options` is a `ReadOptions`:
@@ -259,7 +259,8 @@ same values (the rules live once, in the Rust core):
 - text channels take text only, `ByteArray` channels bytes only;
 - booleans are refused.
 
-A refused value is an error. Integers are never silently truncated, on any
+A refused value is an error, and the record it belongs to is not written at
+all — the writer stays usable. Integers are never silently truncated, on any
 write path (`write_record` and `write_columns` alike); a float written to a
 32-bit float channel is rounded to `float32` as usual. Columns are `numpy` arrays (`float64`, `float32`,
 `uint64`, `int64`), typed arrays (`Float64Array`, `Float32Array`,

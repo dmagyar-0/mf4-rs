@@ -19,9 +19,6 @@ import type {
   TimeRange,
 } from "./types";
 
-/** Initial prefix fetched before the build loop — metadata usually starts at
- * the front of the file, so seeding this often completes the build in one or
- * two round-trips. */
 /**
  * Read `[offset, offset + length)` and insist on getting all of it: a short
  * read would otherwise look like a gap that never closes.
@@ -37,6 +34,9 @@ async function readExact(source: RangeSource, offset: number, length: number): P
   return bytes;
 }
 
+/** Initial prefix fetched before the build loop — metadata usually starts at
+ * the front of the file, so seeding this often completes the build in one or
+ * two round-trips. */
 const BUILD_SEED_BYTES = 256 * 1024;
 /** Base bytes fetched per build round-trip, and the window the read-ahead
  * heuristic falls back to whenever the walk jumps to a new metadata cluster
