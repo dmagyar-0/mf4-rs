@@ -53,6 +53,8 @@ impl ChannelMeta {
 
 #[derive(Debug, Clone)]
 struct GroupMeta {
+    /// Acquisition name of the source group (kept, but not part of `matches`).
+    name: Option<String>,
     record_id_len: u8,
     channels: Vec<ChannelMeta>,
 }
@@ -205,7 +207,11 @@ fn collect_groups(file: &MdfFile, src_file: usize) -> Result<Vec<MergedGroup>, M
                 }
             }
             groups.push(MergedGroup {
-                meta: GroupMeta { record_id_len, channels: metas },
+                meta: GroupMeta {
+                    name: read_string_block(mmap, cg.block.acq_name_addr)?,
+                    record_id_len,
+                    channels: metas,
+                },
                 data,
                 src_file,
             });
@@ -270,6 +276,10 @@ pub fn merge_files(output: &str, first: &str, second: &str) -> Result<(), MdfErr
 
     for group in groups {
         let cg_id = writer.add_channel_group_with(None, |_| {})?;
+        // Groups are addressed by name; keep the source group's.
+        if let Some(name) = &group.meta.name {
+            writer.set_channel_group_name(&cg_id, name)?;
+        }
         let src_mmap = mmaps[group.src_file];
         let cache = &mut caches[group.src_file];
         let mut last_cn: Option<String> = None;

@@ -689,6 +689,10 @@ fn a_refused_record_leaves_no_trace() -> Result<(), MdfError> {
     // A batch that fails midway keeps the records before the refused one.
     let batch = [record(3.0, "c", 3), record(4.0, "ORPHAN", 1 << 33), record(5.0, "never", 5)];
     assert!(w.write_records(&g, batch.iter().map(|r| r.as_slice())).is_err());
+    // …also when the refused record merely has the wrong number of values.
+    let short = [DecodedValue::Float(8.0)];
+    let first = record(7.0, "e", 7);
+    assert!(w.write_records(&g, [first.as_slice(), short.as_slice()]).is_err());
     w.write_record(&g, &record(6.0, "d", 6))?;
     w.finish_data_block(&g)?;
 
@@ -696,6 +700,9 @@ fn a_refused_record_leaves_no_trace() -> Result<(), MdfError> {
     w.add_channel(&g, "n", DataType::UnsignedIntegerLE)?;
     w.start_data_block(&g)?;
     let batch: [&[u64]; 3] = [&[1], &[2], &[1 << 40]];
+    assert!(w.write_records_u64(&g, batch).is_err());
+    // A record with the wrong number of values is refused the same way.
+    let batch: [&[u64]; 3] = [&[3], &[4, 5], &[6]];
     assert!(w.write_records_u64(&g, batch).is_err());
     w.write_record_u64(&g, &[7])?;
     w.finish_data_block(&g)?;
@@ -706,12 +713,12 @@ fn a_refused_record_leaves_no_trace() -> Result<(), MdfError> {
     let index = MdfIndex::from_file(path)?;
     for signal in [mdf.read("s", None)?, index.read("s", None)?] {
         let text: Vec<_> = signal.values.iter().map(|v| format!("{v:?}")).collect();
-        assert_eq!(signal.timestamps, [0.0, 2.0, 3.0, 6.0]);
-        assert_eq!(text.len(), 4, "{text:?}");
+        assert_eq!(signal.timestamps, [0.0, 2.0, 3.0, 7.0, 6.0]);
+        assert_eq!(text.len(), 5, "{text:?}");
         assert!(!text.iter().any(|t| t.contains("ORPHAN")), "{text:?}");
     }
-    assert_eq!(mdf.values("u", None)?, [1.0, 2.0, 3.0, 6.0]);
-    assert_eq!(mdf.values("n", None)?, [1.0, 2.0, 7.0]);
-    assert_eq!(index.values("n", None)?, [1.0, 2.0, 7.0]);
+    assert_eq!(mdf.values("u", None)?, [1.0, 2.0, 3.0, 7.0, 6.0]);
+    assert_eq!(mdf.values("n", None)?, [1.0, 2.0, 3.0, 7.0]);
+    assert_eq!(index.values("n", None)?, [1.0, 2.0, 3.0, 7.0]);
     Ok(())
 }

@@ -401,3 +401,33 @@ fn merge_vlsd_bytearray_files() -> Result<(), MdfError> {
     for p in [&f1, &f2, &out] { std::fs::remove_file(p)?; }
     Ok(())
 }
+
+#[test]
+fn merge_keeps_group_names() -> Result<(), MdfError> {
+    use mf4_rs::{DecodedValue, Mdf, MdfWriter};
+    let dir = tempfile::tempdir().map_err(MdfError::IOError)?;
+    let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+    for (file, extra) in [("a.mf4", "Other"), ("b.mf4", "Third")] {
+        let mut w = MdfWriter::new(&path(file))?;
+        w.init_mdf_file()?;
+        for (group, channel) in [("Engine", "Speed"), (extra, extra)] {
+            let g = w.add_channel_group(Some(group))?;
+            w.add_time_channel(&g, "Time")?;
+            w.add_float_channel(&g, channel)?;
+            w.start_data_block(&g)?;
+            w.write_record(&g, &[DecodedValue::Float(0.0), DecodedValue::Float(1.0)])?;
+            w.finish_data_block(&g)?;
+        }
+        w.finalize()?;
+    }
+    merge_files(&path("out.mf4"), &path("a.mf4"), &path("b.mf4"))?;
+
+    let merged = Mdf::from_file(&path("out.mf4"))?;
+    let names: Vec<_> = merged.groups()?.into_iter().map(|g| (g.name, g.record_count)).collect();
+    assert_eq!(
+        names,
+        [(Some("Engine".to_string()), 2), (Some("Other".to_string()), 1), (Some("Third".to_string()), 1)]
+    );
+    assert_eq!(merged.values("Speed", &mf4_rs::ReadOptions::new().group("Engine"))?, [1.0, 1.0]);
+    Ok(())
+}

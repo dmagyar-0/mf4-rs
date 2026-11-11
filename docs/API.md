@@ -290,8 +290,9 @@ w.finalize()
 | `merge_files(output, first, second)` | ✓ | ✓ | | Concatenate two files; groups with identical layouts are joined. |
 | `FileLayout` | ✓ | ✓ | | Block-level layout inspector (`from_file`, `to_text`, `to_tree`, `to_json`). |
 
-`to_column_oriented` options are `block_size`, `memory_budget` and
-`share_identical_time` (merge byte-identical time axes); the report has
+`to_column_oriented` options are `block_size`, `memory_budget`,
+`read_chunk_size` and `share_identical_time` (merge byte-identical time
+axes); the report has
 `source_groups`, `time_groups`, `signal_groups`, `shared_time_groups`,
 `data_blocks`, `metadata_size`, `file_size` and `skipped_channels`. TypeScript
 takes and returns bytes (`toColumnOriented(bytes, options)` →

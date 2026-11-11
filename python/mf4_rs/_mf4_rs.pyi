@@ -860,7 +860,7 @@ def merge_files(output:builtins.str, first:builtins.str, second:builtins.str) ->
     """
     ...
 
-def to_column_oriented(input_path:builtins.str, output_path:builtins.str, block_size:typing.Optional[builtins.int] = None, memory_budget:typing.Optional[builtins.int] = None, share_identical_time:typing.Optional[builtins.bool] = None) -> ColumnReport:
+def to_column_oriented(input_path:builtins.str, output_path:builtins.str, block_size:typing.Optional[builtins.int] = None, memory_budget:typing.Optional[builtins.int] = None, share_identical_time:typing.Optional[builtins.bool] = None, read_chunk_size:typing.Optional[builtins.int] = None) -> ColumnReport:
     r"""
     Rewrite an MDF 4 file as a column-oriented MDF 4.20 file optimised for
     reading single signals from cloud storage.
@@ -892,6 +892,8 @@ def to_column_oriented(input_path:builtins.str, output_path:builtins.str, block_
     share_identical_time : bool, optional
         Default ``True``. Merge byte-identical time axes of different source groups into one
         time channel group.
+    read_chunk_size : int, optional
+        Bytes read from the source per step (default 4 MiB).
     
     Returns
     -------

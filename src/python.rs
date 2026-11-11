@@ -1433,15 +1433,16 @@ pub struct PyColumnReport {
 impl PyColumnReport {
     fn __repr__(&self) -> String {
         format!(
-            "ColumnReport(signal_groups={}, time_groups={}, shared_time_groups={}, \
-             data_blocks={}, metadata_size={}, file_size={}, skipped_channels={})",
+            "ColumnReport(source_groups={}, signal_groups={}, time_groups={}, shared_time_groups={}, \
+             data_blocks={}, metadata_size={}, file_size={}, skipped_channels={:?})",
+            self.source_groups,
             self.signal_groups,
             self.time_groups,
             self.shared_time_groups,
             self.data_blocks,
             self.metadata_size,
             self.file_size,
-            self.skipped_channels.len()
+            self.skipped_channels
         )
     }
 }
@@ -1491,6 +1492,8 @@ impl From<crate::column::ColumnReport> for PyColumnReport {
 /// share_identical_time : bool, optional
 ///     Default ``True``. Merge byte-identical time axes of different source groups into one
 ///     time channel group.
+/// read_chunk_size : int, optional
+///     Bytes read from the source per step (default 4 MiB).
 ///
 /// Returns
 /// -------
@@ -1515,13 +1518,14 @@ fn to_column_oriented(
     block_size: Option<u64>,
     memory_budget: Option<u64>,
     share_identical_time: Option<bool>,
+    read_chunk_size: Option<u64>,
 ) -> PyResult<PyColumnReport> {
     let defaults = crate::column::ColumnOptions::default();
     let options = crate::column::ColumnOptions {
         block_size: block_size.unwrap_or(defaults.block_size),
         memory_budget: memory_budget.unwrap_or(defaults.memory_budget),
         share_identical_time: share_identical_time.unwrap_or(defaults.share_identical_time),
-        ..defaults
+        read_chunk_size: read_chunk_size.unwrap_or(defaults.read_chunk_size),
     };
     let report = py.allow_threads(|| {
         crate::column::to_column_oriented(input_path, output_path, &options)

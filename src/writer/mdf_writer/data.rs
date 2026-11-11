@@ -629,16 +629,21 @@ impl MdfWriter {
         let max_records = (MAX_DT_BLOCK_SIZE - 24) / record_size;
         let mut buffer = Vec::with_capacity(record_size * max_records);
         for record in records {
-            let potential_new_block = {
+            let (count_matches, potential_new_block) = {
                 let dt = self.open_dts.get(cg_id).ok_or_else(|| {
                     MdfError::BlockSerializationError("no open DT block for this channel group".into())
                 })?;
-                if record.len() != dt.channels.len() {
-                    return Err(MdfError::BlockSerializationError("value count mismatch".into()));
-                }
-                dt.record_count > 0
-                    && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
+                (
+                    !(record.len() != dt.channels.len()),
+                    dt.record_count > 0
+                        && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE,
+                )
             };
+            if !count_matches {
+                // Keep the records already accepted (they are counted).
+                self.flush_records(&mut buffer)?;
+                return Err(MdfError::BlockSerializationError("value count mismatch".into()));
+            }
 
             // Encode first; on a refused record, keep the records already
             // accepted (they are counted) and stop.
@@ -691,16 +696,21 @@ impl MdfWriter {
         let max_records = (MAX_DT_BLOCK_SIZE - 24) / record_size;
         let mut buffer = Vec::with_capacity(record_size * max_records);
         for rec in records {
-            let potential_new_block = {
+            let (count_matches, potential_new_block) = {
                 let dt = self.open_dts.get(cg_id).ok_or_else(|| {
                     MdfError::BlockSerializationError("no open DT block for this channel group".into())
                 })?;
-                if rec.len() != dt.encoders.len() {
-                    return Err(MdfError::BlockSerializationError("value count mismatch".into()));
-                }
-                dt.record_count > 0
-                    && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
+                (
+                    !(rec.len() != dt.encoders.len()),
+                    dt.record_count > 0
+                        && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE,
+                )
             };
+            if !count_matches {
+                // Keep the records already accepted (they are counted).
+                self.flush_records(&mut buffer)?;
+                return Err(MdfError::BlockSerializationError("value count mismatch".into()));
+            }
 
             // Encode first; on a refused record, keep the records already
             // accepted (they are counted) and stop.
@@ -809,16 +819,21 @@ impl MdfWriter {
         let max_records = (MAX_DT_BLOCK_SIZE - 24) / record_size;
         let mut buffer = Vec::with_capacity(record_size * max_records);
         for rec in records {
-            let potential_new_block = {
+            let (count_matches, potential_new_block) = {
                 let dt = self.open_dts.get(cg_id).ok_or_else(|| {
                     MdfError::BlockSerializationError("no open DT block for this channel group".into())
                 })?;
-                if rec.len() != dt.encoders.len() {
-                    return Err(MdfError::BlockSerializationError("value count mismatch".into()));
-                }
-                dt.record_count > 0
-                    && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE
+                (
+                    !(rec.len() != dt.encoders.len()),
+                    dt.record_count > 0
+                        && 24 + dt.record_size * (dt.record_count as usize + 1) > MAX_DT_BLOCK_SIZE,
+                )
             };
+            if !count_matches {
+                // Keep the records already accepted (they are counted).
+                self.flush_records(&mut buffer)?;
+                return Err(MdfError::BlockSerializationError("value count mismatch".into()));
+            }
 
             if potential_new_block {
                 self.split_dt_block(cg_id, &mut buffer)?;
