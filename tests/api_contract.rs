@@ -249,10 +249,10 @@ macro_rules! impl_reader {
                 self.$meta().start_time_ns()
             }
             fn read(&mut self, name: &str, options: &ReadOptions) -> Result<Signal, MdfError> {
-                self.read(name, options)
+                <$ty>::read(self, name, options)
             }
             fn values(&mut self, name: &str, options: &ReadOptions) -> Result<Vec<f64>, MdfError> {
-                self.values(name, options)
+                <$ty>::values(self, name, options)
             }
             fn time_range(&mut self, name: &str, group: Option<&str>) -> Result<Option<TimeRange>, MdfError> {
                 <$ty>::time_range(self, name, group)
