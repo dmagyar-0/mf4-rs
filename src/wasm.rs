@@ -598,14 +598,14 @@ impl WasmMdf {
     #[wasm_bindgen(js_name = values)]
     pub fn values(&self, name: &str, group: Option<String>, window: JsValue) -> Result<Vec<f64>, JsError> {
         let options = read_options(group, window)?;
-        self.mdf.values_with(name, &options).map_err(err_to_js)
+        self.mdf.values(name, &options).map_err(err_to_js)
     }
 
     /// Read a channel as a `Signal` object. `window` is a `ReadWindow` object.
     #[wasm_bindgen(js_name = read)]
     pub fn read(&self, name: &str, group: Option<String>, window: JsValue) -> Result<JsValue, JsError> {
         let options = read_options(group, window)?;
-        signal_to_js(self.mdf.read_with(name, &options).map_err(err_to_js)?)
+        signal_to_js(self.mdf.read(name, &options).map_err(err_to_js)?)
     }
 
     /// `{ start, end }` of the group's master (time) channel, or `undefined`
@@ -1054,7 +1054,7 @@ impl WasmMdfIndex {
         let reader = build_fragment_reader(&ranges, &fragments)?;
         let mut bound = self.index.open(reader);
         let options = ReadOptions { group, ..ReadOptions::default() };
-        bound.values_with(name, &options).map_err(err_to_js)
+        bound.values(name, &options).map_err(err_to_js)
     }
 
     /// Decode a channel to a `{ name, unit, timestamps, values }` object from
@@ -1073,7 +1073,7 @@ impl WasmMdfIndex {
         let reader = build_fragment_reader(&ranges, &fragments)?;
         let mut bound = self.index.open(reader);
         let options = ReadOptions { group, ..ReadOptions::default() };
-        signal_to_js(bound.read_with(name, &options).map_err(err_to_js)?)
+        signal_to_js(bound.read(name, &options).map_err(err_to_js)?)
     }
 }
 

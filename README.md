@@ -18,7 +18,7 @@ speed = mdf.read("Speed", group="Engine")
 ```
 ```rust
 let mdf = Mdf::from_file("recording.mf4")?;         // Rust
-let speed = mdf.read_with("Speed", &ReadOptions::new().group("Engine"))?;
+let speed = mdf.read("Speed", &ReadOptions::new().group("Engine"))?;
 ```
 ```ts
 const mdf = await Mdf.fromFile("recording.mf4");    // TypeScript
@@ -149,11 +149,11 @@ for group in mdf.groups()? {
     println!("{:?}: {} records, channels {:?}", group.name, group.record_count, group.channel_names);
 }
 
-let speed = mdf.read("Speed")?;          // Signal { name, unit, timestamps, values }
-let numbers = mdf.values("Speed")?;      // Vec<f64>, NaN for invalid samples
+let speed = mdf.read("Speed", None)?;    // Signal { name, unit, timestamps, values }
+let numbers = mdf.values("Speed", None)?; // Vec<f64>, NaN for invalid samples
 
 // Narrow by group and/or read only a time or record window
-let window = mdf.read_with("Speed", &ReadOptions::new().group("Engine").time(Some(1.0), Some(2.5)))?;
+let window = mdf.read("Speed", &ReadOptions::new().group("Engine").time(Some(1.0), Some(2.5)))?;
 
 mdf.time_range("Speed", None)?;          // first/last timestamp
 mdf.conversion("Speed", None)?;          // the conversion read/values apply
@@ -174,9 +174,9 @@ index.save("data_index.json")?;
 let mut index = MdfIndex::load("data_index.json")?;
 index.set_source("data.mf4");            // or "https://cdn.example.com/data.mf4"
 
-let signal = index.read("Temperature")?;
-let engine_temp = index.read_with("Temperature", &ReadOptions::new().group("Engine"))?;
-let last_minute = index.values_with("Temperature", &ReadOptions::new().time(Some(540.0), None))?;
+let signal = index.read("Temperature", None)?;
+let engine_temp = index.read("Temperature", &ReadOptions::new().group("Engine"))?;
+let last_minute = index.values("Temperature", &ReadOptions::new().time(Some(540.0), None))?;
 
 // Or index a remote file directly, fetching only its metadata (`http` feature)
 let remote = MdfIndex::from_url("https://cdn.example.com/data.mf4")?;

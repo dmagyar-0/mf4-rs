@@ -516,7 +516,7 @@ fn test_signal_and_lazy_source() -> Result<(), MdfError> {
     let index = MdfIndex::from_file(mdf_path.to_str().unwrap())?;
     assert!(index.source().is_some(), "from_file should attach a source");
 
-    let speed = index.read("Speed")?;
+    let speed = index.read("Speed", None)?;
     assert_eq!(speed.name, "Speed");
     assert_eq!(speed.values.len(), 10);
     assert_eq!(speed.timestamps.len(), 10, "Speed should carry the Time axis");
@@ -528,7 +528,7 @@ fn test_signal_and_lazy_source() -> Result<(), MdfError> {
     }
 
     // The master channel indexes itself: no separate timestamps.
-    let time = index.read("Time")?;
+    let time = index.read("Time", None)?;
     assert_eq!(time.values.len(), 10);
     assert!(!time.has_timestamps(), "master channel has no separate timestamps");
 
@@ -536,9 +536,9 @@ fn test_signal_and_lazy_source() -> Result<(), MdfError> {
     index.save(index_path.to_str().unwrap())?;
     let mut loaded = MdfIndex::load(index_path.to_str().unwrap())?;
     assert!(loaded.source().is_none(), "source must not be serialized");
-    assert!(loaded.read("Speed").is_err(), "read without a source should error");
+    assert!(loaded.read("Speed", None).is_err(), "read without a source should error");
     loaded.set_source(mdf_path.to_str().unwrap());
-    let speed2 = loaded.read("Speed")?;
+    let speed2 = loaded.read("Speed", None)?;
     assert_eq!(speed2.values_f64(), speed.values_f64());
 
     let _ = fs::remove_file(mdf_path);

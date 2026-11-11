@@ -130,7 +130,7 @@ fn vlsd_roundtrip_all_entry_points() -> Result<(), MdfError> {
 
     // (2) lazy index.read via attached source
     {
-        let sig = index.read("Msg")?;
+        let sig = index.read("Msg", None)?;
         assert_eq!(sig.values.len(), 3);
         for (v, w) in sig.values.iter().zip(expected.iter()) {
             assert_string(v, w);
@@ -149,7 +149,7 @@ fn vlsd_roundtrip_all_entry_points() -> Result<(), MdfError> {
 
     // Ensure set_file / source path also works after a manual re-attach.
     index.set_source(path_str);
-    assert_eq!(index.read("Msg")?.values.len(), 3);
+    assert_eq!(index.read("Msg", None)?.values.len(), 3);
 
     std::fs::remove_file(&path)?;
     Ok(())
@@ -195,7 +195,7 @@ fn vlsd_json_persistence() -> Result<(), MdfError> {
 
     let mut index = MdfIndex::load(json_str)?;
     index.set_source(path_str);
-    let sig = index.read("Msg")?;
+    let sig = index.read("Msg", None)?;
     assert_eq!(sig.values.len(), 3);
     assert_string(&sig.values[0], "one");
     assert_string(&sig.values[2], "three");
@@ -228,7 +228,7 @@ fn vlsd_missing_fragments_errors_with_rebuild_message() -> Result<(), MdfError> 
     let mut stripped = MdfIndex::from_json(&v.to_string())?;
     stripped.set_source(path_str);
 
-    let err = stripped.read("Msg").unwrap_err();
+    let err = stripped.read("Msg", None).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("rebuild the index"),
@@ -236,7 +236,7 @@ fn vlsd_missing_fragments_errors_with_rebuild_message() -> Result<(), MdfError> 
     );
 
     // The fixed-size Time channel still reads fine.
-    let times = stripped.read("Time")?;
+    let times = stripped.read("Time", None)?;
     assert_eq!(times.values.len(), 3);
 
     std::fs::remove_file(&path)?;
@@ -252,7 +252,7 @@ fn vlsd_signal_alignment() -> Result<(), MdfError> {
     write_vlsd_file(path_str, &payloads)?;
 
     let index = MdfIndex::from_file(path_str)?;
-    let sig = index.read("Msg")?;
+    let sig = index.read("Msg", None)?;
     assert_eq!(sig.values.len(), payloads.len());
     assert_eq!(sig.timestamps.len(), payloads.len());
     assert_eq!(sig.timestamps.len(), sig.values.len());

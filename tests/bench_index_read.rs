@@ -114,7 +114,7 @@ fn bench_index_all_paths_100k() -> Result<(), MdfError> {
         let mut data = index.open(FileRangeReader::new(p)?);
         let mut total = 0usize;
         for ch in CHANNELS {
-            total += data.values(ch)?.len();
+            total += data.values(ch, None)?.len();
         }
         assert_eq!(total, n * 4);
         times.push(start.elapsed());
@@ -129,7 +129,7 @@ fn bench_index_all_paths_100k() -> Result<(), MdfError> {
         let mut data = index.open(MmapRangeReader::new(p)?);
         let mut total = 0usize;
         for ch in CHANNELS {
-            total += data.values(ch)?.len();
+            total += data.values(ch, None)?.len();
         }
         assert_eq!(total, n * 4);
         times.push(start.elapsed());
@@ -218,7 +218,7 @@ fn bench_index_all_paths_1m() -> Result<(), MdfError> {
         let mut data = index.open(MmapRangeReader::new(p)?);
         let mut total = 0usize;
         for ch in CHANNELS {
-            total += data.values(ch)?.len();
+            total += data.values(ch, None)?.len();
         }
         assert_eq!(total, n * 4);
         times.push(start.elapsed());
@@ -275,8 +275,8 @@ fn test_index_read_paths_consistency() -> Result<(), MdfError> {
     for ch in CHANNELS {
         let vals_file = file_data.decoded_values(ch, None)?;
         let vals_mmap = mmap_data.decoded_values(ch, None)?;
-        let f64_file = file_f64.values(ch)?;
-        let f64_mmap = mmap_f64.values(ch)?;
+        let f64_file = file_f64.values(ch, None)?;
+        let f64_mmap = mmap_f64.values(ch, None)?;
 
         assert_eq!(vals_file.len(), n);
         assert_eq!(vals_mmap.len(), n);

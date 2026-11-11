@@ -15,7 +15,7 @@
       "methods": ["group", "channel", "read", "values", "time_range", "conversion", "file_layout"],
       "only": { "file_layout": ["rust", "python"] },
       "extra": {
-        "rust": ["read_with", "values_with", "channel_groups", "find_channel"],
+        "rust": ["channel_groups", "find_channel"],
         "python": [],
         "typescript": ["dispose"]
       }
@@ -31,7 +31,7 @@
       "only": {},
       "extra": {
         "rust": [
-          "read_with", "values_with", "clear_source", "from_url_with_chunk_size",
+          "clear_source", "from_url_with_chunk_size",
           "from_range_reader", "open", "open_file", "indexed_channel", "conversion_block"
         ],
         "python": [],

@@ -528,7 +528,7 @@ impl PyMDF {
     ) -> PyResult<PySignal> {
         let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count);
         // Decode without holding the GIL so other Python threads can run.
-        let signal = py.allow_threads(|| self.mdf.read_with(name, &options))?;
+        let signal = py.allow_threads(|| self.mdf.read(name, &options))?;
         PySignal::new(py, signal, self.mdf.start_time_ns())
     }
 
@@ -546,7 +546,7 @@ impl PyMDF {
         record_count: Option<u64>,
     ) -> PyResult<PyObject> {
         let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count);
-        let values = py.allow_threads(|| self.mdf.values_with(name, &options))?;
+        let values = py.allow_threads(|| self.mdf.values(name, &options))?;
         Ok(PyArray1::from_vec_bound(py, values).into())
     }
 
@@ -763,7 +763,7 @@ impl PyMdfIndex {
     ) -> PyResult<PySignal> {
         let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count);
         // Release the GIL during the (potentially blocking, e.g. HTTP) read.
-        let signal = py.allow_threads(|| self.index.read_with(name, &options))?;
+        let signal = py.allow_threads(|| self.index.read(name, &options))?;
         PySignal::new(py, signal, self.index.start_time_ns())
     }
 
@@ -781,7 +781,7 @@ impl PyMdfIndex {
         record_count: Option<u64>,
     ) -> PyResult<PyObject> {
         let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count);
-        let values = py.allow_threads(|| self.index.values_with(name, &options))?;
+        let values = py.allow_threads(|| self.index.values(name, &options))?;
         Ok(PyArray1::from_vec_bound(py, values).into())
     }
 

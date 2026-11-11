@@ -188,11 +188,11 @@ fn signals_via_mdf(path: &Path) -> Result<BTreeMap<String, Signal>, MdfError> {
     let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let mut out = BTreeMap::new();
     for (g, c) in CHANNELS {
-        let sig = match mdf.read_with(c, &mf4_rs::ReadOptions::new().group(*g)) {
+        let sig = match mdf.read(c, &mf4_rs::ReadOptions::new().group(*g)) {
             Ok(sig) => sig,
             Err(MdfError::ChannelNotFound { .. }) => {
                 let (ag, ac) = shared_alias(g, c).unwrap_or_else(|| panic!("{g}/{c} missing in {}", path.display()));
-                mdf.read_with(ac, &mf4_rs::ReadOptions::new().group(ag))?
+                mdf.read(ac, &mf4_rs::ReadOptions::new().group(ag))?
             }
             Err(e) => return Err(e),
         };
@@ -204,11 +204,11 @@ fn signals_via_mdf(path: &Path) -> Result<BTreeMap<String, Signal>, MdfError> {
 fn signals_via_index(index: &MdfIndex) -> Result<BTreeMap<String, Signal>, MdfError> {
     let mut out = BTreeMap::new();
     for (g, c) in CHANNELS {
-        let sig = match index.read_with(c, &mf4_rs::ReadOptions::new().group(*g)) {
+        let sig = match index.read(c, &mf4_rs::ReadOptions::new().group(*g)) {
             Ok(sig) => sig,
             Err(e) => {
                 let (ag, ac) = shared_alias(g, c).ok_or(e)?;
-                index.read_with(ac, &mf4_rs::ReadOptions::new().group(ag))?
+                index.read(ac, &mf4_rs::ReadOptions::new().group(ag))?
             }
         };
         out.insert(format!("{g}/{c}"), sig);
@@ -416,7 +416,7 @@ fn wrong_block_sizes_use_the_header_and_wrong_offsets_error() -> Result<(), MdfE
     let f = fixture(&small_blocks())?;
     let path = f.column.to_str().unwrap();
     let index = MdfIndex::from_file(path)?;
-    let expected = index.read_with("Speed", &mf4_rs::ReadOptions::new().group("Engine"))?;
+    let expected = index.read("Speed", &mf4_rs::ReadOptions::new().group("Engine"))?;
     let (g, _) = index
         .channel_groups
         .iter()
@@ -432,9 +432,9 @@ fn wrong_block_sizes_use_the_header_and_wrong_offsets_error() -> Result<(), MdfE
         b.size = (b.size as i64 + delta) as u64;
         for mut reloaded in [wrong.clone(), MdfIndex::from_json(&wrong.to_json()?)?] {
             reloaded.set_source(path);
-            assert_eq!(reloaded.read_with("Speed", &mf4_rs::ReadOptions::new().group("Engine"))?.values, expected.values, "size {delta:+}");
+            assert_eq!(reloaded.read("Speed", &mf4_rs::ReadOptions::new().group("Engine"))?.values, expected.values, "size {delta:+}");
             let mut bound = reloaded.open(mf4_rs::index::FileRangeReader::new(path)?);
-            assert_eq!(bound.read_with("Speed", &mf4_rs::ReadOptions::new().group("Engine")).map(|s| s.values)?, expected.values, "size {delta:+} (range reader)");
+            assert_eq!(bound.read("Speed", &mf4_rs::ReadOptions::new().group("Engine")).map(|s| s.values)?, expected.values, "size {delta:+} (range reader)");
         }
     }
 
@@ -442,10 +442,10 @@ fn wrong_block_sizes_use_the_header_and_wrong_offsets_error() -> Result<(), MdfE
     let mut wrong = index.clone();
     wrong.channel_groups[g].data_blocks[1].file_offset += 8;
     wrong.set_source(path);
-    let err = wrong.read_with("Speed", &mf4_rs::ReadOptions::new().group("Engine")).unwrap_err();
+    let err = wrong.read("Speed", &mf4_rs::ReadOptions::new().group("Engine")).unwrap_err();
     assert!(err.to_string().contains("rebuild the index"), "{err}");
     let mut bound = wrong.open(mf4_rs::index::FileRangeReader::new(path)?);
-    assert!(bound.read_with("Speed", &mf4_rs::ReadOptions::new().group("Engine")).map(|s| s.values).is_err());
+    assert!(bound.read("Speed", &mf4_rs::ReadOptions::new().group("Engine")).map(|s| s.values).is_err());
     Ok(())
 }
 
@@ -491,7 +491,7 @@ fn cloud_requests(path: &Path, group: &str, channel: &str) -> Result<(CloudCost,
     let (build_requests, build_bytes) = (calls.get(), bytes.get());
     let mut bound = index.open(cached);
     bound.reader_mut().set_bypass(true);
-    let signal = bound.read_with(channel, &mf4_rs::ReadOptions::new().group(group))?;
+    let signal = bound.read(channel, &mf4_rs::ReadOptions::new().group(group))?;
     let cost = CloudCost {
         build_requests,
         build_bytes,
@@ -717,8 +717,8 @@ fn unsorted_input_is_sorted_into_columns() -> Result<(), MdfError> {
     assert_eq!(report.time_groups, 2);
     assert_eq!(report.signal_groups, 2);
     let mdf = Mdf::from_bytes(bytes)?;
-    let a = mdf.read_with("A", &mf4_rs::ReadOptions::new().group("Fast"))?;
-    let b = mdf.read_with("B", &mf4_rs::ReadOptions::new().group("Rare"))?;
+    let a = mdf.read("A", &mf4_rs::ReadOptions::new().group("Fast"))?;
+    let b = mdf.read("B", &mf4_rs::ReadOptions::new().group("Rare"))?;
     let fast_idx: Vec<u64> = (0..30).filter(|i| i % 3 != 2).collect();
     let rare_idx: Vec<u64> = (0..30).filter(|i| i % 3 == 2).collect();
     assert_eq!(a.values, fast_idx.iter().map(|&i| Some(DecodedValue::UnsignedInteger(i))).collect::<Vec<_>>());
@@ -748,7 +748,7 @@ fn malformed_channel_offsets_are_skipped_not_panicking() -> Result<(), MdfError>
     assert!(skipped.contains("Fast/Time: lies outside the record"), "{skipped}");
     assert!(skipped.contains("Fast/A: lies outside the record"), "{skipped}");
     let mdf = Mdf::from_bytes(out)?;
-    assert_eq!(mdf.read_with("B", &mf4_rs::ReadOptions::new().group("Rare"))?.values.len(), 10);
+    assert_eq!(mdf.read("B", &mf4_rs::ReadOptions::new().group("Rare"))?.values.len(), 10);
     Ok(())
 }
 
@@ -805,7 +805,7 @@ fn attachments_and_history_are_copied_and_file_size_is_exact() -> Result<(), Mdf
     assert_eq!(&out[data..data + payload.len()], &payload[..]);
     assert_eq!(u64_at(at + 8), (24 + 4 * 8 + 40 + payload.len()) as u64);
     // Still a valid file.
-    Mdf::from_bytes(out)?.read_with("A", &mf4_rs::ReadOptions::new().group("Fast"))?;
+    Mdf::from_bytes(out)?.read("A", &mf4_rs::ReadOptions::new().group("Fast"))?;
     Ok(())
 }
 
@@ -898,7 +898,7 @@ fn remote_master_structure_and_sync_channels() -> Result<(), MdfError> {
 
     let mdf = Mdf::from_bytes(out)?;
     assert_eq!(mdf.start_time_ns(), Some(1_700_000_000_000_000_000));
-    let x = mdf.read_with("X", &mf4_rs::ReadOptions::new().group("S"))?;
+    let x = mdf.read("X", &mf4_rs::ReadOptions::new().group("S"))?;
     assert_eq!(x.values, (0..10u64).map(|i| Some(DecodedValue::UnsignedInteger(100 + i))).collect::<Vec<_>>());
     assert_eq!(x.timestamps, (0..10).map(|i| i as f64 * 0.1).collect::<Vec<_>>());
     for g in mdf.channel_groups() {
@@ -914,7 +914,7 @@ fn remote_master_structure_and_sync_channels() -> Result<(), MdfError> {
     let (out, report) = to_column_oriented_bytes(&build_remote("s", 5), &ColumnOptions::default())?;
     assert!(report.skipped_channels.iter().any(|s| s.contains("S: remote master dropped")), "{report:?}");
     let mdf = Mdf::from_bytes(out)?;
-    let x = mdf.read_with("X", &mf4_rs::ReadOptions::new().group("S"))?;
+    let x = mdf.read("X", &mf4_rs::ReadOptions::new().group("S"))?;
     assert_eq!(x.values.len(), 5);
     assert!(x.timestamps.is_empty());
     Ok(())
@@ -923,7 +923,7 @@ fn remote_master_structure_and_sync_channels() -> Result<(), MdfError> {
 #[test]
 fn stale_cycle_count_still_reads_correctly_via_range_reader() -> Result<(), MdfError> {
     let f = fixture(&small_blocks())?;
-    let expected = MdfIndex::from_file(f.column.to_str().unwrap())?.read_with("Speed", &mf4_rs::ReadOptions::new().group("Engine"))?;
+    let expected = MdfIndex::from_file(f.column.to_str().unwrap())?.read("Speed", &mf4_rs::ReadOptions::new().group("Engine"))?;
     let cg_addr = {
         let mdf = Mdf::from_file(f.column.to_str().unwrap())?;
         let groups = mdf.channel_groups();
@@ -946,7 +946,7 @@ fn stale_cycle_count_still_reads_correctly_via_range_reader() -> Result<(), MdfE
         let mut reader = mf4_rs::index::FileRangeReader::new(path)?;
         let mut index = MdfIndex::from_range_reader(&mut reader, bytes.len() as u64)?;
         index.set_source(path);
-        let sig = index.read_with("Speed", &mf4_rs::ReadOptions::new().group("Engine"))?;
+        let sig = index.read("Speed", &mf4_rs::ReadOptions::new().group("Engine"))?;
         assert_eq!(sig.values, expected.values, "lowered by {lower}");
         assert_eq!(sig.timestamps, expected.timestamps, "lowered by {lower}");
     }
@@ -1057,7 +1057,7 @@ mod http {
         let mut per_read = Vec::new();
         for (g, c) in [("Engine", "Speed"), ("Engine", "Gear"), ("Body", "Temp"), ("Body", "Name"), ("Untimed", "Counter")] {
             let before = server.requests.load(Ordering::SeqCst);
-            let sig = index.read_with(c, &mf4_rs::ReadOptions::new().group(g))?;
+            let sig = index.read(c, &mf4_rs::ReadOptions::new().group(g))?;
             per_read.push((format!("{g}/{c}"), server.requests.load(Ordering::SeqCst) - before));
             let e = &expected[&format!("{g}/{c}")];
             assert_eq!(sig.values, e.values, "{g}/{c}");

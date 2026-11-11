@@ -53,7 +53,7 @@ fn main() -> Result<(), MdfError> {
     for group in mdf.groups()? {
         println!("{:?}: {} records, channels {:?}", group.name, group.record_count, group.channel_names);
     }
-    println!("first temperatures: {:?}", &mdf.values("Temperature")?[..3]);
+    println!("first temperatures: {:?}", &mdf.values("Temperature", None)?[..3]);
     println!("Created example.mf4");
     Ok(())
 }

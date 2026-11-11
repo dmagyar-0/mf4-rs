@@ -26,7 +26,7 @@ The only differences between languages are the ones the language forces:
 | | Rust | Python | TypeScript |
 |---|---|---|---|
 | Zero-argument accessors (`groups`, `channel_names`, `start_time_ns`, `file_size`, `source`) | method | property | method |
-| Optional arguments | `Option<&str>` for `group`; `read_with` / `values_with` take a `ReadOptions` | keyword arguments | a `ReadOptions` object |
+| Optional arguments | passed explicitly: `None`, `Some("group")`, or `&ReadOptions` | keyword arguments | a `ReadOptions` object |
 | "nothing" | `None` | `None` | `undefined` (`null` for `conversion`) |
 | Arrays | `Vec<f64>` | `numpy.ndarray` | `Float64Array` |
 | `MdfIndex` reads | blocking | blocking (GIL released) | `async` |
@@ -44,12 +44,12 @@ let mdf = Mdf::from_file("recording.mf4")?;
 for group in mdf.groups()? {
     println!("{:?}: {} records, {:?}", group.name, group.record_count, group.channel_names);
 }
-let speed = mdf.read("Speed")?;                                  // Signal
-let rpm = mdf.values_with("RPM", &ReadOptions::new().group("Engine"))?;
-let part = mdf.read_with("Speed", &ReadOptions::new().time(Some(1.0), Some(2.5)))?;
+let speed = mdf.read("Speed", None)?;                            // Signal
+let rpm = mdf.values("RPM", &ReadOptions::new().group("Engine"))?;
+let part = mdf.read("Speed", &ReadOptions::new().time(Some(1.0), Some(2.5)))?;
 
 let index = MdfIndex::from_url("https://host/recording.mf4")?;   // metadata only
-let speed = index.read("Speed")?;                                // range requests happen now
+let speed = index.read("Speed", None)?;                          // range requests happen now
 ```
 
 **Python**
@@ -138,8 +138,8 @@ master channel with a handful of single-record reads.
 How `options` is passed:
 
 ```rust
-mdf.read("Speed")?;                                                    // Rust: no options
-mdf.read_with("Speed", &ReadOptions::new().group("Engine").records(0, 100))?;
+mdf.read("Speed", None)?;                                              // Rust: None = no options
+mdf.read("Speed", &ReadOptions::new().group("Engine").records(0, 100))?;
 ```
 ```python
 mdf.read("Speed", group="Engine", start_record=0, record_count=100)    # Python: keywords
@@ -292,7 +292,6 @@ in `api-contract.json`, so they are deliberate rather than drift.
 
 **Rust**
 
-- `read_with` / `values_with` — the forms of `read` / `values` that take `ReadOptions`.
 - Block access underneath the contract: `Mdf::channel_groups()` → `ChannelGroup` → `Channel` (`decoded_values()`, `values()`, `conversion()`, `block()`), `Mdf::find_channel`, the public `MdfIndex.channel_groups` field, `MdfIndex::indexed_channel` and `conversion_block`.
 - Custom byte sources: implement `ByteRangeReader`, build with `MdfIndex::from_range_reader`, read through `index.open(reader)` → `MdfReader`, which has the same `read` / `values` / `time_range` methods.
 - Low-level writer building blocks: `add_channel_with`, `add_channel_group_with`, `start_data_block_with`, `write_records*`, `write_raw_record`, `write_block`, …

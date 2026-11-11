@@ -111,7 +111,7 @@ fn signal_master_axis_is_physical() -> Result<(), MdfError> {
     write_file(path.to_str().unwrap(), false)?;
 
     let mdf = Mdf::from_file(path.to_str().unwrap())?;
-    let sig = mdf.read("Value")?;
+    let sig = mdf.read("Value", None)?;
     assert_eq!(sig.timestamps.len(), 100);
     // Master stored as ticks with a 0.001 linear conversion: physical seconds.
     assert!((sig.timestamps[50] - 0.050).abs() < 1e-12, "{}", sig.timestamps[50]);

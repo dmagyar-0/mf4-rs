@@ -73,13 +73,13 @@ fn record_window_matches_full_read_across_blocks() {
     let mut r = index.open(FileRangeReader::new(&path).unwrap());
 
     let start = 262_000; // straddles the first block boundary
-    let sig = r.read_with("V", &mf4_rs::ReadOptions::new().records(start, 1000)).unwrap();
+    let sig = r.read("V", &mf4_rs::ReadOptions::new().records(start, 1000)).unwrap();
     assert_eq!(uints(&sig.values), (start..start + 1000).collect::<Vec<_>>());
     assert_eq!(sig.timestamps.len(), 1000);
     assert!((sig.timestamps[0] - start as f64 * 0.01).abs() < 1e-9);
 
-    assert!(r.read_with("V", &mf4_rs::ReadOptions::new().records(n - 1, 2)).is_err());
-    assert_eq!(r.read_with("V", &mf4_rs::ReadOptions::new().records(n, 0)).unwrap().values.len(), 0);
+    assert!(r.read("V", &mf4_rs::ReadOptions::new().records(n - 1, 2)).is_err());
+    assert_eq!(r.read("V", &mf4_rs::ReadOptions::new().records(n, 0)).unwrap().values.len(), 0);
 }
 
 #[test]
@@ -89,7 +89,7 @@ fn time_window_reads_only_a_small_part() {
     let index = MdfIndex::from_file(&path).unwrap();
     let mut r = index.open(Counting { inner: FileRangeReader::new(&path).unwrap(), bytes: 0 });
 
-    let sig = r.read_with("V", &mf4_rs::ReadOptions::new().time(Some(100.0), Some(100.5))).unwrap();
+    let sig = r.read("V", &mf4_rs::ReadOptions::new().time(Some(100.0), Some(100.5))).unwrap();
     // 0.01 s spacing: records 10000..=10050 (float rounding may shift an edge)
     let got = uints(&sig.values);
     assert!(got.first().unwrap().abs_diff(10_000) <= 1, "{:?}", got.first());
@@ -100,15 +100,15 @@ fn time_window_reads_only_a_small_part() {
     assert!(r.reader_mut().bytes < 64 * 1024, "read {} bytes", r.reader_mut().bytes);
 
     // Open-ended windows and an empty window.
-    let tail = r.read_with("V", &mf4_rs::ReadOptions::new().time(Some(5999.9), None)).unwrap();
+    let tail = r.read("V", &mf4_rs::ReadOptions::new().time(Some(5999.9), None)).unwrap();
     assert_eq!(uints(&tail.values).last(), Some(&(n - 1)));
-    let head = r.read_with("V", &mf4_rs::ReadOptions::new().time(None, Some(0.025))).unwrap();
+    let head = r.read("V", &mf4_rs::ReadOptions::new().time(None, Some(0.025))).unwrap();
     assert_eq!(uints(&head.values), vec![0, 1, 2]);
-    assert!(r.read_with("V", &mf4_rs::ReadOptions::new().time(Some(1e9), None)).unwrap().values.is_empty());
-    assert!(r.read_with("V", &mf4_rs::ReadOptions::new().time(Some(5.0), Some(4.0))).unwrap().values.is_empty());
+    assert!(r.read("V", &mf4_rs::ReadOptions::new().time(Some(1e9), None)).unwrap().values.is_empty());
+    assert!(r.read("V", &mf4_rs::ReadOptions::new().time(Some(5.0), Some(4.0))).unwrap().values.is_empty());
 
     // Time window on the master itself (its values are the time axis).
-    let m = r.read_with("Time", &mf4_rs::ReadOptions::new().time(Some(1.0), Some(1.02))).unwrap();
+    let m = r.read("Time", &mf4_rs::ReadOptions::new().time(Some(1.0), Some(1.02))).unwrap();
     assert_eq!(m.values.len(), 3);
     assert!(m.timestamps.is_empty());
 }
@@ -149,13 +149,13 @@ fn virtual_master_reads_record_index() {
     let index = MdfIndex::from_file(&path).unwrap();
     assert!(index.channel_groups[0].channel("t").unwrap().is_master());
     let mut r = index.open(FileRangeReader::new(&path).unwrap());
-    assert_eq!(r.values("t").unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
-    let sig = r.read("V").unwrap();
+    assert_eq!(r.values("t", None).unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
+    let sig = r.read("V", None).unwrap();
     assert_eq!(sig.timestamps, vec![0.0, 1.0, 2.0, 3.0]);
-    assert_eq!(uints(&r.read_with("V", &mf4_rs::ReadOptions::new().time(Some(1.0), Some(2.0))).unwrap().values), vec![10, 20]);
+    assert_eq!(uints(&r.read("V", &mf4_rs::ReadOptions::new().time(Some(1.0), Some(2.0))).unwrap().values), vec![10, 20]);
 
     let mdf = Mdf::from_file(&path).unwrap();
-    assert_eq!(mdf.read("V").unwrap().timestamps, vec![0.0, 1.0, 2.0, 3.0]);
+    assert_eq!(mdf.read("V", None).unwrap().timestamps, vec![0.0, 1.0, 2.0, 3.0]);
 }
 
 #[test]
@@ -241,9 +241,9 @@ fn window_reads_verify_block_headers() {
     dz[second..second + 4].copy_from_slice(b"##DZ");
     let mut r = index.open(SliceRangeReader::new(dz));
     let first_rec_of_second = (blocks[0].size - 24) / 16;
-    assert!(r.read_with("V", &mf4_rs::ReadOptions::new().records(first_rec_of_second, 10)).is_err());
-    assert!(r.read_with("V", &mf4_rs::ReadOptions::new().records(first_rec_of_second + 5, 10)).is_err());
-    assert!(r.read_with("V", &mf4_rs::ReadOptions::new().records(0, 10)).is_ok(), "first block is intact");
+    assert!(r.read("V", &mf4_rs::ReadOptions::new().records(first_rec_of_second, 10)).is_err());
+    assert!(r.read("V", &mf4_rs::ReadOptions::new().records(first_rec_of_second + 5, 10)).is_err());
+    assert!(r.read("V", &mf4_rs::ReadOptions::new().records(0, 10)).is_ok(), "first block is intact");
 
     // A header shorter than the index expects (stale index / other file).
     let mut short = bytes.clone();
@@ -251,7 +251,7 @@ fn window_reads_verify_block_headers() {
     let real = u64::from_le_bytes(short[len_pos..len_pos + 8].try_into().unwrap());
     short[len_pos..len_pos + 8].copy_from_slice(&(real - 16 * 100).to_le_bytes());
     let mut r = index.open(SliceRangeReader::new(short));
-    let err = r.read_with("V", &mf4_rs::ReadOptions::new().records(n - 10, 10)).unwrap_err().to_string();
+    let err = r.read("V", &mf4_rs::ReadOptions::new().records(n - 10, 10)).unwrap_err().to_string();
     assert!(err.contains("rebuild the index"), "{err}");
 }
 
@@ -321,7 +321,7 @@ fn column_virtual_master_is_bounded_by_its_signal_groups() {
     let time_group = index.channel_groups.iter().position(|g| g.channel("t").is_some()).unwrap();
     assert!(index.channel_groups[time_group].data_blocks.is_empty(), "time group stores no bytes");
     let mut r = index.open(FileRangeReader::new(out.to_str().unwrap()).unwrap());
-    let sig = r.read("V").unwrap();
+    let sig = r.read("V", None).unwrap();
     assert_eq!(sig.values.len(), 50);
     assert_eq!(sig.timestamps, (0..50).map(|i| i as f64).collect::<Vec<_>>());
 

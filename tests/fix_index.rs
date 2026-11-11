@@ -89,7 +89,7 @@ fn vlsd_channel_reads_resolve_correctly() -> Result<(), MdfError> {
     }
 
     // MdfReader::values_f64 (fast f64 path): strings map to NaN, one per record.
-    let f64s = reader.values("Msg")?;
+    let f64s = reader.values("Msg", None)?;
     assert_eq!(f64s.len(), n);
     assert!(f64s.iter().all(|v| v.is_nan()), "string VLSD values must be NaN");
 
@@ -101,7 +101,7 @@ fn vlsd_channel_reads_resolve_correctly() -> Result<(), MdfError> {
 
     // Lazy source-based read (slice path via mmap) yields a Signal whose
     // timestamps align with the values (one per record).
-    let sig = index.read("Msg")?;
+    let sig = index.read("Msg", None)?;
     assert_eq!(sig.values.len(), n);
     assert_eq!(sig.timestamps.len(), n);
     for (got, want) in sig.values.iter().zip(expected.iter()) {
@@ -112,7 +112,7 @@ fn vlsd_channel_reads_resolve_correctly() -> Result<(), MdfError> {
     }
 
     // The fixed-size channel in the same group still reads fine.
-    let times = reader.values("Time")?;
+    let times = reader.values("Time", None)?;
     assert_eq!(times.len(), n);
     assert!(times.iter().all(|v| !v.is_nan()));
 
@@ -194,7 +194,7 @@ fn malformed_index_json_errors_instead_of_panicking() -> Result<(), MdfError> {
     let idx = MdfIndex::from_json(&v.to_string())?;
     let mut r = idx.open(FileRangeReader::new(path_str)?);
     assert!(
-        r.values("Value").is_err(),
+        r.values("Value", None).is_err(),
         "forged huge block size must error, not abort"
     );
 
@@ -279,7 +279,7 @@ fn all_invalid_flag_yields_nan_on_f64_path() -> Result<(), MdfError> {
     let mut reader = index.open_file(path_str)?;
 
     // f64 fast path: previously returned the raw values.
-    let broken = reader.values("Broken")?;
+    let broken = reader.values("Broken", None)?;
     assert_eq!(broken.len(), 10);
     assert!(
         broken.iter().all(|v| v.is_nan()),
@@ -292,7 +292,7 @@ fn all_invalid_flag_yields_nan_on_f64_path() -> Result<(), MdfError> {
     assert!(decoded.iter().all(|v| v.is_none()));
 
     // Sibling channel without the flag is unaffected.
-    let times = reader.values("Time")?;
+    let times = reader.values("Time", None)?;
     assert!(times.iter().all(|v| !v.is_nan()));
 
     std::fs::remove_file(&path)?;
@@ -309,7 +309,7 @@ fn valid_index_json_round_trips() -> Result<(), MdfError> {
     let index = MdfIndex::from_file(path_str)?;
     let restored = MdfIndex::from_json(&index.to_json()?)?;
     let mut reader = restored.open_file(path_str)?;
-    let vals = reader.values("Value")?;
+    let vals = reader.values("Value", None)?;
     assert_eq!(vals.len(), 25);
     assert_eq!(vals[7], 7.0);
 

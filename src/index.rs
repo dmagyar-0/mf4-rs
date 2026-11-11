@@ -2805,15 +2805,14 @@ impl MdfIndex {
     /// [`Source`] now, not at index build time. Errors with
     /// [`MdfError::ChannelNotFound`] if no such channel exists, or if no
     /// source is attached (see [`set_source`](Self::set_source)).
-    pub fn read(&self, name: &str) -> Result<Signal, MdfError> {
-        self.read_with(name, &ReadOptions::default())
-    }
-
-    /// [`read`](Self::read) with a group filter and/or a time or record
-    /// window — see [`ReadOptions`]. A window fetches only the selected
-    /// records: a time window is located by searching the master channel (a
-    /// few single-record reads), not by downloading it.
-    pub fn read_with(&self, name: &str, options: &ReadOptions) -> Result<Signal, MdfError> {
+    ///
+    /// `options` is `None` for the whole channel, or a [`ReadOptions`] with a
+    /// group filter and/or a time or record window. A window fetches only the
+    /// selected records: a time window is located by searching the master
+    /// channel (a few single-record reads), not by downloading it.
+    pub fn read<'o>(&self, name: &str, options: impl Into<Option<&'o ReadOptions>>) -> Result<Signal, MdfError> {
+        let default = ReadOptions::default();
+        let options = options.into().unwrap_or(&default);
         let window = options.window()?;
         let (g, c) = self.locate_checked(name, options.group_name())?;
         if window == Window::All {
@@ -2826,12 +2825,10 @@ impl MdfIndex {
 
     /// Read a numeric channel as plain `f64` values (no timestamps).
     /// Conversions are applied; invalid and non-numeric samples are `NaN`.
-    pub fn values(&self, name: &str) -> Result<Vec<f64>, MdfError> {
-        self.values_with(name, &ReadOptions::default())
-    }
-
-    /// [`values`](Self::values) with a group filter and/or a window.
-    pub fn values_with(&self, name: &str, options: &ReadOptions) -> Result<Vec<f64>, MdfError> {
+    /// `options` as for [`read`](Self::read).
+    pub fn values<'o>(&self, name: &str, options: impl Into<Option<&'o ReadOptions>>) -> Result<Vec<f64>, MdfError> {
+        let default = ReadOptions::default();
+        let options = options.into().unwrap_or(&default);
         let window = options.window()?;
         let (g, c) = self.locate_checked(name, options.group_name())?;
         if window == Window::All {
@@ -3540,13 +3537,9 @@ impl<'a, R: ByteRangeReader<Error = MdfError>> MdfReader<'a, R> {
     }
 
     /// Read a channel as a [`Signal`] — see [`MdfIndex::read`].
-    pub fn read(&mut self, name: &str) -> Result<Signal, MdfError> {
-        self.read_with(name, &ReadOptions::default())
-    }
-
-    /// [`read`](Self::read) with a group filter and/or a time or record
-    /// window — see [`MdfIndex::read_with`].
-    pub fn read_with(&mut self, name: &str, options: &ReadOptions) -> Result<Signal, MdfError> {
+    pub fn read<'o>(&mut self, name: &str, options: impl Into<Option<&'o ReadOptions>>) -> Result<Signal, MdfError> {
+        let default = ReadOptions::default();
+        let options = options.into().unwrap_or(&default);
         let window = options.window()?;
         let (g, c) = self.index.locate_checked(name, options.group_name())?;
         if window == Window::All {
@@ -3557,12 +3550,9 @@ impl<'a, R: ByteRangeReader<Error = MdfError>> MdfReader<'a, R> {
     }
 
     /// Read a numeric channel as plain `f64` values — see [`MdfIndex::values`].
-    pub fn values(&mut self, name: &str) -> Result<Vec<f64>, MdfError> {
-        self.values_with(name, &ReadOptions::default())
-    }
-
-    /// [`values`](Self::values) with a group filter and/or a window.
-    pub fn values_with(&mut self, name: &str, options: &ReadOptions) -> Result<Vec<f64>, MdfError> {
+    pub fn values<'o>(&mut self, name: &str, options: impl Into<Option<&'o ReadOptions>>) -> Result<Vec<f64>, MdfError> {
+        let default = ReadOptions::default();
+        let options = options.into().unwrap_or(&default);
         let window = options.window()?;
         let (g, c) = self.index.locate_checked(name, options.group_name())?;
         if window == Window::All {

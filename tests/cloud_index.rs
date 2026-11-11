@@ -275,7 +275,7 @@ fn cloud_index_round_trips_within_budget() -> Result<(), MdfError> {
     ];
 
     for (gn, cn) in targets {
-        let vals = data.read_with(cn, &mf4_rs::ReadOptions::new().group(*gn)).map(|s| s.values)?;
+        let vals = data.read(cn, &mf4_rs::ReadOptions::new().group(*gn)).map(|s| s.values)?;
         assert_eq!(vals.len(), RECORDS, "{gn}/{cn} record count");
 
         if *gn == "Group 0" && *cn == "ch_0_9" {
@@ -439,7 +439,7 @@ fn cloud_index_handles_scattered_metadata() -> Result<(), MdfError> {
         ("Group 4", "ch_4_3"),
     ];
     for (gn, cn) in targets {
-        let vals = data.read_with(cn, &mf4_rs::ReadOptions::new().group(*gn)).map(|s| s.values)?;
+        let vals = data.read(cn, &mf4_rs::ReadOptions::new().group(*gn)).map(|s| s.values)?;
         assert_eq!(vals.len(), SCATTER_RECORDS, "{gn}/{cn}");
         // Spot-check decoded value matches what was written.
         let group_idx: usize = gn

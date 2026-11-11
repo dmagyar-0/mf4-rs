@@ -26,16 +26,16 @@ fn main() -> Result<(), MdfError> {
     for group in index.groups()? {
         println!("{:?}: {} records, channels {:?}", group.name, group.record_count, group.channel_names);
     }
-    let temperature = index.read("Temperature")?;
+    let temperature = index.read("Temperature", None)?;
     println!("Temperature: {} samples, first {:?}", temperature.len(), temperature.values.first());
-    let window = index.values_with("Temperature", &ReadOptions::new().time(Some(1.0), Some(1.5)))?;
+    let window = index.values("Temperature", &ReadOptions::new().time(Some(1.0), Some(1.5)))?;
     println!("Temperature between 1.0s and 1.5s: {window:?}");
     println!("time range: {:?}", index.time_range("Temperature", None)?);
     println!("conversion: {:?}", index.conversion("Temperature", None)?);
 
     // Both readers agree.
     let direct = Mdf::from_file(mdf_file)?;
-    assert_eq!(direct.values("Temperature")?, index.values("Temperature")?);
+    assert_eq!(direct.values("Temperature", None)?, index.values("Temperature", None)?);
 
     // Power users: the byte ranges a channel occupies, for your own range requests.
     println!("byte ranges of Temperature: {:?}", index.byte_ranges("Temperature", None)?);
@@ -44,7 +44,7 @@ fn main() -> Result<(), MdfError> {
     // Custom byte sources (S3, caches, …) implement `ByteRangeReader`;
     // `open` binds one and offers the same read methods.
     let mut reader = index.open(mf4_rs::index::FileRangeReader::new(mdf_file)?);
-    println!("via a custom reader: {} samples", reader.values("Temperature")?.len());
+    println!("via a custom reader: {} samples", reader.values("Temperature", None)?.len());
 
     std::fs::remove_file(mdf_file).ok();
     std::fs::remove_file(index_file).ok();

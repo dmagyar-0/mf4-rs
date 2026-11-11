@@ -135,7 +135,7 @@ fn reader_mirrors_the_index_read_api() {
     // `MdfReader` (an index bound to a custom byte source) must offer the
     // same data methods as `MdfIndex`.
     let reader = public_methods(&["src/index.rs"], "MdfReader");
-    for name in ["read", "read_with", "values", "values_with", "time_range"] {
+    for name in ["read", "values", "time_range"] {
         assert!(reader.contains(name), "MdfReader is missing `{name}`");
     }
 }
@@ -249,10 +249,10 @@ macro_rules! impl_reader {
                 self.$meta().start_time_ns()
             }
             fn read(&mut self, name: &str, options: &ReadOptions) -> Result<Signal, MdfError> {
-                self.read_with(name, options)
+                self.read(name, options)
             }
             fn values(&mut self, name: &str, options: &ReadOptions) -> Result<Vec<f64>, MdfError> {
-                self.values_with(name, options)
+                self.values(name, options)
             }
             fn time_range(&mut self, name: &str, group: Option<&str>) -> Result<Option<TimeRange>, MdfError> {
                 <$ty>::time_range(self, name, group)
@@ -372,10 +372,10 @@ fn every_reader_gives_the_same_answers() -> Result<(), MdfError> {
     }
 
     // Spot-check the actual numbers once, against the reference reader.
-    let window = mdf.read_with("Speed", &ReadOptions::new().time(Some(2.0), Some(3.0)))?;
+    let window = mdf.read("Speed", &ReadOptions::new().time(Some(2.0), Some(3.0)))?;
     assert_eq!(window.timestamps, [2.0, 2.5, 3.0]);
     assert_eq!(window.values_f64(), [9.0, 11.0, 13.0]); // 1 + 2 * raw
-    assert_eq!(mdf.read("Time")?.timestamps, Vec::<f64>::new(), "a master has no separate time axis");
+    assert_eq!(mdf.read("Time", None)?.timestamps, Vec::<f64>::new(), "a master has no separate time axis");
     assert_eq!(mdf.time_range("Speed", None)?, Some(TimeRange { start: 0.0, end: 9.5 }));
     let gear = mdf.conversion("Gear", None)?.expect("Gear conversion");
     assert_eq!(gear.conversion_type, "ValueToText");

@@ -28,23 +28,23 @@ fn main() -> Result<(), MdfError> {
     }
 
     // read() -> Signal: values (conversions applied) + the group's time axis.
-    let temperature = mdf.read("Temperature")?;
+    let temperature = mdf.read("Temperature", None)?;
     println!("\n{}: {} samples", temperature.name, temperature.len());
     for (t, v) in temperature.timestamps.iter().zip(&temperature.values).take(3) {
         println!("  t={t:.1}s  {v:?}");
     }
 
     // values() -> Vec<f64>: just the numbers.
-    let speed = mdf.values("Speed")?;
+    let speed = mdf.values("Speed", None)?;
     println!("Speed: {} samples, mean {:.2}", speed.len(), speed.iter().sum::<f64>() / speed.len() as f64);
 
     // Text conversions come back as strings through read().
-    println!("Gear: {:?}", &mdf.read("Gear")?.values[..3]);
+    println!("Gear: {:?}", &mdf.read("Gear", None)?.values[..3]);
 
     // Narrow by group, and read only a time or record window.
-    let window = mdf.read_with("Time", &ReadOptions::new().group("Vehicle").records(0, 5))?;
+    let window = mdf.read("Time", &ReadOptions::new().group("Vehicle").records(0, 5))?;
     println!("first 5 Vehicle times: {:?}", window.values_f64());
-    let slice = mdf.values_with("Speed", &ReadOptions::new().time(Some(1.0), Some(1.05)))?;
+    let slice = mdf.values("Speed", &ReadOptions::new().time(Some(1.0), Some(1.05)))?;
     println!("Speed between 1.00s and 1.05s: {slice:?}");
 
     // Inspection.
@@ -53,6 +53,6 @@ fn main() -> Result<(), MdfError> {
 
     // Unknown names: metadata lookups return None, data reads return an error.
     assert!(mdf.channel("Nope", None)?.is_none());
-    assert!(matches!(mdf.read("Nope"), Err(MdfError::ChannelNotFound { .. })));
+    assert!(matches!(mdf.read("Nope", None), Err(MdfError::ChannelNotFound { .. })));
     Ok(())
 }

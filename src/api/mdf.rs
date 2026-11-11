@@ -16,7 +16,7 @@ use crate::types::{slice_signal, ChannelInfo, ConversionInfo, GroupInfo, ReadOpt
 /// |---|---|
 /// | open | [`from_file`](Self::from_file), [`from_bytes`](Self::from_bytes), [`from_url`](Self::from_url) |
 /// | metadata | [`groups`](Self::groups), [`group`](Self::group), [`channel`](Self::channel), [`channel_names`](Self::channel_names), [`start_time_ns`](Self::start_time_ns) |
-/// | data | [`read`](Self::read) / [`read_with`](Self::read_with) → [`Signal`], [`values`](Self::values) / [`values_with`](Self::values_with) → `Vec<f64>` |
+/// | data | [`read`](Self::read) → [`Signal`], [`values`](Self::values) → `Vec<f64>` |
 /// | inspection | [`time_range`](Self::time_range), [`conversion`](Self::conversion), [`file_layout`](Self::file_layout) |
 ///
 /// Everything is addressed by **name**. Only metadata is parsed up front;
@@ -29,8 +29,8 @@ use crate::types::{slice_signal, ChannelInfo, ConversionInfo, GroupInfo, ReadOpt
 /// for group in mdf.groups()? {
 ///     println!("{:?}: {} records, {:?}", group.name, group.record_count, group.channel_names);
 /// }
-/// let speed = mdf.read("Speed")?;                       // Signal: values + timestamps
-/// let rpm = mdf.values_with("RPM", &ReadOptions::new().group("Engine").time(Some(1.0), Some(2.0)))?;
+/// let speed = mdf.read("Speed", None)?;                 // Signal: values + timestamps
+/// let rpm = mdf.values("RPM", &ReadOptions::new().group("Engine").time(Some(1.0), Some(2.0)))?;
 /// # Ok(()) }
 /// ```
 ///
@@ -122,13 +122,24 @@ impl Mdf {
     /// master channel itself `timestamps` is empty.
     ///
     /// Errors with [`MdfError::ChannelNotFound`] if no such channel exists.
-    pub fn read(&self, name: &str) -> Result<Signal, MdfError> {
-        self.read_with(name, &ReadOptions::default())
+    ///
+    /// `options` is `None` for the whole channel (first match across all
+    /// groups), or a [`ReadOptions`] with a group filter and/or a time or
+    /// record window:
+    ///
+    /// ```no_run
+    /// # use mf4_rs::{Mdf, ReadOptions};
+    /// # fn main() -> Result<(), mf4_rs::MdfError> {
+    /// # let mdf = Mdf::from_file("recording.mf4")?;
+    /// let speed = mdf.read("Speed", None)?;
+    /// let part = mdf.read("Speed", &ReadOptions::new().group("Engine").time(Some(1.0), Some(2.5)))?;
+    /// # Ok(()) }
+    /// ```
+    pub fn read<'o>(&self, name: &str, options: impl Into<Option<&'o ReadOptions>>) -> Result<Signal, MdfError> {
+        self.read_impl(name, options.into().unwrap_or(&ReadOptions::default()))
     }
 
-    /// [`read`](Self::read) with a group filter and/or a time or record
-    /// window — see [`ReadOptions`].
-    pub fn read_with(&self, name: &str, options: &ReadOptions) -> Result<Signal, MdfError> {
+    fn read_impl(&self, name: &str, options: &ReadOptions) -> Result<Signal, MdfError> {
         let window = options.window()?;
         let (g, ci) = self.locate(name, options.group_name())?;
         let signal = g.read_at(ci)?;
@@ -137,17 +148,15 @@ impl Mdf {
 
     /// Read a numeric channel as plain `f64` values (no timestamps).
     /// Conversions are applied; invalid and non-numeric samples are `NaN`.
-    pub fn values(&self, name: &str) -> Result<Vec<f64>, MdfError> {
-        self.values_with(name, &ReadOptions::default())
-    }
-
-    /// [`values`](Self::values) with a group filter and/or a window.
-    pub fn values_with(&self, name: &str, options: &ReadOptions) -> Result<Vec<f64>, MdfError> {
+    /// `options` as for [`read`](Self::read).
+    pub fn values<'o>(&self, name: &str, options: impl Into<Option<&'o ReadOptions>>) -> Result<Vec<f64>, MdfError> {
+        let default = ReadOptions::default();
+        let options = options.into().unwrap_or(&default);
         if options.window()? == Window::All {
             let (g, ci) = self.locate(name, options.group_name())?;
             return g.channels()[ci].values();
         }
-        Ok(self.read_with(name, options)?.values_f64())
+        Ok(self.read_impl(name, options)?.values_f64())
     }
 
     // ----- inspection -----------------------------------------------------
