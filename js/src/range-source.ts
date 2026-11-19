@@ -243,7 +243,7 @@ export class FetchRangeSource implements RangeSource {
       total += value.byteLength;
       if (total > this.maxFullDownloadBytes) {
         await reader.cancel().catch(() => undefined);
-        this.refuseFullDownload(total, reason, "at least ");
+        this.refuseFullDownload(total, reason, "more than ");
       }
       chunks.push(value);
     }
@@ -260,8 +260,8 @@ export class FetchRangeSource implements RangeSource {
   private refuseFullDownload(bytes: number, reason: string, qualifier = ""): void {
     if (bytes > this.maxFullDownloadBytes) {
       throw new Error(
-        `FetchRangeSource: ${reason}, so reading it would download the whole ${qualifier}${bytes}-byte ` +
-          `file (limit ${this.maxFullDownloadBytes} bytes). Serve it with HTTP range support ` +
+        `FetchRangeSource: ${reason}, so reading it would download the whole file ` +
+          `(${qualifier}${bytes} bytes; limit ${this.maxFullDownloadBytes}). Serve it with HTTP range support ` +
           `(and, in a browser, \`Access-Control-Expose-Headers: Content-Range\`), or raise ` +
           `\`maxFullDownloadBytes\` to allow the full download.`,
       );

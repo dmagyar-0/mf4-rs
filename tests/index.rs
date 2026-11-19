@@ -721,4 +721,9 @@ fn source_strings_are_classified_clearly() {
     index.set_source("s3://bucket/a.mf4");
     let err = index.values("X", None).unwrap_err().to_string();
     assert!(err.contains("s3://") && err.contains("http(s)://"), "{err}");
+    let err = index.open_file("https://example.com/a.mf4").err().expect("a URL is not a file").to_string();
+    #[cfg(feature = "http")]
+    assert!(err.contains("set_source") && !err.contains("without the `http` feature"), "{err}");
+    #[cfg(not(feature = "http"))]
+    assert!(err.contains("without the `http` feature"), "{err}");
 }

@@ -167,7 +167,7 @@ test("FetchRangeSource enforces the full-download cap on a chunked body without 
   const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/file.mf4`;
   try {
     const strict = new FetchRangeSource(url, undefined, { maxFullDownloadBytes: 1024 });
-    await assert.rejects(strict.read(100, 10), /download the whole at least \d+-byte file/);
+    await assert.rejects(strict.read(100, 10), /download the whole file \(more than \d+ bytes/);
     const lenient = new FetchRangeSource(url);
     assert.deepEqual(await lenient.read(100, 10), bytes.subarray(100, 110));
   } finally {

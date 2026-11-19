@@ -328,7 +328,10 @@ fn vlsd_window_short_reader_errors_instead_of_panicking() -> Result<(), MdfError
         type Error = MdfError;
         fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
             let mut bytes = self.0.read_range(offset, length)?;
-            if length > 16 {
+            // Truncate only the ##SD slice reads: block headers (24 bytes)
+            // and the window's 16-byte records are served whole, so the read
+            // reaches the signal-data fetch.
+            if length != 24 && length % 16 != 0 {
                 bytes.truncate(bytes.len() / 2);
             }
             Ok(bytes)
@@ -344,7 +347,79 @@ fn vlsd_window_short_reader_errors_instead_of_panicking() -> Result<(), MdfError
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         reader.read("Msg", &mf4_rs::ReadOptions::new().records(50, 20)).map(|_| ())
     }));
-    assert!(matches!(result, Ok(Err(_))), "expected an error, got {result:?}");
+    match result {
+        Ok(Err(MdfError::TooShortBuffer { actual, expected, .. })) => {
+            assert!(expected == 2 * actual || expected == 2 * actual + 1, "{actual} of {expected}")
+        }
+        other => panic!("expected the VLSD short-read error, got {other:?}"),
+    }
+    std::fs::remove_file(&path)?;
+    Ok(())
+}
+
+/// A VLSD entry that does not fit in the ##SD fragment it starts in is
+/// refused by window reads with the same error as full reads.
+#[test]
+fn vlsd_window_refuses_entry_spanning_fragments() -> Result<(), MdfError> {
+    use mf4_rs::ReadOptions;
+    let path = tmp_path("index_vlsd_spanning.mf4");
+    let path_str = path.to_str().unwrap();
+    // Entry 0 fills the first fragment on its own (as in write_vlsd_uneven);
+    // its payload ends with a fake entry header declaring 16 bytes, and an
+    // extra record points at it, so that entry crosses into fragment 1.
+    let mut first = vec![0xAAu8; 1024 * 1024];
+    let n = first.len();
+    first[n - 8..n - 4].copy_from_slice(&16u32.to_le_bytes());
+    let payloads: Vec<Vec<u8>> = vec![first, vec![0xBB; 5 * 1024 * 1024]];
+
+    let mut w = MdfWriter::new(path_str)?;
+    w.init_mdf_file()?;
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |c| {
+        c.data_type = DataType::FloatLE;
+        c.bit_count = 64;
+        c.name = Some("Time".into());
+    })?;
+    w.set_time_channel(&t)?;
+    let vlsd = w.add_channel_with(&cg, Some(&t), |c| {
+        c.data_type = DataType::ByteArray;
+        c.bit_count = 64;
+        c.channel_type = 1;
+        c.name = Some("Image".into());
+    })?;
+    w.start_data_block_for_cg_raw(&cg, 0, RECORD_LEN as u32, 0)?;
+    w.start_signal_data_block(&vlsd)?;
+    let mut offsets = Vec::new();
+    let mut running: u64 = 0;
+    for p in &payloads {
+        offsets.push(running);
+        w.write_signal_data(&vlsd, p)?;
+        running += 4 + p.len() as u64;
+    }
+    let spanning = 4 + n as u64 - 8;
+    offsets.push(spanning);
+    for (i, off) in offsets.iter().enumerate() {
+        let mut record = Vec::with_capacity(RECORD_LEN);
+        record.extend_from_slice(&(i as f64 * 0.1).to_le_bytes());
+        record.extend_from_slice(&off.to_le_bytes());
+        w.write_raw_record(&cg, &record)?;
+    }
+    w.finish_signal_data_block(&vlsd)?;
+    w.finish_data_block(&cg)?;
+    w.finalize()?;
+
+    let index = MdfIndex::from_file(path_str)?;
+    let blocks = &index.channel_groups[0].channels[1].vlsd_data_blocks;
+    assert!(blocks.len() >= 2, "fixture must span ##SD fragments");
+    assert_eq!(blocks[0].size, 24 + 4 + n as u64, "entry 0 must fill fragment 0");
+
+    let mut reader = index.open_file(path_str)?;
+    // Whole entries in the window still read fine.
+    assert_eq!(reader.read("Image", &ReadOptions::new().records(1, 1))?.values.len(), 1);
+    for opts in [ReadOptions::new().records(2, 1), ReadOptions::new()] {
+        let err = reader.read("Image", &opts).unwrap_err().to_string();
+        assert!(err.contains("exceeds fragment"), "{opts:?}: {err}");
+    }
     std::fs::remove_file(&path)?;
     Ok(())
 }

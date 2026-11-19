@@ -3288,8 +3288,14 @@ impl MdfIndex {
     #[cfg(not(target_arch = "wasm32"))]
     fn map_source_file(&self, path: &str) -> Result<memmap2::Mmap, MdfError> {
         if is_http_url(path) {
+            #[cfg(not(feature = "http"))]
             return Err(MdfError::InvalidArgument(format!(
                 "'{path}' is a URL, but mf4-rs was built without the `http` feature"
+            )));
+            #[cfg(feature = "http")]
+            return Err(MdfError::InvalidArgument(format!(
+                "'{path}' is a URL, not a local file: attach URLs with `set_source` or build the \
+                 index with `from_url`"
             )));
         }
         if let Some(scheme) = url_scheme(path) {
