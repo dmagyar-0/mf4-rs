@@ -989,13 +989,13 @@ impl MdfWriter {
                         "column length mismatch: column 0 has {nrows} values, another has {col_len}"
                     )));
                 }
-                let type_ok = match (col, enc) {
-                    (ColumnData::F64(_), ChannelEncoder::F64 { .. }) => true,
-                    (ColumnData::F32(_), ChannelEncoder::F32 { .. }) => true,
-                    (ColumnData::U64(_), ChannelEncoder::UInt { .. }) => true,
-                    (ColumnData::I64(_), ChannelEncoder::Int { .. }) => true,
-                    _ => false,
-                };
+                let type_ok = matches!(
+                    (col, enc),
+                    (ColumnData::F64(_), ChannelEncoder::F64 { .. })
+                        | (ColumnData::F32(_), ChannelEncoder::F32 { .. })
+                        | (ColumnData::U64(_), ChannelEncoder::UInt { .. })
+                        | (ColumnData::I64(_), ChannelEncoder::Int { .. })
+                );
                 // Integers narrower than 64 bits: refuse values that do not
                 // fit before anything is written.
                 match (col, enc) {
