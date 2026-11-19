@@ -65,7 +65,7 @@ impl BlockParse<'_> for ChannelGroupBlock {
         }
 
         Ok(Self {
-            header: header,
+            header,
             next_cg_addr: LittleEndian::read_u64(&bytes[24..32]),
             first_ch_addr: LittleEndian::read_u64(&bytes[32..40]),
             acq_name_addr: LittleEndian::read_u64(&bytes[40..48]),

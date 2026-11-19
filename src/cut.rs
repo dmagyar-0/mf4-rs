@@ -106,7 +106,7 @@ pub(crate) fn clone_block_to_writer(
                 cc_md_comment: (new_md_comment != 0).then_some(new_md_comment),
                 cc_cc_inverse: (new_cc_inverse != 0).then_some(new_cc_inverse),
                 cc_ref: new_refs,
-                cc_type: src_block.cc_type.clone(),
+                cc_type: src_block.cc_type,
                 cc_precision: src_block.cc_precision,
                 cc_flags: src_block.cc_flags,
                 cc_ref_count: src_block.cc_ref_count,

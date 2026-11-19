@@ -130,7 +130,7 @@ fn vlsd_payload_to_value(bytes: &[u8], data_type: &DataType) -> DecodedValue {
             DecodedValue::String(s.trim_end_matches('\0').to_string())
         }
         DataType::StringUtf16LE => {
-            if bytes.len() % 2 != 0 {
+            if !bytes.len().is_multiple_of(2) {
                 return DecodedValue::String(String::from("<Invalid UTF16LE>"));
             }
             let u16_data: Vec<u16> = bytes.chunks_exact(2).map(LittleEndian::read_u16).collect();
@@ -140,7 +140,7 @@ fn vlsd_payload_to_value(bytes: &[u8], data_type: &DataType) -> DecodedValue {
             }
         }
         DataType::StringUtf16BE => {
-            if bytes.len() % 2 != 0 {
+            if !bytes.len().is_multiple_of(2) {
                 return DecodedValue::String(String::from("<Invalid UTF16BE>"));
             }
             let u16_data: Vec<u16> = bytes.chunks_exact(2).map(BigEndian::read_u16).collect();
@@ -194,8 +194,8 @@ fn collect_groups(file: &MdfFile, src_file: usize) -> Result<Vec<MergedGroup>, M
             let mut data: Vec<Vec<DecodedValue>> = metas.iter().map(|_| Vec::new()).collect();
             for (idx, ch) in cg.raw_channels.iter().enumerate() {
                 let is_vlsd = ch.block.channel_type == 1 && ch.block.data != 0;
-                let mut iter = ch.records(dg, cg, mmap)?;
-                while let Some(rec) = iter.next() {
+                let iter = ch.records(dg, cg, mmap)?;
+                for rec in iter {
                     let bytes = rec?;
                     let val = if is_vlsd {
                         vlsd_payload_to_value(bytes, &ch.block.data_type)
@@ -251,7 +251,7 @@ pub fn merge_files(output: &str, first: &str, second: &str) -> Result<(), MdfErr
 
     for og in other_groups {
         if let Some(g1) = groups.iter_mut().find(|g| g.meta.matches(&og.meta)) {
-            for (vals1, vals2) in g1.data.iter_mut().zip(og.data.into_iter()) {
+            for (vals1, vals2) in g1.data.iter_mut().zip(og.data) {
                 vals1.extend(vals2);
             }
         } else {
@@ -335,7 +335,7 @@ pub fn merge_files(output: &str, first: &str, second: &str) -> Result<(), MdfErr
             last_cn = Some(id);
         }
         writer.start_data_block_for_cg(&cg_id, group.meta.record_id_len)?;
-        let record_count = group.data.get(0).map(|v| v.len()).unwrap_or(0);
+        let record_count = group.data.first().map(|v| v.len()).unwrap_or(0);
         for i in 0..record_count {
             let mut vals = Vec::new();
             for (ci, ch_data) in group.data.iter().enumerate() {

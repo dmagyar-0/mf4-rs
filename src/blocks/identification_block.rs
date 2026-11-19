@@ -157,7 +157,7 @@ impl IdentificationBlock {
         }
 
         Ok(Self {
-            file_identifier: file_identifier,
+            file_identifier,
             version_identifier: String::from_utf8_lossy(&bytes[8..16]).to_string(),
             program_identifier: String::from_utf8_lossy(&bytes[16..24]).to_string(),
             // Reserved bytes between 24 and 28 are skipped
@@ -178,7 +178,7 @@ impl IdentificationBlock {
     /// unexpected.
     pub fn parse_block_version(bytes: &[u8]) -> Result<(u16,u16), MdfError> {
         // 1) Decode to &str, ignoring invalid UTF-8 (there shouldn’t be any).
-        let raw = from_utf8(&bytes)
+        let raw = from_utf8(bytes)
             .map_err(|_| MdfError::InvalidVersionString("Invalid UTF-8".to_string()))?;
 
         // 2) Trim trailing nulls and spaces

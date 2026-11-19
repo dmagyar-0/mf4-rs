@@ -299,7 +299,7 @@ pub fn read_string_block(mmap: &[u8], address: u64) -> Result<Option<String>, Md
     }
 
     let offset = address as usize;
-    if offset.checked_add(24).map_or(true, |end| end > mmap.len()) {
+    if offset.checked_add(24).is_none_or(|end| end > mmap.len()) {
         return Err(MdfError::TooShortBuffer {
             actual:   mmap.len(),
             expected: offset.saturating_add(24),

@@ -121,7 +121,7 @@ impl BlockParse<'_> for HeaderBlock {
         }
         
         Ok(Self {
-            header: header,
+            header,
             first_dg_addr: LittleEndian::read_u64(&bytes[24..32]),
             file_history_addr: LittleEndian::read_u64(&bytes[32..40]),
             channel_tree_addr: LittleEndian::read_u64(&bytes[40..48]),

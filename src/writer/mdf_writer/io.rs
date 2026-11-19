@@ -53,7 +53,7 @@ impl Seek for MmapWriter {
             SeekFrom::Current(x) => self.pos as i64 + x,
         };
         if new_pos < 0 || new_pos as usize > self.mmap.len() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "invalid seek"));
+            return Err(std::io::Error::other("invalid seek"));
         }
         self.pos = new_pos as usize;
         Ok(self.pos as u64)

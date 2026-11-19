@@ -110,8 +110,8 @@ impl FileLayout {
         let _ = writeln!(out, "Blocks ({} total), sorted by offset:", self.blocks.len());
         let _ = writeln!(
             out,
-            "{:<12}  {:<12}  {:>10}  {:<6}  {}",
-            "offset", "end", "size", "type", "description"
+            "{:<12}  {:<12}  {:>10}  {:<6}  description",
+            "offset", "end", "size", "type"
         );
         let _ = writeln!(
             out,
@@ -342,7 +342,7 @@ impl<'a> Walker<'a> {
     fn bytes_at(&self, offset: usize, needed: usize) -> Result<&'a [u8], MdfError> {
         if offset
             .checked_add(needed)
-            .map_or(true, |end| end > self.data.len())
+            .is_none_or(|end| end > self.data.len())
         {
             return Err(MdfError::TooShortBuffer {
                 actual: self.data.len(),

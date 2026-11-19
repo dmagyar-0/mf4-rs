@@ -154,7 +154,7 @@ pub fn decode_f64_from_record(
         return f64::NAN;
     }
 
-    let num_bytes = ((bit_offset + bit_count + 7) / 8).max(1);
+    let num_bytes = (bit_offset + bit_count).div_ceil(8).max(1);
     if base_offset + num_bytes > record.len() {
         return f64::NAN;
     }
@@ -312,7 +312,7 @@ fn decode_value_internal(
         // read with a fixed width, so a short payload must yield None
         // instead of panicking inside the fixed-width readers.
         if is_numeric {
-            let needed = ((bit_offset + bit_count + 7) / 8).max(1);
+            let needed = (bit_offset + bit_count).div_ceil(8).max(1);
             if record.len() < needed {
                 return None;
             }
@@ -328,7 +328,7 @@ fn decode_value_internal(
         {
             bit_count / 8
         } else {
-            ((bit_offset + bit_count + 7) / 8).max(1)
+            (bit_offset + bit_count).div_ceil(8).max(1)
         };
 
         if base_offset + num_bytes > record.len() {
@@ -470,7 +470,7 @@ fn decode_value_internal(
             // byte instead of refusing to decode the value.
             let even = &slice[..slice.len() & !1];
             let u16_data: Vec<u16> = even.chunks_exact(2)
-                .map(|chunk| LittleEndian::read_u16(chunk))
+                .map(LittleEndian::read_u16)
                 .collect();
             let end = u16_data.iter().position(|&u| u == 0).unwrap_or(u16_data.len());
             match String::from_utf16(&u16_data[..end]) {
@@ -481,7 +481,7 @@ fn decode_value_internal(
         DataType::StringUtf16BE => {
             let even = &slice[..slice.len() & !1];
             let u16_data: Vec<u16> = even.chunks_exact(2)
-                .map(|chunk| BigEndian::read_u16(chunk))
+                .map(BigEndian::read_u16)
                 .collect();
             let end = u16_data.iter().position(|&u| u == 0).unwrap_or(u16_data.len());
             match String::from_utf16(&u16_data[..end]) {

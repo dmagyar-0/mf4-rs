@@ -8,7 +8,7 @@ use super::linear::extract_numeric;
 pub fn lookup_table(cc_val: &[f64], raw: f64, interp: bool) -> Option<f64> {
     let len = cc_val.len();
     // A single key/value pair is spec-valid: every input clamps to that value.
-    if len < 2 || len % 2 != 0 { return None; }
+    if len < 2 || !len.is_multiple_of(2) { return None; }
     let n = len / 2;
     let mut table = Vec::with_capacity(n);
     for i in 0..n { table.push((cc_val[2*i], cc_val[2*i + 1])); }
@@ -44,7 +44,7 @@ pub fn apply_range_lookup(block: &ConversionBlock, value: DecodedValue) -> Resul
     if let Some(raw) = extract_numeric(&value) {
         let inclusive_upper = matches!(value, DecodedValue::UnsignedInteger(_) | DecodedValue::SignedInteger(_));
         let v = &block.cc_val;
-        if v.len() < 4 || (v.len() - 1) % 3 != 0 {
+        if v.len() < 4 || !(v.len() - 1).is_multiple_of(3) {
             return Ok(DecodedValue::Float(raw));
         }
         let n = (v.len() - 1) / 3;
