@@ -76,13 +76,15 @@ impl MdfWriter {
         let dg_bytes = dg_block.to_bytes()?;
         let _pos = self.write_block_with_id(&dg_bytes, &dg_id)?;
 
-        if prev_dg_id.is_none() {
-            let hd_dg_link_offset = 24;
-            self.update_block_link("hd_block", hd_dg_link_offset, &dg_id)?;
-        } else {
-            let prev = prev_dg_id.unwrap();
-            let prev_off = 24;
-            self.update_block_link(prev, prev_off, &dg_id)?;
+        match prev_dg_id {
+            None => {
+                let hd_dg_link_offset = 24;
+                self.update_block_link("hd_block", hd_dg_link_offset, &dg_id)?;
+            }
+            Some(prev) => {
+                let prev_off = 24;
+                self.update_block_link(prev, prev_off, &dg_id)?;
+            }
         }
         Ok(dg_id)
     }
@@ -111,13 +113,15 @@ impl MdfWriter {
         let cg_bytes = cg_block.to_bytes()?;
         let _pos = self.write_block_with_id(&cg_bytes, &cg_id)?;
 
-        if prev_cg_id.is_none() {
-            let dg_cg_link_offset = 32;
-            self.update_block_link(dg_id, dg_cg_link_offset, &cg_id)?;
-        } else {
-            let prev = prev_cg_id.unwrap();
-            let prev_cg_off = 24;
-            self.update_block_link(prev, prev_cg_off, &cg_id)?;
+        match prev_cg_id {
+            None => {
+                let dg_cg_link_offset = 32;
+                self.update_block_link(dg_id, dg_cg_link_offset, &cg_id)?;
+            }
+            Some(prev) => {
+                let prev_cg_off = 24;
+                self.update_block_link(prev, prev_cg_off, &cg_id)?;
+            }
         }
         Ok(cg_id)
     }
@@ -373,13 +377,15 @@ impl MdfWriter {
         self.cg_channel_ids.entry(cg_id.to_string()).or_default().push(cn_id.clone());
         self.channel_map.insert(cn_id.clone(), (cg_id.to_string(), idx));
 
-        if prev_cn_id.is_none() {
-            let cg_cn_link_offset = 32;
-            self.update_block_link(cg_id, cg_cn_link_offset, &cn_id)?;
-        } else {
-            let prev_cn = prev_cn_id.unwrap();
-            let prev_cn_next_link_offset = 24;
-            self.update_block_link(prev_cn, prev_cn_next_link_offset, &cn_id)?;
+        match prev_cn_id {
+            None => {
+                let cg_cn_link_offset = 32;
+                self.update_block_link(cg_id, cg_cn_link_offset, &cn_id)?;
+            }
+            Some(prev_cn) => {
+                let prev_cn_next_link_offset = 24;
+                self.update_block_link(prev_cn, prev_cn_next_link_offset, &cn_id)?;
+            }
         }
         Ok(cn_id)
     }
