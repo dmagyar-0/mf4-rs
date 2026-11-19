@@ -14,6 +14,7 @@ pub mod cut;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod merge;
 pub mod index;
+pub(crate) mod fragments;
 pub mod signal;
 pub mod types;
 pub mod block_layout;

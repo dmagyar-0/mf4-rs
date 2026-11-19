@@ -68,6 +68,7 @@ export {
   readAllRanges,
   type RangeSource,
   type FetchLike,
+  type FetchRangeSourceOptions,
 } from "./range-source";
 
 export { mergeByteRanges } from "./byte-ranges";

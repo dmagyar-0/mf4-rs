@@ -92,3 +92,64 @@ test("FetchRangeSource over a Range-ignoring (200-only) server matches direct re
     await closeServer(server);
   }
 });
+
+test("MdfIndex refuses a URL whose file no longer matches the index", async () => {
+  const original = buildSampleFile(60).bytes;
+  const replaced = buildSampleFile(200).bytes;
+  const { server, url } = await startServer(replaced, true);
+  try {
+    const index = MdfIndex.fromBytes(original);
+    index.setSource(new FetchRangeSource(url));
+    for (const read of [
+      () => index.values("Value", { group: "Group1" }),
+      () => index.read("Value", { group: "Group1", startTime: 0.1, endTime: 0.2 }),
+      () => index.timeRange("Value", "Group1"),
+    ]) {
+      await assert.rejects(read(), /does not match the index/);
+    }
+    index.dispose();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("FetchRangeSource refuses to download a large file whole when Range is ignored", async () => {
+  const { bytes } = buildSampleFile(60);
+  const { server, url } = await startServer(bytes, false);
+  try {
+    // Limit below the file size: the 200 body is refused before it is read.
+    const strict = new FetchRangeSource(url, undefined, { maxFullDownloadBytes: bytes.length - 1 });
+    await assert.rejects(strict.read(100, 10), /ignored the Range header/);
+    await assert.rejects(strict.size(), /ignored the Range header/);
+    // Within the limit it still works by slicing the cached body.
+    const lenient = new FetchRangeSource(url, undefined, { maxFullDownloadBytes: bytes.length });
+    assert.deepEqual(await lenient.read(100, 10), bytes.subarray(100, 110));
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("Mdf and MdfIndex refuse a time window on a time axis that resets", async () => {
+  const { MdfWriter } = await import("../src/mdf-writer");
+  const writer = new MdfWriter();
+  writer.initMdfFile();
+  const g = writer.addChannelGroup("G");
+  const t = writer.addTimeChannel(g, "t");
+  writer.addFloatChannel(g, "X");
+  writer.setTimeChannel(t);
+  writer.startDataBlock(g);
+  for (let i = 0; i < 2000; i++) writer.writeRecord(g, [(i % 1000) * 0.01, i]);
+  writer.finishDataBlock(g);
+  const bytes = writer.finalize();
+  const mdf = Mdf.fromBytes(bytes);
+  const index = MdfIndex.fromBytes(bytes);
+  assert.throws(() => mdf.read("X", { startTime: 2, endTime: 3 }), /not monotonic/);
+  await assert.rejects(index.read("X", { startTime: 2, endTime: 3 }), /not monotonic/);
+  await assert.rejects(index.values("X", { startTime: 2, endTime: 3 }), /not monotonic/);
+  assert.deepEqual(
+    (await index.read("X", { startRecord: 1200, recordCount: 2 })).values,
+    mdf.read("X", { startRecord: 1200, recordCount: 2 }).values,
+  );
+  mdf.dispose();
+  index.dispose();
+});

@@ -1,7 +1,6 @@
 import { getWasmModule, type WasmMdfIndex } from "./wasm-module";
 import { readFileNodeOnly, writeFileNodeOnly } from "./platform";
 import {
-  readAllRanges,
   BytesRangeSource,
   FetchRangeSource,
   type RangeSource,
@@ -551,7 +550,7 @@ export class MdfIndex {
       return step.signal as Signal;
     }
     const ranges = this.signalByteRanges(name, options.group);
-    const fragments = await readAllRanges(source, ranges);
+    const fragments = await this.#fetchAll(source, ranges);
     // A signal read decodes the group master too, so resolve the master's
     // conversion as well as the channel's (withMaster = true).
     await this.#fetchConversionRanges(name, options.group, true, source, ranges, fragments);
@@ -574,7 +573,7 @@ export class MdfIndex {
       return step.values!;
     }
     const ranges = this.signalByteRanges(name, options.group, false);
-    const fragments = await readAllRanges(source, ranges);
+    const fragments = await this.#fetchAll(source, ranges);
     // Indexes built over the network resolve conversions lazily; fetch the
     // channel's conversion blocks (if any) so the decoder can apply them.
     await this.#fetchConversionRanges(name, options.group, false, source, ranges, fragments);
@@ -613,7 +612,7 @@ export class MdfIndex {
       if (step.done) return (step.conversion ?? null) as ConversionInfo | null;
       const source = this.#requireSource({});
       const spans = coalesceNeeded(step.needed!, lookahead, lookahead, this.fileSize());
-      const fetched = await Promise.all(spans.map(([o, l]) => readExact(source, o, l)));
+      const fetched = await this.#fetchAll(source, spans);
       spans.forEach(([offset], i) => {
         ranges.push([offset, fetched[i]!.length]);
         fragments.push(fetched[i]!);
@@ -659,16 +658,11 @@ export class MdfIndex {
         return result;
       }
       const spans = coalesceNeeded(result.needed!, WINDOW_BRIDGE_BYTES, 0, size);
-      const fetched = await Promise.all(
-        spans.map(async ([offset, length]): Promise<[ByteRange, Uint8Array]> => {
-          const bytes = await readExact(source, offset, length);
-          return [[offset, bytes.length], bytes];
-        }),
-      );
-      for (const [range, bytes] of fetched) {
-        ranges.push(range);
-        fragments.push(bytes);
-      }
+      const fetched = await this.#fetchAll(source, spans);
+      spans.forEach(([offset], i) => {
+        ranges.push([offset, fetched[i]!.length]);
+        fragments.push(fetched[i]!);
+      });
     }
     throw new Error("MdfIndex: read did not converge; the index or source may be inconsistent.");
   }
@@ -705,20 +699,46 @@ export class MdfIndex {
         CONVERSION_LOOKAHEAD_BYTES,
         size,
       );
-      const fetched = await Promise.all(
-        spans.map(async ([offset, length]): Promise<[ByteRange, Uint8Array]> => {
-          const bytes = await readExact(source, offset, length);
-          return [[offset, bytes.length], bytes];
-        }),
-      );
-      for (const [range, bytes] of fetched) {
-        ranges.push(range);
-        fragments.push(bytes);
-      }
+      const fetched = await this.#fetchAll(source, spans);
+      spans.forEach(([offset], i) => {
+        ranges.push([offset, fetched[i]!.length]);
+        fragments.push(fetched[i]!);
+      });
     }
     throw new Error(
       "MdfIndex: conversion resolution did not converge; the index or source may be inconsistent.",
     );
+  }
+
+  /**
+   * Fetch `spans` from `source` concurrently (each in full), refusing a
+   * source whose size — once it is known without an extra request, e.g. from
+   * a `Content-Range` header — differs from the indexed file's: the file
+   * behind it was replaced, and its bytes would be decoded at offsets meant
+   * for another file.
+   */
+  async #fetchAll(source: RangeSource, spans: ByteRange[]): Promise<Uint8Array[]> {
+    let fetched: Uint8Array[];
+    try {
+      fetched = await Promise.all(spans.map(([offset, length]) => readExact(source, offset, length)));
+    } catch (e) {
+      this.#checkSourceSize(source);
+      throw e;
+    }
+    this.#checkSourceSize(source);
+    return fetched;
+  }
+
+  #checkSourceSize(source: RangeSource): void {
+    const actual = source.knownSize?.();
+    const expected = this.fileSize();
+    if (actual !== undefined && expected > 0 && actual !== expected) {
+      throw new Error(
+        `the source does not match the index: the index was built from a ${expected}-byte ` +
+          `file but the source is ${actual} bytes — attach the file the index was built from, ` +
+          `or rebuild the index`,
+      );
+    }
   }
 
   /** Free the underlying wasm memory. Safe to call multiple times. */

@@ -9,6 +9,7 @@ import { open, type FileHandle } from "node:fs/promises";
 export class FileRangeSource implements RangeSource {
   private readonly path: string;
   private handlePromise: Promise<FileHandle> | undefined;
+  private cachedSize: number | undefined;
 
   constructor(path: string) {
     this.path = path;
@@ -16,7 +17,10 @@ export class FileRangeSource implements RangeSource {
 
   private async handle(): Promise<FileHandle> {
     if (!this.handlePromise) {
-      this.handlePromise = open(this.path, "r");
+      this.handlePromise = open(this.path, "r").then(async (fh) => {
+        this.cachedSize = (await fh.stat()).size;
+        return fh;
+      });
     }
     return this.handlePromise;
   }
@@ -24,7 +28,12 @@ export class FileRangeSource implements RangeSource {
   async size(): Promise<number> {
     const fh = await this.handle();
     const stat = await fh.stat();
+    this.cachedSize = stat.size;
     return stat.size;
+  }
+
+  knownSize(): number | undefined {
+    return this.cachedSize;
   }
 
   async read(offset: number, length: number): Promise<Uint8Array> {

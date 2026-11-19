@@ -566,3 +566,159 @@ fn test_channel_group_name_lookup() -> Result<(), MdfError> {
     let _ = fs::remove_file(mdf_path);
     Ok(())
 }
+
+/// A time axis that resets (two recordings back to back) is refused by both
+/// readers with the same error, instead of each silently selecting a
+/// different half of the data; a non-decreasing axis with repeated
+/// timestamps still selects identical records.
+#[test]
+fn non_monotonic_time_axis_is_refused_by_mdf_and_index() -> Result<(), mf4_rs::error::MdfError> {
+    use mf4_rs::error::MdfError;
+    use mf4_rs::parsing::decoder::DecodedValue;
+    use mf4_rs::{Mdf, MdfIndex, MdfWriter, ReadOptions};
+
+    let dir = tempfile::tempdir()?;
+    let write = |name: &str, times: &[f64]| -> Result<String, MdfError> {
+        let path = dir.path().join(name).to_str().unwrap().to_string();
+        let mut w = MdfWriter::new(&path)?;
+        w.init_mdf_file()?;
+        let cg = w.add_channel_group(Some("G"))?;
+        w.add_time_channel(&cg, "t")?;
+        w.add_float_channel(&cg, "X")?;
+        w.start_data_block(&cg)?;
+        for (k, t) in times.iter().enumerate() {
+            w.write_record(&cg, &[DecodedValue::Float(*t), DecodedValue::Float(k as f64)])?;
+        }
+        w.finish_data_block(&cg)?;
+        w.finalize()?;
+        Ok(path)
+    };
+
+    let reset: Vec<f64> = (0..2000).map(|i| (i % 1000) as f64 * 0.01).collect();
+    let path = write("reset.mf4", &reset)?;
+    let (mdf, index) = (Mdf::from_file(&path)?, MdfIndex::from_file(&path)?);
+    let window = ReadOptions::new().time(Some(2.0), Some(3.0));
+    for result in [mdf.read("X", &window).map(|_| ()), index.read("X", &window).map(|_| ()), index.values("X", &window).map(|_| ())] {
+        match result {
+            Err(MdfError::InvalidArgument(msg)) => assert!(msg.contains("not monotonic"), "{msg}"),
+            other => panic!("expected a non-monotonic error, got {other:?}"),
+        }
+    }
+    // Record windows do not depend on the time axis.
+    let records = ReadOptions::new().records(1200, 3);
+    assert_eq!(mdf.read("X", &records)?.values, index.read("X", &records)?.values);
+
+    let steps: Vec<f64> = (0..3000).map(|i| (i / 7) as f64).collect();
+    let path = write("steps.mf4", &steps)?;
+    let (mdf, index) = (Mdf::from_file(&path)?, MdfIndex::from_file(&path)?);
+    for (a, b) in [(Some(10.0), Some(12.0)), (None, Some(0.0)), (Some(428.0), None), (Some(5.5), Some(5.6))] {
+        let w = ReadOptions::new().time(a, b);
+        let (m, i) = (mdf.read("X", &w)?, index.read("X", &w)?);
+        assert_eq!(m.values, i.values, "{a:?}..{b:?}");
+        assert_eq!(m.timestamps, i.timestamps, "{a:?}..{b:?}");
+    }
+    assert_eq!(mdf.read("X", &ReadOptions::new().time(Some(10.0), Some(12.0)))?.values.len(), 21);
+    Ok(())
+}
+
+/// An index re-attached to a different file (the source was replaced, or the
+/// wrong file was given) is refused with a clear error naming both sizes,
+/// rather than decoding bytes at offsets meant for another file; a missing
+/// source names its path.
+#[test]
+fn source_that_does_not_match_the_index_is_refused() -> Result<(), mf4_rs::error::MdfError> {
+    use mf4_rs::error::MdfError;
+    use mf4_rs::{MdfIndex, MdfWriter};
+
+    let dir = tempfile::tempdir()?;
+    let write = |name: &str, records: u64| -> Result<String, MdfError> {
+        let path = dir.path().join(name).to_str().unwrap().to_string();
+        let mut w = MdfWriter::new(&path)?;
+        w.init_mdf_file()?;
+        let cg = w.add_channel_group(Some("G"))?;
+        w.add_time_channel(&cg, "t")?;
+        w.add_float_channel(&cg, "X")?;
+        w.start_data_block(&cg)?;
+        for k in 0..records {
+            w.write_record(&cg, &[DecodedValue::Float(k as f64), DecodedValue::Float(k as f64)])?;
+        }
+        w.finish_data_block(&cg)?;
+        w.finalize()?;
+        Ok(path)
+    };
+    let (a, b) = (write("a.mf4", 100)?, write("b.mf4", 10)?);
+    let mut index = MdfIndex::from_file(&a)?;
+    assert_eq!(index.values("X", None)?.len(), 100);
+
+    index.set_source(b.as_str());
+    for result in [index.values("X", None).map(|_| ()), index.read("X", None).map(|_| ()), index.time_range("X", None).map(|_| ())] {
+        match result {
+            Err(MdfError::InvalidArgument(msg)) => {
+                assert!(msg.contains("does not match the index"), "{msg}");
+                assert!(msg.contains(&b), "{msg}");
+            }
+            other => panic!("expected a source mismatch, got {other:?}"),
+        }
+    }
+
+    let missing = dir.path().join("missing.mf4").to_str().unwrap().to_string();
+    index.set_source(missing.as_str());
+    let err = index.values("X", None).unwrap_err().to_string();
+    assert!(err.contains(&missing), "{err}");
+    Ok(())
+}
+
+/// An index's JSON is byte-for-byte reproducible: conversion text/reference
+/// maps are written with sorted keys, not in `HashMap` order.
+#[test]
+fn index_json_is_deterministic() -> Result<(), mf4_rs::error::MdfError> {
+    use mf4_rs::{MdfIndex, MdfWriter};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("texts.mf4").to_str().unwrap().to_string();
+    let mut w = MdfWriter::new(&path)?;
+    w.init_mdf_file()?;
+    let cg = w.add_channel_group(Some("G"))?;
+    w.add_time_channel(&cg, "t")?;
+    let gear = w.add_int_channel(&cg, "Gear")?;
+    let mapping: Vec<(i64, String)> = (0..40).map(|i| (i, format!("state-{i}"))).collect();
+    let mapping: Vec<(i64, &str)> = mapping.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    w.add_value_to_text_conversion(&gear, &mapping, "unknown")?;
+    w.start_data_block(&cg)?;
+    w.write_record(&cg, &[DecodedValue::Float(0.0), DecodedValue::UnsignedInteger(3)])?;
+    w.finish_data_block(&cg)?;
+    w.finalize()?;
+
+    let first = MdfIndex::from_file(&path)?.to_json()?;
+    for _ in 0..5 {
+        assert_eq!(MdfIndex::from_file(&path)?.to_json()?, first);
+    }
+    let pos = |k: &str| first.find(&format!("\"{k}\": \"state-")).unwrap();
+    assert!(pos("2") < pos("10") && pos("10") < pos("39"), "keys must be in numeric order");
+    Ok(())
+}
+
+/// `HTTP://` is recognised as a URL in any letter case; other URL schemes
+/// (`s3://`, `gs://`) are refused with an explanation instead of an opaque
+/// "No such file"; a Windows drive path stays a file path.
+#[test]
+fn source_strings_are_classified_clearly() {
+    use mf4_rs::index::Source;
+    use mf4_rs::MdfIndex;
+    #[cfg(feature = "http")]
+    assert!(matches!(Source::from("HTTPS://example.com/a.mf4"), Source::Url(_)));
+    assert!(matches!(Source::from(r"C:\data\a.mf4"), Source::File(_)));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("x.mf4").to_str().unwrap().to_string();
+    let mut w = mf4_rs::MdfWriter::new(&path).unwrap();
+    w.init_mdf_file().unwrap();
+    let cg = w.add_channel_group(Some("G")).unwrap();
+    w.add_float_channel(&cg, "X").unwrap();
+    w.start_data_block(&cg).unwrap();
+    w.write_record(&cg, &[DecodedValue::Float(1.0)]).unwrap();
+    w.finish_data_block(&cg).unwrap();
+    w.finalize().unwrap();
+    let mut index = MdfIndex::from_file(&path).unwrap();
+    index.set_source("s3://bucket/a.mf4");
+    let err = index.values("X", None).unwrap_err().to_string();
+    assert!(err.contains("s3://") && err.contains("http(s)://"), "{err}");
+}

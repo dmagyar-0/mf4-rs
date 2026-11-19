@@ -260,3 +260,61 @@ fn vlsd_signal_alignment() -> Result<(), MdfError> {
     std::fs::remove_file(&path)?;
     Ok(())
 }
+
+/// Counts the bytes read through it.
+struct CountingReader {
+    inner: FileRangeReader,
+    bytes: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl mf4_rs::index::ByteRangeReader for CountingReader {
+    type Error = MdfError;
+    fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
+        self.bytes.set(self.bytes.get() + length);
+        self.inner.read_range(offset, length)
+    }
+}
+
+/// A record or time window of a VLSD channel fetches only the records in
+/// the window and the slice of the signal-data stream they point into — not
+/// the whole stream — and decodes the same values as a full read. Covers a
+/// window inside one fragment and one spanning uneven `##SD` fragments.
+#[test]
+fn vlsd_window_reads_only_the_needed_stream_bytes() -> Result<(), MdfError> {
+    use mf4_rs::ReadOptions;
+
+    let path = tmp_path("index_vlsd_window.mf4");
+    let path_str = path.to_str().unwrap();
+    let texts: Vec<String> = (0..5000).map(|i| format!("message number {i} {}", "x".repeat(i % 50))).collect();
+    let payloads: Vec<&[u8]> = texts.iter().map(|s| s.as_bytes()).collect();
+    write_vlsd_file(path_str, &payloads)?;
+    let stream: u64 = payloads.iter().map(|p| 4 + p.len() as u64).sum();
+
+    let index = MdfIndex::from_file(path_str)?;
+    let full = index.open_file(path_str)?.decoded_values("Msg", None)?;
+    let bytes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut reader = index.open(CountingReader { inner: FileRangeReader::new(path_str)?, bytes: bytes.clone() });
+    for opts in [ReadOptions::new().records(2000, 25), ReadOptions::new().time(Some(100.0), Some(102.0)), ReadOptions::new().records(4990, 10)] {
+        bytes.set(0);
+        let sig = reader.read("Msg", &opts)?;
+        let start = (sig.timestamps[0] / 0.1).round() as usize;
+        assert_eq!(sig.values, full[start..start + sig.values.len()], "{opts:?}");
+        assert!(bytes.get() < stream / 20, "{opts:?} read {} of a {stream}-byte stream", bytes.get());
+    }
+    std::fs::remove_file(&path)?;
+
+    // A window spanning uneven fragments (1 MB, 5 MB, 256 KB entries).
+    let path = tmp_path("index_vlsd_window_uneven.mf4");
+    let path_str = path.to_str().unwrap();
+    let payloads = write_vlsd_uneven(path_str)?;
+    let index = MdfIndex::from_file(path_str)?;
+    let mut reader = index.open_file(path_str)?;
+    for (start, count) in [(0u64, 3u64), (1, 2), (2, 1), (0, 1)] {
+        let sig = reader.read("Image", &ReadOptions::new().records(start, count))?;
+        for (k, v) in sig.values.iter().enumerate() {
+            assert_eq!(v, &Some(DecodedValue::ByteArray(payloads[start as usize + k].clone())), "{start}+{k}");
+        }
+    }
+    std::fs::remove_file(&path)?;
+    Ok(())
+}

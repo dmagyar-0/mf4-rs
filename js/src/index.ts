@@ -36,6 +36,7 @@ export {
   readAllRanges,
   type RangeSource,
   type FetchLike,
+  type FetchRangeSourceOptions,
 } from "./range-source";
 export { FileRangeSource } from "./file-range-source";
 
