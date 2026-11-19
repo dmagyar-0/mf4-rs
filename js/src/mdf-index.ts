@@ -722,14 +722,15 @@ export class MdfIndex {
     try {
       fetched = await Promise.all(spans.map(([offset, length]) => readExact(source, offset, length)));
     } catch (e) {
-      this.#checkSourceSize(source);
+      // A size mismatch explains the failure better; keep the original as its cause.
+      this.#checkSourceSize(source, e);
       throw e;
     }
     this.#checkSourceSize(source);
     return fetched;
   }
 
-  #checkSourceSize(source: RangeSource): void {
+  #checkSourceSize(source: RangeSource, cause?: unknown): void {
     const actual = source.knownSize?.();
     const expected = this.fileSize();
     if (actual !== undefined && expected > 0 && actual !== expected) {
@@ -737,6 +738,7 @@ export class MdfIndex {
         `the source does not match the index: the index was built from a ${expected}-byte ` +
           `file but the source is ${actual} bytes — attach the file the index was built from, ` +
           `or rebuild the index`,
+        cause === undefined ? undefined : { cause },
       );
     }
   }

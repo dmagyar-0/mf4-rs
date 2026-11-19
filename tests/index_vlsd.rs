@@ -318,3 +318,33 @@ fn vlsd_window_reads_only_the_needed_stream_bytes() -> Result<(), MdfError> {
     std::fs::remove_file(&path)?;
     Ok(())
 }
+
+/// A custom reader that returns fewer bytes than asked (clamped at some
+/// point) makes a VLSD window read fail with an error, not panic.
+#[test]
+fn vlsd_window_short_reader_errors_instead_of_panicking() -> Result<(), MdfError> {
+    struct ShortReader(FileRangeReader);
+    impl mf4_rs::index::ByteRangeReader for ShortReader {
+        type Error = MdfError;
+        fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
+            let mut bytes = self.0.read_range(offset, length)?;
+            if length > 16 {
+                bytes.truncate(bytes.len() / 2);
+            }
+            Ok(bytes)
+        }
+    }
+    let path = tmp_path("index_vlsd_short_reader.mf4");
+    let path_str = path.to_str().unwrap();
+    let texts: Vec<String> = (0..200).map(|i| format!("entry {i} {}", "y".repeat(i % 30))).collect();
+    let payloads: Vec<&[u8]> = texts.iter().map(|s| s.as_bytes()).collect();
+    write_vlsd_file(path_str, &payloads)?;
+    let index = MdfIndex::from_file(path_str)?;
+    let mut reader = index.open(ShortReader(FileRangeReader::new(path_str)?));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reader.read("Msg", &mf4_rs::ReadOptions::new().records(50, 20)).map(|_| ())
+    }));
+    assert!(matches!(result, Ok(Err(_))), "expected an error, got {result:?}");
+    std::fs::remove_file(&path)?;
+    Ok(())
+}

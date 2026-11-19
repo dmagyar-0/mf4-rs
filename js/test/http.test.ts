@@ -153,3 +153,24 @@ test("Mdf and MdfIndex refuse a time window on a time axis that resets", async (
   mdf.dispose();
   index.dispose();
 });
+
+test("FetchRangeSource enforces the full-download cap on a chunked body without Content-Length", async () => {
+  const { bytes } = buildSampleFile(60);
+  const server = http.createServer((_req, res) => {
+    // Ignore Range and stream the body chunked (no Content-Length).
+    res.writeHead(200, { "Content-Type": "application/octet-stream" });
+    const step = 256;
+    for (let i = 0; i < bytes.length; i += step) res.write(Buffer.from(bytes.subarray(i, i + step)));
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/file.mf4`;
+  try {
+    const strict = new FetchRangeSource(url, undefined, { maxFullDownloadBytes: 1024 });
+    await assert.rejects(strict.read(100, 10), /download the whole at least \d+-byte file/);
+    const lenient = new FetchRangeSource(url);
+    assert.deepEqual(await lenient.read(100, 10), bytes.subarray(100, 110));
+  } finally {
+    await closeServer(server);
+  }
+});

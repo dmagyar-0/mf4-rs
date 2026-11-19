@@ -64,6 +64,11 @@ export async function readAllRanges(
   return Promise.all(ranges.map(([offset, length]) => source.read(offset, length)));
 }
 
+/** A response as `FetchRangeSource` reads it: the `FetchLike` result plus an optional streaming body. */
+type FullBodyResponse = Awaited<ReturnType<FetchLike>> & {
+  body?: { getReader?(): { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<void> } } | null;
+};
+
 /** Default {@link FetchRangeSourceOptions.maxFullDownloadBytes}: 64 MiB. */
 const DEFAULT_MAX_FULL_DOWNLOAD_BYTES = 64 * 1024 * 1024;
 
@@ -72,7 +77,9 @@ export interface FetchRangeSourceOptions {
   /**
    * Largest file to download whole when the server does not honour range
    * requests (or, in a browser, hides `Content-Range` from the size probe).
-   * Default 64 MiB; pass `Infinity` to always allow it.
+   * Checked against `Content-Length` before the body is read and, for a
+   * streamed body, while reading it. Default 64 MiB; pass `Infinity` to
+   * always allow it.
    */
   maxFullDownloadBytes?: number;
 }
@@ -140,15 +147,13 @@ export class FetchRangeSource implements RangeSource {
       if (!full.ok) {
         throw new Error(`FetchRangeSource: full GET for size failed with status ${full.status}`);
       }
-      this.checkFullDownload(full, "the response did not expose its total size (Content-Range)");
-      const body = new Uint8Array(await full.arrayBuffer());
+      const body = await this.readFullBody(full, "the response did not expose its total size (Content-Range)");
       this.cachedBody = body;
       this.cachedSize = body.byteLength;
       return this.cachedSize;
     }
     // Server ignored Range and sent the full body; cache it for later reads.
-    this.checkFullDownload(res, "the server ignored the Range header");
-    const buf = new Uint8Array(await res.arrayBuffer());
+    const buf = await this.readFullBody(res, "the server ignored the Range header");
     this.cachedBody = buf;
     this.cachedSize = buf.byteLength;
     return this.cachedSize;
@@ -182,10 +187,10 @@ export class FetchRangeSource implements RangeSource {
     if (!res.ok) {
       throw new Error(`FetchRangeSource: request failed with status ${res.status}`);
     }
-    if (res.status !== 206) {
-      this.checkFullDownload(res, "the server ignored the Range header");
-    }
-    const buf = new Uint8Array(await res.arrayBuffer());
+    const buf =
+      res.status === 206
+        ? new Uint8Array(await res.arrayBuffer())
+        : await this.readFullBody(res, "the server ignored the Range header");
 
     if (res.status === 206) {
       // Server honoured the Range request — validate what it returned.
@@ -216,22 +221,64 @@ export class FetchRangeSource implements RangeSource {
   }
 
   /**
-   * Refuse to download a whole resource (a response that is not the
-   * requested range) larger than `maxFullDownloadBytes`, judged by its
-   * `Content-Length` before the body is read.
+   * Read a whole-resource body (a response that is not the requested range),
+   * refusing one larger than `maxFullDownloadBytes`: up front from its
+   * `Content-Length`, and — when the body is a stream — while reading it, so
+   * a chunked or compressed response without an honest length is cut off
+   * too.
+   */
+  private async readFullBody(res: FullBodyResponse, reason: string): Promise<Uint8Array> {
+    this.checkFullDownload(res, reason);
+    const reader = res.body?.getReader?.();
+    if (!reader) {
+      const buf = new Uint8Array(await res.arrayBuffer());
+      this.refuseFullDownload(buf.byteLength, reason);
+      return buf;
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      total += value.byteLength;
+      if (total > this.maxFullDownloadBytes) {
+        await reader.cancel().catch(() => undefined);
+        this.refuseFullDownload(total, reason, "at least ");
+      }
+      chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, at);
+      at += chunk.byteLength;
+    }
+    return out;
+  }
+
+  /** Throw the full-download refusal if `bytes` exceeds the limit. */
+  private refuseFullDownload(bytes: number, reason: string, qualifier = ""): void {
+    if (bytes > this.maxFullDownloadBytes) {
+      throw new Error(
+        `FetchRangeSource: ${reason}, so reading it would download the whole ${qualifier}${bytes}-byte ` +
+          `file (limit ${this.maxFullDownloadBytes} bytes). Serve it with HTTP range support ` +
+          `(and, in a browser, \`Access-Control-Expose-Headers: Content-Range\`), or raise ` +
+          `\`maxFullDownloadBytes\` to allow the full download.`,
+      );
+    }
+  }
+
+  /**
+   * Refuse a whole-resource response whose `Content-Length` already exceeds
+   * `maxFullDownloadBytes`, before reading its body.
    */
   private checkFullDownload(
     res: { headers: { get(name: string): string | null } },
     reason: string,
   ): void {
     const declared = Number(res.headers.get("content-length") ?? NaN);
-    if (Number.isFinite(declared) && declared > this.maxFullDownloadBytes) {
-      throw new Error(
-        `FetchRangeSource: ${reason}, so reading it would download the whole ${declared}-byte ` +
-          `file (limit ${this.maxFullDownloadBytes} bytes). Serve it with HTTP range support ` +
-          `(and, in a browser, \`Access-Control-Expose-Headers: Content-Range\`), or raise ` +
-          `\`maxFullDownloadBytes\` to allow the full download.`,
-      );
+    if (Number.isFinite(declared)) {
+      this.refuseFullDownload(declared, reason);
     }
   }
 

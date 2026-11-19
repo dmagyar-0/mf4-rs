@@ -1012,21 +1012,29 @@ pub(crate) const MAX_PARALLEL_REQUESTS: usize = 8;
 /// connections alive across calls (and across indexes reading the same host).
 #[cfg(feature = "http")]
 fn shared_http_agent() -> Result<ureq::Agent, MdfError> {
-    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    if let Some(agent) = AGENT.get() {
+    // Keyed by process id: a forked child (multiprocessing, DataLoader
+    // workers) must not reuse the parent's pooled keep-alive sockets, or
+    // several processes would interleave requests on one TCP stream.
+    static AGENT: std::sync::Mutex<Option<(u32, ureq::Agent)>> = std::sync::Mutex::new(None);
+    let pid = std::process::id();
+    let mut slot = AGENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((owner, agent)) = slot.as_ref()
+        && *owner == pid
+    {
         return Ok(agent.clone());
-}
-// ureq's native-tls feature is not auto-wired (unlike rustls): the
-// connector must be constructed and attached explicitly, otherwise
-// HTTPS requests fail with "no TLS backend is configured".
-let connector = native_tls::TlsConnector::new().map_err(|e| {
-    MdfError::BlockSerializationError(format!("failed to init TLS backend: {e}"))
-})?;
-let agent = ureq::AgentBuilder::new()
-    .tls_connector(std::sync::Arc::new(connector))
-    .max_idle_connections_per_host(MAX_PARALLEL_REQUESTS)
-    .build();
-Ok(AGENT.get_or_init(|| agent).clone())
+    }
+    // ureq's native-tls feature is not auto-wired (unlike rustls): the
+    // connector must be constructed and attached explicitly, otherwise
+    // HTTPS requests fail with "no TLS backend is configured".
+    let connector = native_tls::TlsConnector::new().map_err(|e| {
+        MdfError::BlockSerializationError(format!("failed to init TLS backend: {e}"))
+    })?;
+    let agent = ureq::AgentBuilder::new()
+        .tls_connector(std::sync::Arc::new(connector))
+        .max_idle_connections_per_host(MAX_PARALLEL_REQUESTS)
+        .build();
+    *slot = Some((pid, agent.clone()));
+    Ok(agent)
 }
 
 /// Total size from a `Content-Range: bytes A-B/<total>` (or `bytes */<total>`)
@@ -1034,6 +1042,14 @@ Ok(AGENT.get_or_init(|| agent).clone())
 #[cfg(feature = "http")]
 fn content_range_total(header: Option<&str>) -> Option<u64> {
     header?.rsplit_once('/')?.1.trim().parse().ok()
+}
+
+/// `(A, B)` from a `Content-Range: bytes A-B/<total>` header.
+#[cfg(feature = "http")]
+fn content_range_span(header: Option<&str>) -> Option<(u64, u64)> {
+    let spec = header?.trim().strip_prefix("bytes")?.trim();
+    let (a, b) = spec.split_once('/')?.0.split_once('-')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
 /// Refuse a source whose size differs from the one the index was built from.
@@ -1083,6 +1099,20 @@ fn http_get_range(
     };
     if let (Some(expected), Some(actual)) = (expected_size, content_range_total(resp.header("Content-Range"))) {
         check_resource_size(url, expected, actual)?;
+    }
+    // A 206 must carry exactly the requested range: a proxy or a shared
+    // connection that answers with other bytes of the right length would
+    // otherwise be decoded silently.
+    if resp.status() == 206 {
+        if let Some((start, end)) = content_range_span(resp.header("Content-Range")) {
+            let want_end = offset + length - 1;
+            // (A shorter range at end-of-file is caught by the short-body check below.)
+            if start != offset || end > want_end {
+                return Err(MdfError::BlockSerializationError(format!(
+                    "HTTP server returned bytes {start}-{end} for requested range {offset}-{want_end}"
+                )));
+            }
+        }
     }
 
     // 206 Partial Content is the accepted path. A 200 means the server
@@ -2654,6 +2684,20 @@ impl MdfIndex {
                 values.push(None);
                 continue;
             };
+            // Like the full read, refuse an entry that does not fit in the
+            // ##SD fragment it starts in.
+            let frag_idx = frag_starts.partition_point(|&s| s <= off) - 1;
+            let frag_end = frag_starts.get(frag_idx + 1).copied().unwrap_or(stream_len);
+            let len = entry_len(&buf, off);
+            if off + 4 + len as u64 > frag_end {
+                return Err(MdfError::BlockSerializationError(format!(
+                    "VLSD entry at virtual offset {} declares length {} which exceeds fragment {} (size {})",
+                    off,
+                    len,
+                    frag_idx,
+                    frag_end - frag_starts[frag_idx]
+                )));
+            }
             let p = (off - lo) as usize + 4;
             let payload = &buf[p..p + entry_len(&buf, off)];
             values.push(match decode_channel_value(payload, 0, &payload_cb) {
@@ -2688,6 +2732,16 @@ impl MdfIndex {
                 continue;
             }
             match reader.read_range(db.file_offset + 24 + (a - fs), b - a) {
+                // A custom reader that returns fewer bytes (e.g. clamped at
+                // EOF) must surface as an error, not an out-of-bounds slice.
+                Ok(bytes) if bytes.len() as u64 != b - a => {
+                    return Err(MdfError::TooShortBuffer {
+                        actual: bytes.len(),
+                        expected: (b - a) as usize,
+                        file: file!(),
+                        line: line!(),
+                    });
+                }
                 Ok(bytes) => out.extend_from_slice(&bytes),
                 Err(e) if reader.is_probing() => {
                     first_err.get_or_insert(e);
@@ -3098,15 +3152,15 @@ impl MdfIndex {
     /// has no master channel.
     pub fn time_range(&self, name: &str, group: Option<&str>) -> Result<Option<TimeRange>, MdfError> {
         let (g, c) = self.locate_checked(name, group)?;
-        let mut reader = self.source_reader(g, c)?;
-        match reader {
-            #[cfg(feature = "http")]
-            SourceReader::Url(ref mut cached) => {
-                self.batched_reads(cached.inner_mut(), |r| self.time_range_at(g, c, r))
-            }
-            #[allow(unreachable_patterns)]
-            _ => self.time_range_at(g, c, &mut reader),
+        // Over a URL only the master is read (in batched rounds), so skip
+        // `source_reader`, which would also fetch channel `c`'s conversion.
+        #[cfg(feature = "http")]
+        if let Source::Url(url) = self.require_source()? {
+            let mut http = self.http_source(url)?;
+            return self.batched_reads(&mut http, |r| self.time_range_at(g, c, r));
         }
+        let mut reader = self.source_reader(g, c)?;
+        self.time_range_at(g, c, &mut reader)
     }
 
     /// [`resolve_window`](Self::resolve_window) over a [`SourceReader`]: a
@@ -3233,6 +3287,11 @@ impl MdfIndex {
     /// opened and refusing it when its size differs from the indexed file.
     #[cfg(not(target_arch = "wasm32"))]
     fn map_source_file(&self, path: &str) -> Result<memmap2::Mmap, MdfError> {
+        if is_http_url(path) {
+            return Err(MdfError::InvalidArgument(format!(
+                "'{path}' is a URL, but mf4-rs was built without the `http` feature"
+            )));
+        }
         if let Some(scheme) = url_scheme(path) {
             return Err(MdfError::InvalidArgument(format!(
                 "unsupported source '{path}': {scheme}:// URLs cannot be read directly — use a \
@@ -3922,4 +3981,20 @@ pub(crate) fn read_signal_window<R: ByteRangeReader<Error = MdfError>>(
         None => Vec::new(),
     };
     Ok(Signal { name, unit, timestamps, values: values? })
+}
+
+#[cfg(all(test, feature = "http"))]
+mod http_header_tests {
+    use super::{content_range_span, content_range_total};
+
+    #[test]
+    fn parses_content_range() {
+        assert_eq!(content_range_span(Some("bytes 10-19/100")), Some((10, 19)));
+        assert_eq!(content_range_span(Some(" bytes 0-0/*")), Some((0, 0)));
+        assert_eq!(content_range_span(Some("bytes */100")), None);
+        assert_eq!(content_range_span(None), None);
+        assert_eq!(content_range_total(Some("bytes 10-19/100")), Some(100));
+        assert_eq!(content_range_total(Some("bytes */100")), Some(100));
+        assert_eq!(content_range_total(Some("bytes 0-0/*")), None);
+    }
 }
