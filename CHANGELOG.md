@@ -1,3 +1,11 @@
+## v4.0.1 — 2026-11-19
+
+### Fixes
+- resolve clippy warnings in the library (#98)
+
+### CI
+- build macOS wheels on macos-15 (#97)
+
 ## v4.0.0 — 2026-11-11
 
 ### BREAKING CHANGES
