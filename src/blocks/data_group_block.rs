@@ -40,7 +40,7 @@ impl BlockParse<'_> for DataGroupBlock {
         }
 
         Ok(Self {
-            header: header,
+            header,
             next_dg_addr: LittleEndian::read_u64(&bytes[24..32]),
             first_cg_addr: LittleEndian::read_u64(&bytes[32..40]),
             data_block_addr: LittleEndian::read_u64(&bytes[40..48]),

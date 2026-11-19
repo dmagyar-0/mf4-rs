@@ -198,7 +198,7 @@ fn test_index_metadata() -> Result<(), MdfError> {
 
     writer.start_data_block_for_cg(&cg_id, 0)?;
     writer.write_record(&cg_id, &[
-        DecodedValue::Float(3.14),
+        DecodedValue::Float(3.5),
         DecodedValue::UnsignedInteger(42),
     ])?;
     writer.finish_data_block(&cg_id)?;

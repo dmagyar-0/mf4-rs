@@ -307,7 +307,7 @@ impl MdfWriter {
 
         let mut record_bytes = 0usize;
         for ch in channels {
-            let byte_end = ch.byte_offset as usize + ((ch.bit_offset as usize + ch.bit_count as usize + 7) / 8);
+            let byte_end = ch.byte_offset as usize + (ch.bit_offset as usize + ch.bit_count as usize).div_ceil(8);
             record_bytes = record_bytes.max(byte_end);
         }
         // Records must include the channel group's invalidation bytes
@@ -336,7 +336,7 @@ impl MdfWriter {
         let mut vlsd_channel_ids: Vec<Option<String>> = Vec::with_capacity(channels.len());
         for (i, ch) in channels.iter().enumerate() {
             let offset = record_id_len as usize + ch.byte_offset as usize;
-            let bytes = ((ch.bit_count + 7) / 8) as usize;
+            let bytes = ch.bit_count.div_ceil(8) as usize;
             // A channel_type of 1 alone marks a VLSD channel; the legacy
             // `data != 0` sentinel is no longer required (but still implies
             // channel_type == 1 in files produced by this writer).
@@ -621,10 +621,10 @@ impl MdfWriter {
         I: IntoIterator<Item = &'a [DecodedValue]>,
     {
         let record_size = {
-            let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+            
+            self.open_dts.get(cg_id).ok_or_else(|| {
                 MdfError::BlockSerializationError("no open DT block for this channel group".into())
-            })?.record_size;
-            dt
+            })?.record_size
         };
         let max_records = (MAX_DT_BLOCK_SIZE - 24) / record_size;
         let mut buffer = Vec::with_capacity(record_size * max_records);
@@ -679,10 +679,10 @@ impl MdfWriter {
         I: IntoIterator<Item = &'a [u64]>,
     {
         let record_size = {
-            let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+            
+            self.open_dts.get(cg_id).ok_or_else(|| {
                 MdfError::BlockSerializationError("no open DT block for this channel group".into())
-            })?.record_size;
-            dt
+            })?.record_size
         };
         // Check ONCE that all encoders are unsigned integer type
         {
@@ -802,10 +802,10 @@ impl MdfWriter {
         I: IntoIterator<Item = &'a [f64]>,
     {
         let record_size = {
-            let dt = self.open_dts.get(cg_id).ok_or_else(|| {
+            
+            self.open_dts.get(cg_id).ok_or_else(|| {
                 MdfError::BlockSerializationError("no open DT block for this channel group".into())
-            })?.record_size;
-            dt
+            })?.record_size
         };
         // Check ONCE that all encoders are float types (F32 or F64).
         {

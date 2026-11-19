@@ -20,7 +20,7 @@ fn read_name_checked(addr: Option<u64>, file_data: &[u8]) -> Result<Option<Strin
 
 pub fn apply_bitfield_text(block: &ConversionBlock, value: DecodedValue, file_data: &[u8]) -> Result<DecodedValue, MdfError> {
     let raw = match value {
-        DecodedValue::UnsignedInteger(u) => u as u64,
+        DecodedValue::UnsignedInteger(u) => u,
         DecodedValue::SignedInteger(i) => i as u64,
         _ => return Ok(value),
     };

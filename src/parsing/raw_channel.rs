@@ -95,7 +95,7 @@ impl<'a> RawChannel {
                                 sdb_pos = 0;
                                 continue;
                             }
-                            Err(e) => return Some(Err(e.into())),
+                            Err(e) => return Some(Err(e)),
                         }
                     }
 

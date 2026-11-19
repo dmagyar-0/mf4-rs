@@ -174,11 +174,10 @@ pub(crate) mod f64_lossless {
 
     fn parse_f64_str(s: &str) -> f64 {
         let t = s.trim();
-        if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-            if let Ok(bits) = u64::from_str_radix(hex, 16) {
+        if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))
+            && let Ok(bits) = u64::from_str_radix(hex, 16) {
                 return f64::from_bits(bits);
             }
-        }
         match t.to_ascii_lowercase().as_str() {
             "inf" | "+inf" | "infinity" | "+infinity" => f64::INFINITY,
             "-inf" | "-infinity" => f64::NEG_INFINITY,
@@ -351,16 +350,14 @@ impl ConversionBlock {
                     // name (cc_tx_name) now, so applying the conversion later
                     // with empty file data (index reads) can still emit the
                     // "name = value" form without touching the file.
-                    if self.cc_type == ConversionType::BitfieldText {
-                        if let Some(name_addr) = nested_conversion.cc_tx_name {
+                    if self.cc_type == ConversionType::BitfieldText
+                        && let Some(name_addr) = nested_conversion.cc_tx_name {
                             let name_off = name_addr as usize;
-                            if name_off.saturating_add(24) <= file_data.len() {
-                                if let Some(name_text) = read_string_block(file_data, name_addr)? {
+                            if name_off.saturating_add(24) <= file_data.len()
+                                && let Some(name_text) = read_string_block(file_data, name_addr)? {
                                     resolved_texts.insert(i, name_text);
                                 }
-                            }
                         }
-                    }
 
                     // Check if this should be stored as default conversion
                     if Some(i) == default_ref_index {
@@ -479,15 +476,13 @@ impl ConversionBlock {
                     // For BitfieldText, also resolve the nested conversion's
                     // name (cc_tx_name) so index reads can emit
                     // "name = value" without file access.
-                    if self.cc_type == ConversionType::BitfieldText {
-                        if let Some(name_addr) = nested.cc_tx_name {
-                            if let Some(name_text) =
+                    if self.cc_type == ConversionType::BitfieldText
+                        && let Some(name_addr) = nested.cc_tx_name
+                            && let Some(name_text) =
                                 read_string_block_via_reader(reader, name_addr)?
                             {
                                 resolved_texts.insert(i, name_text);
                             }
-                        }
-                    }
 
                     if Some(i) == default_ref_index {
                         default_conversion = Some(Box::new(nested));

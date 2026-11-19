@@ -338,7 +338,7 @@ impl MdfWriter {
         if ch.channel_type == 1 { ch.bit_count = 64; }
         if let Some(off) = self.cg_offsets.get_mut(cg_id) {
             if auto_offset && ch.byte_offset == 0 { ch.byte_offset = *off as u32; }
-            let used = ((ch.bit_offset as usize + ch.bit_count as usize + 7) / 8) as usize;
+            let used = (ch.bit_offset as usize + ch.bit_count as usize).div_ceil(8);
             // Keep the running offset monotonic so a later auto-placed
             // channel can never overlap an explicitly placed one.
             *off = (*off).max(ch.byte_offset as usize + used);
@@ -391,14 +391,12 @@ impl MdfWriter {
         self.update_block_u8(cn_id, CHANNEL_TYPE_OFFSET, 2)?;
         self.update_block_u8(cn_id, SYNC_TYPE_OFFSET, 1)?;
 
-        if let Some((cg, idx)) = self.channel_map.get(cn_id).cloned() {
-            if let Some(chs) = self.cg_channels.get_mut(&cg) {
-                if let Some(ch) = chs.get_mut(idx) {
+        if let Some((cg, idx)) = self.channel_map.get(cn_id).cloned()
+            && let Some(chs) = self.cg_channels.get_mut(&cg)
+                && let Some(ch) = chs.get_mut(idx) {
                     ch.channel_type = 2;
                     ch.sync_type = 1;
                 }
-            }
-        }
         Ok(())
     }
 }

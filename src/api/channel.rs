@@ -127,7 +127,7 @@ impl<'a> Channel<'a> {
                 .raw_channel
                 .records(self.raw_data_group, self.raw_channel_group, self.mmap)?;
             for rec_res in records_iter {
-                let ref rec = rec_res?;
+                let rec = rec_res?;
                 if all_invalid {
                     out.push(None);
                 } else if let Some(decoded) = decode_channel_value(rec, record_id_len, self.block) {
@@ -215,7 +215,7 @@ impl<'a> Channel<'a> {
 
         let all_invalid = self.block.flags & 0x01 != 0;
         let conv = self.block.conversion.as_ref();
-        let has_conversion = conv.map_or(false, |c| c.cc_type != ConversionType::Identity);
+        let has_conversion = conv.is_some_and(|c| c.cc_type != ConversionType::Identity);
         let linear_coeffs = conv.and_then(|c| {
             if c.cc_type == ConversionType::Linear && c.cc_val.len() >= 2 {
                 Some((c.cc_val[0], c.cc_val[1]))

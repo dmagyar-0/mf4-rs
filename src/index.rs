@@ -378,7 +378,7 @@ pub struct FileRangeReader {
 impl FileRangeReader {
     pub fn new(file_path: &str) -> Result<Self, MdfError> {
         let file = std::fs::File::open(file_path)
-            .map_err(|e| MdfError::IOError(e))?;
+            .map_err(MdfError::IOError)?;
         Ok(Self { file })
     }
 }
@@ -407,11 +407,11 @@ impl ByteRangeReader for FileRangeReader {
         }
 
         self.file.seek(SeekFrom::Start(offset))
-            .map_err(|e| MdfError::IOError(e))?;
+            .map_err(MdfError::IOError)?;
 
         let mut buffer = vec![0u8; length as usize];
         self.file.read_exact(&mut buffer)
-            .map_err(|e| MdfError::IOError(e))?;
+            .map_err(MdfError::IOError)?;
 
         Ok(buffer)
     }
@@ -991,7 +991,7 @@ impl MdfIndex {
     pub fn from_file(file_path: &str) -> Result<Self, MdfError> {
         let mdf = Mdf::from_file(file_path)?;
         let file_size = std::fs::metadata(file_path)
-            .map_err(|e| MdfError::IOError(e))?
+            .map_err(MdfError::IOError)?
             .len();
         let mut index = Self::build_index(mdf, file_size)?;
         index.source = Some(Source::File(file_path.to_string()));
@@ -1384,8 +1384,8 @@ impl MdfIndex {
                     let data_list_block =
                         crate::blocks::data_list_block::DataListBlock::from_bytes(&dl_bytes)?;
 
-                    if current_block_address == data_block_addr && data_list_block.next == 0 {
-                        if let Some(derived) = Self::derive_equal_length_fragments(
+                    if current_block_address == data_block_addr && data_list_block.next == 0
+                        && let Some(derived) = Self::derive_equal_length_fragments(
                             &data_list_block,
                             expected_bytes,
                             file_size,
@@ -1393,7 +1393,6 @@ impl MdfIndex {
                             data_blocks.extend(derived);
                             break;
                         }
-                    }
 
                     for &fragment_address in &data_list_block.data_links {
                         let frag_header_bytes = probe_read!(fragment_address, 24);
@@ -1639,9 +1638,9 @@ impl MdfIndex {
                         // an inline offset to a fragment via cumulative
                         // data-section sizes, so a non-contiguous chain would
                         // silently mislocate entries — reject it here.
-                        if let Some(offsets) = &dl.offsets {
-                            if let Some(&declared) = offsets.get(i) {
-                                if declared != running_offset {
+                        if let Some(offsets) = &dl.offsets
+                            && let Some(&declared) = offsets.get(i)
+                                && declared != running_offset {
                                     return Err(MdfError::BlockSerializationError(format!(
                                         "non-contiguous VLSD ##SD chain is unsupported: \
                                          fragment at offset {} declares virtual start {} \
@@ -1649,8 +1648,6 @@ impl MdfIndex {
                                         fragment_address, declared, running_offset
                                     )));
                                 }
-                            }
-                        }
 
                         let data_section = frag_header.block_len.checked_sub(24).ok_or_else(|| {
                             MdfError::BlockSerializationError(format!(
@@ -1694,7 +1691,7 @@ impl MdfIndex {
     pub fn save(&self, index_path: &str) -> Result<(), MdfError> {
         let json = self.to_json()?;
         std::fs::write(index_path, json)
-            .map_err(|e| MdfError::IOError(e))?;
+            .map_err(MdfError::IOError)?;
         Ok(())
     }
 
@@ -1704,7 +1701,7 @@ impl MdfIndex {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load(index_path: &str) -> Result<Self, MdfError> {
         let json = std::fs::read_to_string(index_path)
-            .map_err(|e| MdfError::IOError(e))?;
+            .map_err(MdfError::IOError)?;
         Self::from_json(&json)
     }
 
@@ -2483,7 +2480,7 @@ impl MdfIndex {
                 "invalid index: record size is 0".to_string(),
             ));
         }
-        if block_data.len() % record_size != 0 {
+        if !block_data.len().is_multiple_of(record_size) {
             return Err(MdfError::BlockSerializationError(format!(
                 "data block length {} is not a multiple of the {}-byte record — \
                  record spans data block fragments, which is unsupported",
@@ -2536,7 +2533,7 @@ impl MdfIndex {
                 "invalid index: record size is 0".to_string(),
             ));
         }
-        if block_data.len() % record_size != 0 {
+        if !block_data.len().is_multiple_of(record_size) {
             return Err(MdfError::BlockSerializationError(format!(
                 "data block length {} is not a multiple of the {}-byte record — \
                  record spans data block fragments, which is unsupported",
@@ -2553,7 +2550,7 @@ impl MdfIndex {
         // of whether the group carries invalidation bytes. Short-circuit to
         // NaN for every sample, matching decode_records_to_values.
         if channel.flags & 0x1 != 0 {
-            values.extend(std::iter::repeat(f64::NAN).take(record_count));
+            values.extend(std::iter::repeat_n(f64::NAN, record_count));
             return Ok(());
         }
 
@@ -3201,7 +3198,7 @@ impl MdfIndex {
         {
             channel.bit_count as usize / 8
         } else {
-            ((channel.bit_offset as usize + channel.bit_count as usize + 7) / 8).max(1)
+            (channel.bit_offset as usize + channel.bit_count as usize).div_ceil(8).max(1)
         };
 
         let mut byte_ranges = Vec::new();

@@ -230,11 +230,10 @@ impl Mdf {
     /// channel group per signal, all sharing the source group's name).
     fn find(&self, name: &str, group: Option<&str>) -> Result<Option<(ChannelGroup<'_>, usize)>, MdfError> {
         for g in self.channel_groups() {
-            if let Some(wanted) = group {
-                if g.name()?.as_deref() != Some(wanted) {
+            if let Some(wanted) = group
+                && g.name()?.as_deref() != Some(wanted) {
                     continue;
                 }
-            }
             if let Some(ci) = g.position(name)? {
                 return Ok(Some((g, ci)));
             }

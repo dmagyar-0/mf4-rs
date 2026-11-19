@@ -98,7 +98,7 @@ impl BlockParse<'_> for SourceBlock {
 pub fn read_source_block(mmap: &[u8], address: u64) -> Result<SourceBlock, MdfError> {
 
     let start = address as usize;
-    if start.checked_add(24).map_or(true, |end| end > mmap.len()) {
+    if start.checked_add(24).is_none_or(|end| end > mmap.len()) {
         return Err(MdfError::TooShortBuffer {
             actual:   mmap.len(),
             expected: start.saturating_add(24),
@@ -124,5 +124,5 @@ pub fn read_source_block(mmap: &[u8], address: u64) -> Result<SourceBlock, MdfEr
         });
     }
     let slice = &mmap[start..end];
-    Ok(SourceBlock::from_bytes(slice)?)
+    SourceBlock::from_bytes(slice)
 }

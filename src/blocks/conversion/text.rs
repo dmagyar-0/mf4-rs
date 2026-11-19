@@ -9,7 +9,7 @@ use super::linear::extract_numeric;
 /// If no range matches, returns `n` (the default index).
 pub fn find_range_to_text_index(cc_val: &[f64], raw: f64, inclusive_upper: bool) -> usize {
     let len = cc_val.len();
-    if len < 2 || len % 2 != 0 { return 0; }
+    if len < 2 || !len.is_multiple_of(2) { return 0; }
     let n = len / 2;
     for i in 0..n {
         let min = cc_val[2*i];
@@ -40,11 +40,10 @@ pub fn apply_value_to_text(block: &ConversionBlock, value: DecodedValue, file_da
     }
 
     // If no match found and we have a default conversion, use it
-    if !is_match {
-        if let Some(default_conversion) = block.get_default_conversion() {
+    if !is_match
+        && let Some(default_conversion) = block.get_default_conversion() {
             return default_conversion.apply_decoded(value, &[]);
         }
-    }
 
     // Fallback to legacy behavior if no resolved data (for backward compatibility)
     let link = *block.cc_ref.get(idx).unwrap_or(&0);
@@ -113,11 +112,10 @@ pub fn apply_range_to_text(block: &ConversionBlock, value: DecodedValue, file_da
     }
 
     // If no range matched (idx == n_ranges) and we have a default conversion, use it
-    if !is_match {
-        if let Some(default_conversion) = block.get_default_conversion() {
+    if !is_match
+        && let Some(default_conversion) = block.get_default_conversion() {
             return default_conversion.apply_decoded(value, &[]);
         }
-    }
 
     // Fallback to legacy behavior if no resolved data (for backward compatibility)
     let link = *block.cc_ref.get(idx).unwrap_or(&0);
@@ -181,15 +179,14 @@ pub fn apply_text_to_value(block: &ConversionBlock, value: DecodedValue, file_da
     // wins deterministically (the HashMap has arbitrary iteration order).
     if let Some(resolved_texts) = &block.resolved_texts {
         for i in 0..n {
-            if let Some(resolved_text) = resolved_texts.get(&i) {
-                if input == *resolved_text {
+            if let Some(resolved_text) = resolved_texts.get(&i)
+                && input == *resolved_text {
                     if i < block.cc_val.len() {
                         return Ok(DecodedValue::Float(block.cc_val[i]));
                     } else {
                         return Ok(DecodedValue::Unknown);
                     }
                 }
-            }
         }
         // If we have resolved texts but no match found, return default or unknown
         if block.cc_val.len() > n {
@@ -203,15 +200,14 @@ pub fn apply_text_to_value(block: &ConversionBlock, value: DecodedValue, file_da
     for i in 0..n {
         let link = block.cc_ref[i];
         if link == 0 { continue; }
-        if let Some(key_str) = read_string_block(file_data, link)? {
-            if input == key_str {
+        if let Some(key_str) = read_string_block(file_data, link)?
+            && input == key_str {
                 if i < block.cc_val.len() {
                     return Ok(DecodedValue::Float(block.cc_val[i]));
                 } else {
                     return Ok(DecodedValue::Unknown);
                 }
             }
-        }
     }
     if block.cc_val.len() > n {
         Ok(DecodedValue::Float(block.cc_val[n]))
@@ -230,15 +226,14 @@ pub fn apply_text_to_text(block: &ConversionBlock, value: DecodedValue, file_dat
             let key_idx = 2 * i;
             let output_idx = 2 * i + 1;
             
-            if let Some(key_str) = resolved_texts.get(&key_idx) {
-                if *key_str == input {
+            if let Some(key_str) = resolved_texts.get(&key_idx)
+                && *key_str == input {
                     return if let Some(output_str) = resolved_texts.get(&output_idx) {
                         Ok(DecodedValue::String(output_str.clone()))
                     } else {
                         Ok(DecodedValue::String(input))
                     };
                 }
-            }
         }
         // Default case with resolved texts
         let default_idx = 2 * pairs;
@@ -253,15 +248,14 @@ pub fn apply_text_to_text(block: &ConversionBlock, value: DecodedValue, file_dat
     for i in 0..pairs {
         let key_link = block.cc_ref[2*i];
         let output_link = block.cc_ref[2*i + 1];
-        if let Some(key_str) = read_string_block(file_data, key_link)? {
-            if key_str == input {
+        if let Some(key_str) = read_string_block(file_data, key_link)?
+            && key_str == input {
                 return if output_link == 0 {
                     Ok(DecodedValue::String(input))
                 } else {
                     Ok(read_string_block(file_data, output_link)?.map(DecodedValue::String).unwrap_or(DecodedValue::String(input)))
                 };
             }
-        }
     }
     let default_link = *block.cc_ref.get(2*pairs).unwrap_or(&0);
     if default_link == 0 {

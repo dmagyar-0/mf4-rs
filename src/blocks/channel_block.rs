@@ -60,7 +60,7 @@ impl BlockParse<'_> for ChannelBlock {
         }
 
         Ok(Self {
-            header: header,
+            header,
             next_ch_addr: LittleEndian::read_u64(&bytes[24..32]),
             component_addr: LittleEndian::read_u64(&bytes[32..40]),
             name_addr: LittleEndian::read_u64(&bytes[40..48]),
