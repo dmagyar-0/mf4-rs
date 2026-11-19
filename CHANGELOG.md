@@ -1,3 +1,12 @@
+## v4.0.2 — 2026-11-19
+
+### Fixes
+- replace is_none/unwrap pairs and boolean match in the writer (#99)
+- resolve clippy warnings in the library (#98)
+
+### CI
+- build macOS wheels on macos-15 (#97)
+
 ## v4.0.1 — 2026-11-19
 
 ### Fixes
