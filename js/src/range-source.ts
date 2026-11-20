@@ -76,23 +76,32 @@ type FullBodyResponse = Awaited<ReturnType<FetchLike>> & {
  * A response body as bytes: streamed chunk by chunk when the response has a
  * readable body (`touch` is called for every chunk, restarting a stall
  * timer; `check` sees the running total and may throw to stop), else via
- * `arrayBuffer()`.
+ * `arrayBuffer()`. Every wait goes through `guard`, which rejects on a stall
+ * even when the `fetch` implementation ignores its abort signal.
  */
 async function readBody(
   res: FullBodyResponse,
   touch: () => void,
+  guard: <T>(pending: Promise<T>) => Promise<T>,
   check: (total: number) => void = () => {},
 ): Promise<Uint8Array> {
   const reader = res.body?.getReader?.();
   if (!reader) {
-    const buf = new Uint8Array(await res.arrayBuffer());
+    const buf = new Uint8Array(await guard(res.arrayBuffer()));
     check(buf.byteLength);
     return buf;
   }
   const chunks: Uint8Array[] = [];
   let total = 0;
   for (;;) {
-    const { done, value } = await reader.read();
+    let next: { done: boolean; value?: Uint8Array };
+    try {
+      next = await guard(reader.read());
+    } catch (e) {
+      await reader.cancel().catch(() => undefined);
+      throw e;
+    }
+    const { done, value } = next;
     if (done || !value) break;
     touch();
     total += value.byteLength;
@@ -193,6 +202,11 @@ export class FetchRangeSource implements RangeSource {
     if (!Number.isInteger(this.retries) || this.retries < 0) {
       throw new RangeError(`FetchRangeSource: retries must be a non-negative integer, got ${this.retries}`);
     }
+    for (const [name, value] of [["retryDelayMs", this.retryDelayMs], ["timeoutMs", this.timeoutMs]] as const) {
+      if (!Number.isFinite(value) || value < 0) {
+        throw new RangeError(`FetchRangeSource: ${name} must be a non-negative number, got ${value}`);
+      }
+    }
     const impl = fetchImpl ?? (globalThis as { fetch?: FetchLike }).fetch;
     if (!impl) {
       throw new Error(
@@ -216,14 +230,20 @@ export class FetchRangeSource implements RangeSource {
    * status (the response is cancelled before retrying), a network error
    * (`TypeError`, also thrown when a body is cut off) or a stall longer than
    * `timeoutMs` — waiting for the headers or between body chunks
-   * (`consume` calls `touch` for every chunk it reads). Other errors,
+   * (`consume` calls `touch` for every chunk it reads and wraps every wait
+   * in `guard`, so a stall is detected even when the `fetch` implementation
+   * ignores the abort signal). Other errors,
    * including those `consume` throws, are final. A response that is still
    * transient after the last retry is passed to `consume` for its status
    * handling.
    */
   private async request<T>(
     headers: Record<string, string> | undefined,
-    consume: (res: FullBodyResponse, touch: () => void) => Promise<T>,
+    consume: (
+      res: FullBodyResponse,
+      touch: () => void,
+      guard: <U>(pending: Promise<U>) => Promise<U>,
+    ) => Promise<T>,
   ): Promise<T> {
     let delay = this.retryDelayMs;
     for (let attempt = 0; ; attempt++) {
@@ -232,12 +252,20 @@ export class FetchRangeSource implements RangeSource {
         this.timeoutMs > 0 && typeof AbortController !== "undefined" ? new AbortController() : undefined;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let stalled = false;
+      let onStall: (reason: Error) => void = () => {};
+      const stall = new Promise<never>((_, reject) => {
+        onStall = reject;
+      });
+      stall.catch(() => undefined); // only observed through `guard`
+      const guard = <U>(pending: Promise<U>): Promise<U> =>
+        this.timeoutMs > 0 ? Promise.race([pending, stall]) : pending;
       const touch = (): void => {
-        if (!controller) return;
+        if (this.timeoutMs <= 0) return;
         clearTimeout(timer);
         timer = setTimeout(() => {
           stalled = true;
-          controller.abort();
+          controller?.abort();
+          onStall(new Error("stalled"));
         }, this.timeoutMs);
       };
       touch();
@@ -245,9 +273,8 @@ export class FetchRangeSource implements RangeSource {
         const init: { headers?: Record<string, string>; signal?: AbortSignal } = {};
         if (headers) init.headers = headers;
         if (controller) init.signal = controller.signal;
-        const res: FullBodyResponse = await this.fetchImpl(
-          this.url,
-          Object.keys(init).length > 0 ? init : undefined,
+        const res: FullBodyResponse = await guard(
+          this.fetchImpl(this.url, Object.keys(init).length > 0 ? init : undefined),
         );
         if (TRANSIENT_STATUSES.has(res.status) && !last) {
           clearTimeout(timer);
@@ -257,7 +284,7 @@ export class FetchRangeSource implements RangeSource {
           continue;
         }
         touch();
-        return await consume(res, touch);
+        return await consume(res, touch, guard);
       } catch (e) {
         const transient = stalled || e instanceof TypeError;
         if (!transient || last) {
@@ -278,7 +305,7 @@ export class FetchRangeSource implements RangeSource {
     if (this.cachedSize !== undefined) {
       return this.cachedSize;
     }
-    const known = await this.request({ Range: "bytes=0-0" }, async (res, touch) => {
+    const known = await this.request({ Range: "bytes=0-0" }, async (res, touch, guard) => {
       if (!res.ok) {
         throw new Error(`FetchRangeSource: HEAD-equivalent request failed with status ${res.status}`);
       }
@@ -299,18 +326,18 @@ export class FetchRangeSource implements RangeSource {
         return undefined;
       }
       // Server ignored Range and sent the full body; cache it for later reads.
-      this.cachedBody = await this.readFullBody(res, "the server ignored the Range header", touch);
+      this.cachedBody = await this.readFullBody(res, "the server ignored the Range header", touch, guard);
       return this.cachedBody.byteLength;
     });
     if (known !== undefined) {
       this.cachedSize = known;
       return known;
     }
-    const body = await this.request(undefined, async (full, touch) => {
+    const body = await this.request(undefined, async (full, touch, guard) => {
       if (!full.ok) {
         throw new Error(`FetchRangeSource: full GET for size failed with status ${full.status}`);
       }
-      return this.readFullBody(full, "the response did not expose its total size (Content-Range)", touch);
+      return this.readFullBody(full, "the response did not expose its total size (Content-Range)", touch, guard);
     });
     this.cachedBody = body;
     this.cachedSize = body.byteLength;
@@ -327,7 +354,7 @@ export class FetchRangeSource implements RangeSource {
     }
 
     const end = offset + length - 1;
-    const result = await this.request({ Range: `bytes=${offset}-${end}` }, async (res, touch) => {
+    const result = await this.request({ Range: `bytes=${offset}-${end}` }, async (res, touch, guard) => {
       // Every ranged response states the resource's total size; remember it
       // (it costs no request) so a mismatch with an index can be reported.
       const total = contentRangeTotal(res.headers.get("content-range"));
@@ -345,7 +372,7 @@ export class FetchRangeSource implements RangeSource {
       }
       if (res.status !== 206) {
         // Server returned 200 with the full body (ignored Range).
-        return { full: await this.readFullBody(res, "the server ignored the Range header", touch) };
+        return { full: await this.readFullBody(res, "the server ignored the Range header", touch, guard) };
       }
       // Server honoured the Range request — validate what it returned.
       const contentRange = res.headers.get("content-range");
@@ -357,7 +384,11 @@ export class FetchRangeSource implements RangeSource {
           );
         }
       }
-      const buf = await readBody(res, touch);
+      // Stop reading as soon as the body is longer than the range asked for.
+      const tooLong = new Error(`FetchRangeSource: 206 response body is longer than the ${length} bytes requested at offset ${offset}`);
+      const buf = await readBody(res, touch, guard, (total) => {
+        if (total > length) throw tooLong;
+      });
       if (buf.byteLength !== length) {
         throw new Error(
           `FetchRangeSource: 206 response body is ${buf.byteLength} bytes but ${length} were ` +
@@ -382,9 +413,14 @@ export class FetchRangeSource implements RangeSource {
    * a chunked or compressed response without an honest length is cut off
    * too.
    */
-  private async readFullBody(res: FullBodyResponse, reason: string, touch: () => void = () => {}): Promise<Uint8Array> {
+  private async readFullBody(
+    res: FullBodyResponse,
+    reason: string,
+    touch: () => void,
+    guard: <U>(pending: Promise<U>) => Promise<U>,
+  ): Promise<Uint8Array> {
     this.checkFullDownload(res, reason);
-    return readBody(res, touch, (total) => {
+    return readBody(res, touch, guard, (total) => {
       if (total > this.maxFullDownloadBytes) this.refuseFullDownload(total, reason, "more than ");
     });
   }

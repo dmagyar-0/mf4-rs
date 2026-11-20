@@ -221,3 +221,45 @@ test("readMany fetches a shared time axis once and matches the source groups", a
   column.dispose();
   index.dispose();
 });
+
+test("readMany fetches a large contiguous batch as bounded concurrent chunks", async () => {
+  const w = new MdfWriter();
+  w.initMdfFile();
+  const g = w.addChannelGroup("Big");
+  w.addTimeChannel(g, "t");
+  w.addFloatChannel(g, "a");
+  w.addFloatChannel(g, "b");
+  const n = 700_000;
+  const t = Float64Array.from({ length: n }, (_, i) => i * 1e-3);
+  const a = Float64Array.from({ length: n }, (_, i) => i % 1013);
+  w.startDataBlock(g);
+  w.writeColumns(g, [t, a, a]);
+  w.finishDataBlock(g);
+  const { bytes } = toColumnOriented(w.finalize(), {});
+  w.dispose();
+
+  const sizes: number[] = [];
+  let inFlight = 0;
+  let peak = 0;
+  const recording: RangeSource = {
+    size: () => Promise.resolve(bytes.length),
+    knownSize: () => bytes.length,
+    read: async (offset, length) => {
+      sizes.push(length);
+      peak = Math.max(peak, ++inFlight);
+      await new Promise((resolve) => setImmediate(resolve));
+      inFlight--;
+      return bytes.subarray(offset, offset + length);
+    },
+  };
+  const index = MdfIndex.fromBytes(bytes);
+  const [sa, sb] = await index.readMany(["a", "b"], { source: recording });
+  assert.equal(sa!.values.length, n);
+  assert.deepEqual(sb!.values.slice(0, 3), [0, 1, 2]);
+  assert.equal(sb!.timestamps[n - 1], (n - 1) * 1e-3);
+  // Three columns of 5.6 MB sit back to back: one 16.8 MB span, fetched as
+  // 8 MiB chunks in parallel rather than one huge request.
+  assert.ok(Math.max(...sizes) <= 8 * 1024 * 1024, `largest request ${Math.max(...sizes)}`);
+  assert.ok(sizes.length >= 3 && peak >= 2, `${sizes.length} requests, ${peak} in flight`);
+  index.dispose();
+});

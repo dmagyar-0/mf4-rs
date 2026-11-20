@@ -114,7 +114,7 @@ const lazySpeed = await index.read("Speed");               // range requests hap
 | `groups` | list of `GroupInfo` | Every channel group, in file order. |
 | `channel_names` | list of names | Every named channel across all groups (duplicates kept). |
 | `start_time_ns` | integer or nothing | Measurement start, nanoseconds since the Unix epoch. |
-| `group(name)` | `GroupInfo` or nothing | First group with that name. In a column-oriented file the per-signal groups of a source group are merged back into it, time channel first, so the answer matches the source file's. |
+| `group(name)` | `GroupInfo` or nothing | First group with that name. In a column-oriented file the per-signal groups of a source group are merged back into it, time channel first, so the answer matches the source file's. (Groups are merged when they share a time axis, or are untimed one-channel groups; two same-named source groups that share a time axis, or same-named untimed one-channel groups, therefore come back as one.) |
 | `channel(name, group?)` | `ChannelInfo` or nothing | First channel with that name; `group` restricts the search. |
 
 ### Data
@@ -191,8 +191,10 @@ response, or status `408`, `429`, `500`, `502`, `503` or `504` (e.g. S3
 a `Retry-After` of up to 10 s); other statuses fail at once. Rust and Python
 give up on a connection after 30 s and on a response that sends nothing for
 60 s. In TypeScript, `FetchRangeSource` takes `retries`, `retryDelayMs` and
-`timeoutMs` options; the timeout (default 60 s) applies whenever the server
-sends nothing — no headers, or no next part of the body.
+`timeoutMs` options (also accepted by `MdfIndex.fromUrl`); the timeout
+(default 60 s) applies whenever the server sends nothing — no headers, or no
+next part of the body. TypeScript `Mdf.fromUrl` is a single plain `fetch`
+without retries.
 
 ### `Mdf` only
 

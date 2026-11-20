@@ -5,6 +5,7 @@ import {
   FetchRangeSource,
   type RangeSource,
   type FetchLike,
+  type FetchRangeSourceOptions,
 } from "./range-source";
 import { ChannelNotFoundError, guard } from "./errors";
 import { hasWindow, wasmWindow } from "./signal-util";
@@ -18,6 +19,17 @@ import type {
   Signal,
   TimeRange,
 } from "./types";
+
+/** Ranges longer than this (8 MiB) are fetched as several concurrent
+ * requests, as the native reader does: one connection to an object store is
+ * far slower than several. */
+const FETCH_CHUNK_BYTES = 8 * 1024 * 1024;
+/** Most requests one fetch round keeps in flight. */
+const MAX_CONCURRENT_FETCHES = 16;
+/** `readMany` of whole channels fetches the whole batch at once only while it
+ * needs at most this many bytes (256 MiB); a larger batch is read channel by
+ * channel so its memory stays bounded. */
+const READ_MANY_BATCH_BYTES = 256 * 1024 * 1024;
 
 /**
  * Read `[offset, offset + length)` and insist on getting all of it: a short
@@ -358,14 +370,15 @@ export class MdfIndex {
    * bound to the index, so `values(name)` / `read(name)` read lazily from it.
    *
    * Pass `options` to tune the fetch windows for your file's shape — see
-   * {@link IndexBuildOptions}.
+   * {@link IndexBuildOptions} — and the source's retries and timeout — see
+   * {@link FetchRangeSourceOptions}.
    */
   static async fromUrl(
     url: string,
     fetchImpl?: FetchLike,
-    options?: IndexBuildOptions,
+    options?: IndexBuildOptions & FetchRangeSourceOptions,
   ): Promise<MdfIndex> {
-    return MdfIndex.fromRangeSource(new FetchRangeSource(url, fetchImpl), options);
+    return MdfIndex.fromRangeSource(new FetchRangeSource(url, fetchImpl, options), options);
   }
 
   /**
@@ -570,8 +583,9 @@ export class MdfIndex {
    * one `Signal` per name, in order — like calling {@link read} for each,
    * but every byte range of the batch is fetched concurrently, a time axis
    * shared by several of the channels (every signal of a source group in a
-   * column-oriented file) is fetched and decoded once, and a time window is
-   * searched once per time axis. Throws `ChannelNotFoundError` — before
+   * column-oriented file) is fetched once, and a time window is searched
+   * once per time axis. Ranges over 8 MiB are fetched as concurrent chunks,
+   * and a batch over 256 MiB is read channel by channel to bound memory. Throws `ChannelNotFoundError` — before
    * fetching anything — if any name is unknown.
    */
   async readMany(names: string[], options: ReadOptions = {}): Promise<Signal[]> {
@@ -591,12 +605,33 @@ export class MdfIndex {
     // concurrently in one go...
     const perName = names.map((name) => this.signalByteRanges(name, options.group));
     const spans = mergeByteRanges(perName.flat());
+    const batchBytes = spans.reduce((sum, [, length]) => sum + length, 0);
+    if (batchBytes > READ_MANY_BATCH_BYTES) {
+      // Too much to hold at once: one channel (and its time axis) at a time.
+      const conversions = await this.#fetchBatchConversions(names, options.group, source, raw);
+      const signals: Signal[] = [];
+      for (const [i, name] of names.entries()) {
+        const own = mergeByteRanges(perName[i]!);
+        const fetched = await this.#fetchAll(source, own);
+        signals.push(
+          this.readFromFragments(
+            name,
+            options.group,
+            [...conversions.ranges, ...own],
+            [...conversions.fragments, ...fetched],
+            raw,
+          ),
+        );
+      }
+      return signals;
+    }
     const [fetched, conversions] = await Promise.all([
       this.#fetchAll(source, spans),
       this.#fetchBatchConversions(names, options.group, source, raw),
     ]);
     // ...then decoded one channel at a time from zero-copy views of the
     // fetched bytes, so wasm never holds more than one channel's samples.
+    // (`mergeByteRanges` only unions, so every range lies inside one span.)
     return names.map((name, i) => {
       const ranges: ByteRange[] = [...conversions.ranges];
       const fragments: Uint8Array[] = [...conversions.fragments];
@@ -799,23 +834,46 @@ export class MdfIndex {
   }
 
   /**
-   * Fetch `spans` from `source` concurrently (each in full), refusing a
-   * source whose size — once it is known without an extra request, e.g. from
-   * a `Content-Range` header — differs from the indexed file's: the file
-   * behind it was replaced, and its bytes would be decoded at offsets meant
-   * for another file.
+   * Fetch `spans` from `source` (each in full, one `Uint8Array` per span),
+   * at most {@link MAX_CONCURRENT_FETCHES} requests at a time, a span longer
+   * than {@link FETCH_CHUNK_BYTES} as several concurrent chunk requests.
+   * Refuses a source whose size — once it is known without an extra
+   * request, e.g. from a `Content-Range` header — differs from the indexed
+   * file's: the file behind it was replaced, and its bytes would be decoded
+   * at offsets meant for another file.
    */
   async #fetchAll(source: RangeSource, spans: ByteRange[]): Promise<Uint8Array[]> {
-    let fetched: Uint8Array[];
+    const out: Uint8Array[] = spans.map(([, length]) =>
+      length > FETCH_CHUNK_BYTES ? new Uint8Array(length) : new Uint8Array(0),
+    );
+    const jobs: (() => Promise<void>)[] = [];
+    spans.forEach(([offset, length], i) => {
+      if (length <= FETCH_CHUNK_BYTES) {
+        jobs.push(async () => {
+          out[i] = await readExact(source, offset, length);
+        });
+        return;
+      }
+      for (let at = 0; at < length; at += FETCH_CHUNK_BYTES) {
+        const size = Math.min(FETCH_CHUNK_BYTES, length - at);
+        jobs.push(async () => {
+          out[i]!.set(await readExact(source, offset + at, size), at);
+        });
+      }
+    });
     try {
-      fetched = await Promise.all(spans.map(([offset, length]) => readExact(source, offset, length)));
+      let next = 0;
+      const worker = async (): Promise<void> => {
+        while (next < jobs.length) await jobs[next++]!();
+      };
+      await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT_FETCHES, jobs.length) }, worker));
     } catch (e) {
       // A size mismatch explains the failure better; keep the original as its cause.
       this.#checkSourceSize(source, e);
       throw e;
     }
     this.#checkSourceSize(source);
-    return fetched;
+    return out;
   }
 
   #checkSourceSize(source: RangeSource, cause?: unknown): void {

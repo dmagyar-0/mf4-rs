@@ -3519,7 +3519,7 @@ impl MdfIndex {
         http: &mut HttpRangeReader,
         op: impl FnMut(&mut RecordingRangeReader<'_>) -> Result<T, MdfError>,
     ) -> Result<T, MdfError> {
-        self.batched_reads_seeded(http, FragmentStore::new(), op)
+        self.batched_reads_seeded(http, &mut FragmentStore::new(), op)
     }
 
     /// [`batched_reads`](Self::batched_reads) starting from bytes already
@@ -3530,11 +3530,11 @@ impl MdfIndex {
     fn batched_reads_seeded<T>(
         &self,
         http: &mut HttpRangeReader,
-        mut store: FragmentStore,
+        store: &mut FragmentStore,
         mut op: impl FnMut(&mut RecordingRangeReader<'_>) -> Result<T, MdfError>,
     ) -> Result<T, MdfError> {
         for _ in 0..MAX_BATCH_ROUNDS {
-            let mut recorder = RecordingRangeReader { store: &store, misses: Vec::new(), whole_request: true };
+            let mut recorder = RecordingRangeReader { store: &*store, misses: Vec::new(), whole_request: true };
             let result = op(&mut recorder);
             let misses = std::mem::take(&mut recorder.misses);
             if misses.is_empty() {
@@ -3663,21 +3663,7 @@ impl MdfIndex {
             let values = values?;
             return Ok(self.make_signal(g, c, timestamps?, values));
         }
-        // A time window depends on the time axis searched, a record window
-        // only on the group's record count.
-        let axis = match window {
-            Window::Time(..) => self.time_axis_location(g, c),
-            _ => None,
-        };
-        let key = (axis, self.channel_groups[g].record_count);
-        let (start, count) = match windows.get(&key) {
-            Some(&resolved) => resolved,
-            None => {
-                let resolved = self.resolve_window(g, c, window, reader)?;
-                windows.insert(key, resolved);
-                resolved
-            }
-        };
+        let (start, count) = self.cached_window(g, c, window, reader, windows)?;
         let values = self.read_channel_values_window(g, c, start, count, raw, reader);
         let timestamps = match master {
             Some((mg, m)) => Self::cached_axis(axes, (mg, m, start, count), || {
@@ -3691,6 +3677,30 @@ impl MdfIndex {
         };
         let values = values?;
         Ok(self.make_signal(g, c, timestamps?, values))
+    }
+
+    /// [`resolve_window`](Self::resolve_window) through `cache`: a time window
+    /// depends on the time axis searched, a record window only on the
+    /// group's record count.
+    fn cached_window<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        g: usize,
+        c: usize,
+        window: Window,
+        reader: &mut R,
+        cache: &mut WindowCache,
+    ) -> Result<(u64, u64), MdfError> {
+        let axis = match window {
+            Window::Time(..) => self.time_axis_location(g, c),
+            _ => None,
+        };
+        let key = (axis, self.channel_groups[g].record_count);
+        if let Some(&resolved) = cache.get(&key) {
+            return Ok(resolved);
+        }
+        let resolved = self.resolve_window(g, c, window, reader)?;
+        cache.insert(key, resolved);
+        Ok(resolved)
     }
 
     fn cached_axis(
@@ -3759,15 +3769,73 @@ impl MdfIndex {
             }
         }
         let (mut http, fetched) = cached.into_parts();
-        let store = FragmentStore::from_pairs(fetched)?;
-        if window == Window::All && self.whole_read_bytes(targets) > batch_limit {
+        let mut store = FragmentStore::from_pairs(fetched)?;
+        let bytes = if window == Window::All {
+            self.whole_read_bytes(targets)
+        } else {
+            // Locate every window first (a few rounds of single-record
+            // probes), to know how much the read itself will fetch.
+            let resolved = self.batched_reads_seeded(&mut http, &mut store, |r| self.resolve_windows(targets, window, r))?;
+            self.window_read_bytes(targets, &resolved)
+        };
+        if bytes > batch_limit {
             // Too much to hold at once: stream channel by channel (one
             // section in memory at a time), each large section still fetched
-            // as concurrent chunks; time axes are still read once.
+            // as concurrent chunks; time axes are still read once, and the
+            // window probes are served from the bytes already fetched.
             let mut reader = ChunkedUrlReader { http, store };
             return self.read_many_at(targets, window, raw, &mut reader);
         }
-        self.batched_reads_seeded(&mut http, store, |r| self.read_many_at(targets, window, raw, r))
+        self.batched_reads_seeded(&mut http, &mut store, |r| self.read_many_at(targets, window, raw, r))
+    }
+
+    /// The record window `(start, count)` of every target, resolved as
+    /// [`read_many_at`](Self::read_many_at) does (once per time axis). Every
+    /// target is attempted, so a probing reader records all probes of a round.
+    #[cfg(feature = "http")]
+    fn resolve_windows<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        targets: &[(usize, usize)],
+        window: Window,
+        reader: &mut R,
+    ) -> Result<Vec<(u64, u64)>, MdfError> {
+        let mut cache = WindowCache::new();
+        let mut out = Vec::with_capacity(targets.len());
+        let mut first_error = None;
+        for &(g, c) in targets {
+            match self.cached_window(g, c, window, reader, &mut cache) {
+                Ok(resolved) => out.push(resolved),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+
+    /// Upper bound of the bytes a windowed `read_many` fetches once its
+    /// windows are resolved: the selected records of every group involved
+    /// (each group once, at its widest window) plus the `##SD` streams of
+    /// VLSD channels.
+    #[cfg(feature = "http")]
+    fn window_read_bytes(&self, targets: &[(usize, usize)], resolved: &[(u64, u64)]) -> u64 {
+        let mut records: std::collections::BTreeMap<usize, u64> = std::collections::BTreeMap::new();
+        let mut total = 0u64;
+        for (&(g, c), &(_, count)) in targets.iter().zip(resolved) {
+            for group in std::iter::once(g).chain(self.master_location(g, c).map(|(mg, _)| mg)) {
+                let widest = records.entry(group).or_default();
+                *widest = (*widest).max(count);
+            }
+            let channel = &self.channel_groups[g].channels[c];
+            total = total.saturating_add(channel.vlsd_data_blocks.iter().map(|b| b.size).sum());
+        }
+        records.into_iter().fold(total, |sum, (g, count)| {
+            let record = Self::checked_record_size(&self.channel_groups[g]).unwrap_or(0) as u64;
+            sum.saturating_add(count.saturating_mul(record))
+        })
     }
 
     /// Bytes a whole-channel `read_many` of `targets` fetches: every data
@@ -4743,8 +4811,8 @@ mod url_read_tests {
         w.finalize().unwrap();
     }
 
-    /// Whole channels over a URL give the same signals batched and streamed
-    /// (the path taken above the memory limit), on a row-oriented file split
+    /// Whole channels and windows over a URL give the same signals batched
+    /// and streamed (the path taken above the memory limit), on a row-oriented file split
     /// into several data blocks and on its column-oriented conversion.
     #[test]
     fn streamed_and_batched_whole_reads_agree() {
@@ -4760,13 +4828,20 @@ mod url_read_tests {
             let url = serve(std::fs::read(path).unwrap());
             let names = ["A", "t", "B", "A"];
             let targets = index.locate_all(&names, None).unwrap();
-            let expected = mdf.read_many(&names, &ReadOptions::new()).unwrap();
-            for limit in [0, u64::MAX] {
-                for raw in [false, true] {
-                    let got = index.read_many_url_limited(&url, &targets, Window::All, raw, limit).unwrap();
-                    let want = if raw { mdf.read_many(&names, &ReadOptions::new().raw(true)).unwrap() } else { expected.clone() };
+            let option_sets = [
+                ReadOptions::new(),
+                ReadOptions::new().raw(true),
+                ReadOptions::new().time(Some(12.5), Some(250.0)),
+                ReadOptions::new().time(Some(100.0), None).raw(true),
+                ReadOptions::new().records(1000, 150_000),
+            ];
+            for options in &option_sets {
+                let want = mdf.read_many(&names, options).unwrap();
+                let window = options.window().unwrap();
+                for limit in [0, u64::MAX] {
+                    let got = index.read_many_url_limited(&url, &targets, window, options.raw, limit).unwrap();
                     for (g, w) in got.iter().zip(&want) {
-                        assert_eq!((&g.values, &g.timestamps), (&w.values, &w.timestamps), "limit {limit} raw {raw}");
+                        assert_eq!((&g.values, &g.timestamps), (&w.values, &w.timestamps), "limit {limit} {options:?}");
                     }
                 }
             }

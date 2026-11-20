@@ -163,6 +163,51 @@ test("FetchRangeSource times out a body that stalls, and retries it", async () =
   assert.equal(calls, 2);
 });
 
+test("FetchRangeSource detects stalls even when fetch ignores the abort signal", async () => {
+  let calls = 0;
+  // Never settles and never looks at init.signal.
+  const deaf = () => {
+    calls++;
+    return new Promise<never>(() => {});
+  };
+  const source = new FetchRangeSource("http://example.invalid/f.mf4", deaf, { timeoutMs: 20, retries: 1, retryDelayMs: 1 });
+  await assert.rejects(source.read(0, 4), /sent nothing for 20 ms/);
+  assert.equal(calls, 2);
+
+  // A body whose arrayBuffer() never settles.
+  const stuckBody = async () => ({
+    ok: true,
+    status: 206,
+    headers: { get: (name: string) => (name.toLowerCase() === "content-range" ? "bytes 0-3/4" : null) },
+    arrayBuffer: () => new Promise<ArrayBuffer>(() => {}),
+  });
+  const body = new FetchRangeSource("http://example.invalid/f.mf4", stuckBody, { timeoutMs: 20, retries: 0 });
+  await assert.rejects(body.read(0, 4), /sent nothing for 20 ms/);
+  assert.throws(() => new FetchRangeSource("http://x/", stuckBody, { timeoutMs: Number.NaN }), RangeError);
+});
+
+test("FetchRangeSource stops reading a 206 body longer than requested", async () => {
+  let chunksRead = 0;
+  const huge = async () => ({
+    ok: true,
+    status: 206,
+    headers: { get: (name: string) => (name.toLowerCase() === "content-range" ? "bytes 0-3/1000000" : null) },
+    arrayBuffer: async () => new ArrayBuffer(0),
+    body: {
+      getReader: () => ({
+        read: async () => {
+          chunksRead++;
+          return { done: false, value: new Uint8Array(1024) };
+        },
+        cancel: async () => undefined,
+      }),
+    },
+  });
+  const source = new FetchRangeSource("http://example.invalid/f.mf4", huge, { retries: 0 });
+  await assert.rejects(source.read(0, 4), /longer than the 4 bytes requested/);
+  assert.equal(chunksRead, 1, "the body is cancelled after the first oversized chunk");
+});
+
 test("FetchRangeSource does not retry errors that are not network failures", async () => {
   let calls = 0;
   const failing = async (): Promise<never> => {
