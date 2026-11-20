@@ -1,3 +1,8 @@
+## v4.0.3 — 2026-11-20
+
+### Fixes
+- make cloud-hosted index reads fast and fail clearly (#100)
+
 ## v4.0.2 — 2026-11-19
 
 ### Fixes
