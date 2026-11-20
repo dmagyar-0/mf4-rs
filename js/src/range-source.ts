@@ -98,7 +98,7 @@ async function readBody(
     try {
       next = await guard(reader.read());
     } catch (e) {
-      await reader.cancel().catch(() => undefined);
+      void reader.cancel().catch(() => undefined); // never awaited: it could hang
       throw e;
     }
     const { done, value } = next;
@@ -108,7 +108,7 @@ async function readBody(
     try {
       check(total);
     } catch (e) {
-      await reader.cancel().catch(() => undefined);
+      void reader.cancel().catch(() => undefined); // never awaited: it could hang
       throw e;
     }
     chunks.push(value);
@@ -203,8 +203,9 @@ export class FetchRangeSource implements RangeSource {
       throw new RangeError(`FetchRangeSource: retries must be a non-negative integer, got ${this.retries}`);
     }
     for (const [name, value] of [["retryDelayMs", this.retryDelayMs], ["timeoutMs", this.timeoutMs]] as const) {
-      if (!Number.isFinite(value) || value < 0) {
-        throw new RangeError(`FetchRangeSource: ${name} must be a non-negative number, got ${value}`);
+      // Timers clamp delays above 2^31 - 1 ms to ~1 ms.
+      if (!Number.isFinite(value) || value < 0 || value > 2_147_483_647) {
+        throw new RangeError(`FetchRangeSource: ${name} must be between 0 and 2147483647 ms, got ${value}`);
       }
     }
     const impl = fetchImpl ?? (globalThis as { fetch?: FetchLike }).fetch;
@@ -278,7 +279,7 @@ export class FetchRangeSource implements RangeSource {
         );
         if (TRANSIENT_STATUSES.has(res.status) && !last) {
           clearTimeout(timer);
-          await res.body?.cancel?.().catch(() => undefined);
+          void res.body?.cancel?.().catch(() => undefined); // never awaited: it could hang
           await sleep(Math.min(retryAfterMs(res.headers.get("retry-after")) ?? delay, MAX_RETRY_DELAY_MS));
           delay *= 2;
           continue;
@@ -314,7 +315,7 @@ export class FetchRangeSource implements RangeSource {
         if (contentRange) {
           const total = contentRange.split("/")[1];
           if (total && total !== "*") {
-            await res.body?.cancel?.().catch(() => undefined);
+            void res.body?.cancel?.().catch(() => undefined); // never awaited: it could hang
             return Number(total);
           }
         }
@@ -322,7 +323,7 @@ export class FetchRangeSource implements RangeSource {
         // be cached as the full file. Fall back to a plain GET (below). (In a
         // browser this usually means the server's CORS policy does not expose
         // `Content-Range`: add `Access-Control-Expose-Headers: Content-Range`.)
-        await res.body?.cancel?.().catch(() => undefined);
+        void res.body?.cancel?.().catch(() => undefined); // never awaited: it could hang
         return undefined;
       }
       // Server ignored Range and sent the full body; cache it for later reads.

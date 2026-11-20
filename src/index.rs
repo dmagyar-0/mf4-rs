@@ -3775,8 +3775,12 @@ impl MdfIndex {
         } else {
             // Locate every window first (a few rounds of single-record
             // probes), to know how much the read itself will fetch.
-            let resolved = self.batched_reads_seeded(&mut http, &mut store, |r| self.resolve_windows(targets, window, r))?;
-            self.window_read_bytes(targets, &resolved)
+            // A failure here is left to the read below, which reports the
+            // channels' errors in the same order as a loop of `read`.
+            match self.batched_reads_seeded(&mut http, &mut store, |r| self.resolve_windows(targets, window, r)) {
+                Ok(resolved) => self.window_read_bytes(targets, &resolved),
+                Err(_) => 0,
+            }
         };
         if bytes > batch_limit {
             // Too much to hold at once: stream channel by channel (one

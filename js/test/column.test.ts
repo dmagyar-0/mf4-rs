@@ -263,3 +263,23 @@ test("readMany fetches a large contiguous batch as bounded concurrent chunks", a
   assert.ok(sizes.length >= 3 && peak >= 2, `${sizes.length} requests, ${peak} in flight`);
   index.dispose();
 });
+
+test("a failed fetch starts no further requests", async () => {
+  const bytes = toColumnOriented(buildSource(), {}).bytes;
+  const index = MdfIndex.fromBytes(bytes);
+  let started = 0;
+  // The first request fails at once; the others answer slowly.
+  const failing: RangeSource = {
+    size: () => Promise.resolve(bytes.length),
+    read: async (offset, length) => {
+      if (started++ === 0) throw new Error("boom");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return bytes.subarray(offset, offset + length);
+    },
+  };
+  // Two time axes: the first round probes more than 16 separate ranges.
+  await assert.rejects(index.readMany(["Speed", "Pressure"], { source: failing, startTime: 1, endTime: 2 }), /boom/);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(started <= 16, `${started} requests started`);
+  index.dispose();
+});

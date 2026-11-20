@@ -184,6 +184,7 @@ test("FetchRangeSource detects stalls even when fetch ignores the abort signal",
   const body = new FetchRangeSource("http://example.invalid/f.mf4", stuckBody, { timeoutMs: 20, retries: 0 });
   await assert.rejects(body.read(0, 4), /sent nothing for 20 ms/);
   assert.throws(() => new FetchRangeSource("http://x/", stuckBody, { timeoutMs: Number.NaN }), RangeError);
+  assert.throws(() => new FetchRangeSource("http://x/", stuckBody, { timeoutMs: 1e10 }), RangeError);
 });
 
 test("FetchRangeSource stops reading a 206 body longer than requested", async () => {

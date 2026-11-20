@@ -585,7 +585,10 @@ export class MdfIndex {
    * shared by several of the channels (every signal of a source group in a
    * column-oriented file) is fetched once, and a time window is searched
    * once per time axis. Ranges over 8 MiB are fetched as concurrent chunks,
-   * and a batch over 256 MiB is read channel by channel to bound memory. Throws `ChannelNotFoundError` — before
+   * and a whole-channel batch over 256 MiB is read channel by channel to
+   * bound memory. A windowed batch keeps every selected record in memory
+   * until it is decoded — for very wide windows over many channels, call
+   * {@link read} per channel instead. Throws `ChannelNotFoundError` — before
    * fetching anything — if any name is unknown.
    */
   async readMany(names: string[], options: ReadOptions = {}): Promise<Signal[]> {
@@ -857,14 +860,23 @@ export class MdfIndex {
       for (let at = 0; at < length; at += FETCH_CHUNK_BYTES) {
         const size = Math.min(FETCH_CHUNK_BYTES, length - at);
         jobs.push(async () => {
-          out[i]!.set(await readExact(source, offset + at, size), at);
+          out[i]!.set((await readExact(source, offset + at, size)).subarray(0, size), at);
         });
       }
     });
     try {
       let next = 0;
+      let failed = false;
+      // After a failure no further request is started.
       const worker = async (): Promise<void> => {
-        while (next < jobs.length) await jobs[next++]!();
+        while (!failed && next < jobs.length) {
+          try {
+            await jobs[next++]!();
+          } catch (e) {
+            failed = true;
+            throw e;
+          }
+        }
       };
       await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT_FETCHES, jobs.length) }, worker));
     } catch (e) {
