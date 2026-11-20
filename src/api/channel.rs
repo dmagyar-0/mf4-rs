@@ -249,8 +249,8 @@ impl<'a> Channel<'a> {
         // Applies conversion to one raw record slice, returning the physical f64.
         let convert_record = |rec: &[u8], out: &mut Vec<f64>| -> Result<(), MdfError> {
             if let Some((a, b)) = linear_coeffs {
-                let raw = decode_f64_from_record(rec, record_id_len, self.block);
-                out.push(a + b * raw);
+                let stored = decode_f64_from_record(rec, record_id_len, self.block);
+                out.push(a + b * stored);
             } else if has_conversion {
                 if let Some(decoded) = decode_channel_value(rec, record_id_len, self.block) {
                     match self.block.apply_conversion_value(decoded, self.mmap)? {

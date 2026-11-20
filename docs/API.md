@@ -130,7 +130,7 @@ const lazySpeed = await index.read("Speed");               // range requests hap
 | `group` | Look only in the group(s) with this name. A column-oriented file has one group per signal, all named after the source group — every group with the name is searched. |
 | `start_time`, `end_time` | Inclusive time window in the master channel's unit (seconds relative to the measurement start). Either bound may be omitted. |
 | `start_record`, `record_count` | Record window `[start_record, start_record + record_count)`. Reaching past the last record is an error. |
-| `raw` | `true`: return the values as stored in the file, without the channel's conversion (default `false`). A linear channel gives its stored numbers, a value-to-text channel its integer keys instead of the texts. Only the requested channel is affected: `timestamps` and time windows still use the physical (converted) time axis. On `MdfIndex` a raw read never fetches the channel's conversion block. Invalidation bits still apply. |
+| `raw` | `true`: return the values as stored in the file, without the channel's conversion (default `false`). A linear channel gives its stored numbers, a value-to-text channel its integer keys instead of the texts. Only the requested channel is affected: `timestamps` and time windows still use the physical (converted) time axis. On `MdfIndex` a raw read never fetches the channel's conversion block. Invalidation bits still apply. `unit` is the channel's (physical) unit, unchanged. |
 
 Pass a time window **or** a record window, not both. On `MdfIndex` a window
 fetches only the selected records; a time window is located by searching the

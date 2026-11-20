@@ -155,7 +155,7 @@ impl From<&ConversionBlock> for ConversionInfo {
 /// conversion (a linear channel gives its stored numbers, a value-to-text
 /// channel its keys instead of the texts). Only the requested channel is
 /// affected: `timestamps` and time windows still use the physical (converted)
-/// time axis.
+/// time axis. `unit` is the channel's (physical) unit, unchanged.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReadOptions {
     /// Group name, to disambiguate a channel name used by several groups.

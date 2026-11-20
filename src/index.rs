@@ -3158,7 +3158,7 @@ impl MdfIndex {
         if window == Window::All {
             return self.read_values_f64_via_source(g, c, options.raw);
         }
-        let mut reader = self.source_reader(g, c, options.raw, matches!(window, Window::Time(..)))?;
+        let mut reader = self.source_reader(g, c, options.raw, false)?;
         let (start, count) = self.resolve_window_via(g, c, window, &mut reader)?;
         self.values_f64_window(g, c, start, count, options.raw, &mut reader)
     }
@@ -3343,8 +3343,9 @@ impl MdfIndex {
 
     /// A byte-range reader over the attached source, with the conversion of
     /// `(g, c)` resolved up front for URL sources (unless `raw`).
-    /// `with_master`: the read decodes the time axis (a signal, or a time
-    /// window search), so the master's conversion is primed too.
+    /// `with_master`: the read decodes the time axis through this reader (a
+    /// signal), so the master's conversion is primed too. A URL time-window
+    /// search runs through `batched_reads`, which bypasses this cache.
     fn source_reader(&self, g: usize, c: usize, raw: bool, with_master: bool) -> Result<SourceReader, MdfError> {
         let _ = (g, c, raw, with_master);
         match self.require_source()? {
