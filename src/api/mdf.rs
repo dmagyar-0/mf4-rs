@@ -91,7 +91,8 @@ impl Mdf {
         let Some(first) = names.iter().position(|n| n.as_deref() == Some(name)) else {
             return Ok(None);
         };
-        let members = logical_group_members(&names, &Self::time_groups(&groups), first);
+        let channel_counts: Vec<usize> = groups.iter().map(|g| g.raw_channel_group().raw_channels.len()).collect();
+        let members = logical_group_members(&names, &Self::time_groups(&groups), &channel_counts, first);
         let infos = members.iter().map(|&m| groups[m].info()).collect::<Result<Vec<_>, _>>()?;
         Ok(Some(merge_group_infos(groups[first].info()?, infos)))
     }

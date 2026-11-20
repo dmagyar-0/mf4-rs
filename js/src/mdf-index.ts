@@ -580,29 +580,34 @@ export class MdfIndex {
     for (const name of names) this.#requireChannel(name, options.group);
     if (names.length === 0) return [];
     const source = this.#requireSource(options);
-    const ranges: ByteRange[] = [];
-    const fragments: Uint8Array[] = [];
-    if (!hasWindow(options)) {
-      // Whole channels: every data block of the batch (channels and their
-      // time axes, each once) in one concurrent fetch, then any deferred
-      // conversion blocks, so the decode below needs no further round.
-      const spans = mergeByteRanges(names.flatMap((name) => this.signalByteRanges(name, options.group)));
-      const fetched = await this.#fetchAll(source, spans);
-      spans.forEach((span, i) => {
-        ranges.push(span);
-        fragments.push(fetched[i]!);
-      });
-      for (const name of new Set(names)) {
-        await this.#fetchConversionRanges(name, options.group, true, source, ranges, fragments, raw);
-      }
+    if (hasWindow(options)) {
+      const step = await this.#gapLoop(source, (r, f) =>
+        this.inner.readManyStep(names, options.group, window, r, f),
+      );
+      return step.signals as Signal[];
     }
-    const step = await this.#gapLoop(
-      source,
-      (r, f) => this.inner.readManyStep(names, options.group, window, r, f),
-      ranges,
-      fragments,
-    );
-    return step.signals as Signal[];
+    // Whole channels: every data block of the batch (channels and their time
+    // axes, each once) and any deferred conversion blocks, fetched
+    // concurrently in one go...
+    const perName = names.map((name) => this.signalByteRanges(name, options.group));
+    const spans = mergeByteRanges(perName.flat());
+    const [fetched, conversions] = await Promise.all([
+      this.#fetchAll(source, spans),
+      this.#fetchBatchConversions(names, options.group, source, raw),
+    ]);
+    // ...then decoded one channel at a time from zero-copy views of the
+    // fetched bytes, so wasm never holds more than one channel's samples.
+    return names.map((name, i) => {
+      const ranges: ByteRange[] = [...conversions.ranges];
+      const fragments: Uint8Array[] = [...conversions.fragments];
+      for (const [offset, length] of perName[i]!) {
+        const at = spans.findIndex(([o, l]) => o <= offset && offset + length <= o + l);
+        const start = offset - spans[at]![0];
+        ranges.push([offset, length]);
+        fragments.push(fetched[at]!.subarray(start, start + length));
+      }
+      return this.readFromFragments(name, options.group, ranges, fragments, raw);
+    });
   }
 
   /**
@@ -751,6 +756,37 @@ export class MdfIndex {
         CONVERSION_LOOKAHEAD_BYTES,
         size,
       );
+      const fetched = await this.#fetchAll(source, spans);
+      spans.forEach(([offset], i) => {
+        ranges.push([offset, fetched[i]!.length]);
+        fragments.push(fetched[i]!);
+      });
+    }
+    throw new Error(
+      "MdfIndex: conversion resolution did not converge; the index or source may be inconsistent.",
+    );
+  }
+
+  /**
+   * Fetch the deferred conversion blocks a whole `readMany` batch needs
+   * (channels and their time axes, each block once): a no-op for a locally
+   * built index. Only conversion fragments are passed to wasm each round,
+   * never the batch's data.
+   */
+  async #fetchBatchConversions(
+    names: string[],
+    group: string | null | undefined,
+    source: RangeSource,
+    raw: boolean,
+  ): Promise<{ ranges: ByteRange[]; fragments: Uint8Array[] }> {
+    const ranges: ByteRange[] = [];
+    const fragments: Uint8Array[] = [];
+    const size = this.fileSize();
+    const CONVERSION_LOOKAHEAD_BYTES = 8 * 1024;
+    for (let round = 0; round < 10_000; round++) {
+      const step = this.inner.conversionRangesManyStep(names, group, true, ranges, fragments, raw);
+      if (step.done) return { ranges, fragments };
+      const spans = coalesceNeeded(step.needed!, CONVERSION_LOOKAHEAD_BYTES, CONVERSION_LOOKAHEAD_BYTES, size);
       const fetched = await this.#fetchAll(source, spans);
       spans.forEach(([offset], i) => {
         ranges.push([offset, fetched[i]!.length]);

@@ -289,6 +289,43 @@ fn column_file_reads_back_identically() -> Result<(), MdfError> {
     Ok(())
 }
 
+/// An untimed source group with several channels becomes untimed one-channel
+/// groups; `group(name)` merges them back into the source group.
+#[test]
+fn untimed_column_groups_match_the_source_group() -> Result<(), MdfError> {
+    let dir = tempfile::tempdir()?;
+    let (source, column) = (dir.path().join("u.mf4"), dir.path().join("u_col.mf4"));
+    let mut w = MdfWriter::new(source.to_str().unwrap())?;
+    w.init_mdf_file()?;
+    for name in ["U", "V"] {
+        let g = w.add_channel_group(Some(name))?;
+        w.add_int_channel(&g, &format!("{name}1"))?;
+        w.add_int_channel(&g, &format!("{name}2"))?;
+        w.start_data_block(&g)?;
+        for i in 0..50u64 {
+            w.write_record(&g, &[DecodedValue::UnsignedInteger(i), DecodedValue::UnsignedInteger(2 * i)])?;
+        }
+        w.finish_data_block(&g)?;
+    }
+    w.finalize()?;
+    to_column_oriented(&source, &column, &ColumnOptions::default())?;
+    let src = Mdf::from_file(source.to_str().unwrap())?;
+    let col = Mdf::from_file(column.to_str().unwrap())?;
+    let index = MdfIndex::from_file(column.to_str().unwrap())?;
+    assert_eq!(col.groups()?.len(), 4, "one group per signal");
+    for name in ["U", "V"] {
+        let expected = src.group(name)?.expect(name);
+        assert_eq!(expected.channel_names.len(), 2);
+        assert_eq!(col.group(name)?.as_ref(), Some(&expected), "Mdf group {name}");
+        assert_eq!(index.group(name)?.as_ref(), Some(&expected), "index group {name}");
+    }
+    let values = |m: &Mdf| -> Result<Vec<Vec<f64>>, MdfError> {
+        Ok(m.read_many(&["U1", "V2"], None)?.iter().map(|s| s.values_f64()).collect())
+    };
+    assert_eq!(values(&col)?, values(&src)?);
+    Ok(())
+}
+
 /// `group(name)` on a column file merges the per-signal groups (and the
 /// shared time group, whatever its name) back into the source group.
 #[test]

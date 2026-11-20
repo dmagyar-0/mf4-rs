@@ -130,8 +130,48 @@ test("FetchRangeSource times out a request that never answers", async () => {
       init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
     });
   const source = new FetchRangeSource("http://example.invalid/f.mf4", hanging, { timeoutMs: 20, retries: 1, retryDelayMs: 1 });
-  await assert.rejects(source.read(0, 4), /no response .* within 20 ms/);
+  await assert.rejects(source.read(0, 4), /sent nothing for 20 ms/);
   assert.equal(calls, 2, "the timed-out request is retried once");
+});
+
+test("FetchRangeSource times out a body that stalls, and retries it", async () => {
+  let calls = 0;
+  // The first response sends 2 of 4 bytes and then nothing; the retry is whole.
+  const fetchImpl = async (_url: string, init?: { signal?: AbortSignal }) => {
+    const stall = calls++ === 0;
+    const chunks = stall ? [new Uint8Array([1, 2])] : [new Uint8Array([1, 2]), new Uint8Array([3, 4])];
+    return {
+      ok: true,
+      status: 206,
+      headers: { get: (name: string) => (name.toLowerCase() === "content-range" ? "bytes 0-3/4" : null) },
+      arrayBuffer: async () => new ArrayBuffer(0),
+      body: {
+        getReader: () => ({
+          read: () =>
+            chunks.length > 0
+              ? Promise.resolve({ done: false, value: chunks.shift()! })
+              : stall
+                ? new Promise<never>((_, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("aborted"))))
+                : Promise.resolve({ done: true }),
+          cancel: async () => undefined,
+        }),
+      },
+    };
+  };
+  const source = new FetchRangeSource("http://example.invalid/f.mf4", fetchImpl, { timeoutMs: 30, retryDelayMs: 1 });
+  assert.deepEqual(Array.from(await source.read(0, 4)), [1, 2, 3, 4]);
+  assert.equal(calls, 2);
+});
+
+test("FetchRangeSource does not retry errors that are not network failures", async () => {
+  let calls = 0;
+  const failing = async (): Promise<never> => {
+    calls++;
+    throw new RangeError("bad request setup");
+  };
+  const source = new FetchRangeSource("http://example.invalid/f.mf4", failing, { retryDelayMs: 1 });
+  await assert.rejects(source.read(0, 4), /bad request setup/);
+  assert.equal(calls, 1);
 });
 
 test("FetchRangeSource over a Range-ignoring (200-only) server matches direct read", async () => {

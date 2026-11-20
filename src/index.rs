@@ -321,6 +321,41 @@ const MAX_BATCH_ROUNDS: usize = 1_000;
 #[cfg(feature = "http")]
 const PARALLEL_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Whole-channel URL reads fetch the batch at once (concurrently) only while
+/// it needs at most this many bytes (256 MiB); larger reads stream one data
+/// section at a time.
+#[cfg(feature = "http")]
+const BATCH_MEMORY_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// URL reader for streamed whole-channel reads: serves bytes already fetched
+/// (deferred conversion blocks) from `store`, and fetches a range larger than
+/// [`PARALLEL_CHUNK_BYTES`] as concurrent chunks.
+#[cfg(feature = "http")]
+struct ChunkedUrlReader {
+    http: HttpRangeReader,
+    store: FragmentStore,
+}
+
+#[cfg(feature = "http")]
+impl ByteRangeReader for ChunkedUrlReader {
+    type Error = MdfError;
+
+    fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
+        if let crate::fragments::Coverage::Full(bytes) = self.store.assemble(offset, length)? {
+            return Ok(bytes);
+        }
+        if length <= PARALLEL_CHUNK_BYTES {
+            return self.http.read_range(offset, length);
+        }
+        let parts = self.http.read_ranges_parallel(&split_spans(vec![(offset, length)], PARALLEL_CHUNK_BYTES))?;
+        let mut out = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
+        for part in parts {
+            out.extend_from_slice(&part);
+        }
+        Ok(out)
+    }
+}
+
 /// Split every `(offset, length)` span longer than `chunk` into consecutive
 /// pieces of at most `chunk` bytes.
 #[cfg(feature = "http")]
@@ -1134,8 +1169,8 @@ fn retry_after(resp: &ureq::Response) -> Option<std::time::Duration> {
     resp.header("Retry-After")?.trim().parse::<u64>().ok().map(std::time::Duration::from_secs)
 }
 
-/// Classify a failed `call()`: transport errors and transient statuses are
-/// retried, every other status is final.
+/// Classify a failed `call()`: connection/IO errors and transient statuses
+/// are retried; every other status and transport error is final.
 #[cfg(feature = "http")]
 fn classify_call_error(error: ureq::Error) -> HttpFailure {
     match error {
@@ -1149,10 +1184,17 @@ fn classify_call_error(error: ureq::Error) -> HttpFailure {
         ureq::Error::Status(status, _) => {
             HttpFailure::Fatal(MdfError::BlockSerializationError(format!("HTTP request failed with status {status}")))
         }
-        transport => HttpFailure::Transient(
-            MdfError::BlockSerializationError(format!("HTTP request failed: {transport}")),
-            None,
-        ),
+        ureq::Error::Transport(transport) => {
+            let error = MdfError::BlockSerializationError(format!("HTTP request failed: {transport}"));
+            // A dropped or refused connection is worth another try; a bad
+            // URL, an unknown host or a proxy misconfiguration is not.
+            match transport.kind() {
+                ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Io | ureq::ErrorKind::ProxyConnect => {
+                    HttpFailure::Transient(error, None)
+                }
+                _ => HttpFailure::Fatal(error),
+            }
+        }
     }
 }
 
@@ -1824,6 +1866,10 @@ impl MdfIndex {
         R: ByteRangeReader<Error = MdfError>,
         F: FnMut(&[u8]) -> Result<(), MdfError>,
     {
+        // With a probing reader every missing section is recorded in one
+        // pass (sections after a miss are requested but not decoded), so a
+        // batched read needs one round, not one per section.
+        let mut first_err = None;
         let mut i = 0;
         while i < blocks.len() {
             let start = blocks[i].file_offset;
@@ -1845,7 +1891,19 @@ impl MdfIndex {
                 end = b_end;
                 j += 1;
             }
-            let buf = reader.read_range(start, end - start)?;
+            let buf = match reader.read_range(start, end - start) {
+                Ok(buf) if first_err.is_none() => buf,
+                Ok(_) => {
+                    i = j;
+                    continue;
+                }
+                Err(e) if reader.is_probing() => {
+                    first_err.get_or_insert(e);
+                    i = j;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             for b in &blocks[i..j] {
                 let header_start = (b.file_offset - start) as usize;
                 let data_start = header_start + 24;
@@ -1857,7 +1915,10 @@ impl MdfIndex {
             }
             i = j;
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Check that `header` (the 24 header bytes of `block`, if available) is an
@@ -3130,7 +3191,8 @@ impl MdfIndex {
         let Some(first) = names.iter().position(|n| n.as_deref() == Some(name)) else {
             return Ok(None);
         };
-        let members = logical_group_members(&names, &self.time_groups(), first);
+        let channel_counts: Vec<usize> = self.channel_groups.iter().map(|g| g.channels.len()).collect();
+        let members = logical_group_members(&names, &self.time_groups(), &channel_counts, first);
         Ok(Some(merge_group_infos(
             self.group_info(first),
             members.iter().map(|&m| self.group_info(m)),
@@ -3372,6 +3434,8 @@ impl MdfIndex {
         if targets.is_empty() {
             return Ok(Vec::new());
         }
+        #[cfg(all(target_arch = "wasm32", not(feature = "http")))]
+        let _ = window;
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
             Source::File(path) => {
@@ -3535,10 +3599,11 @@ impl MdfIndex {
     /// `read_many` over any byte-range reader — the shared core of the URL,
     /// wasm-fragment and [`MdfReader`] paths.
     ///
-    /// Every channel is attempted even after one fails, so a probing reader
+    /// With a probing reader
     /// ([`RecordingRangeReader`](crate::fragments::RecordingRangeReader))
-    /// records the gaps of the whole batch in one pass; the first error is
-    /// returned. Within the call, a window is resolved once per time axis and
+    /// every channel is attempted even after one fails, so the gaps of the
+    /// whole batch are recorded in one pass, and the first error is
+    /// returned; any other reader stops at the first error. Within the call, a window is resolved once per time axis and
     /// each time axis (or its window) is decoded once.
     pub(crate) fn read_many_at<R: ByteRangeReader<Error = MdfError>>(
         &self,
@@ -3554,9 +3619,13 @@ impl MdfIndex {
         for &(g, c) in targets {
             match self.read_one_at(g, c, window, raw, reader, &mut windows, &mut axes) {
                 Ok(signal) => out.push(signal),
-                Err(e) => {
+                // Only a probing reader gains from going on (it records the
+                // remaining channels' gaps); any other reader stops here, as a
+                // loop of `read` would.
+                Err(e) if reader.is_probing() => {
                     first_error.get_or_insert(e);
                 }
+                Err(e) => return Err(e),
             }
         }
         match first_error {
@@ -3587,10 +3656,12 @@ impl MdfIndex {
             let timestamps = match master {
                 Some((mg, m)) => Self::cached_axis(axes, (mg, m, 0, u64::MAX), || {
                     self.read_channel_values_as_f64(mg, m, false, reader)
-                })?,
-                None => Vec::new(),
+                }),
+                None => Ok(Vec::new()),
             };
-            return Ok(self.make_signal(g, c, timestamps, values?));
+            // The channel's own error first, as `read` reports it.
+            let values = values?;
+            return Ok(self.make_signal(g, c, timestamps?, values));
         }
         // A time window depends on the time axis searched, a record window
         // only on the group's record count.
@@ -3615,10 +3686,11 @@ impl MdfIndex {
                     .iter()
                     .map(decoded_opt_to_f64)
                     .collect())
-            })?,
-            None => Vec::new(),
+            }),
+            None => Ok(Vec::new()),
         };
-        Ok(self.make_signal(g, c, timestamps, values?))
+        let values = values?;
+        Ok(self.make_signal(g, c, timestamps?, values))
     }
 
     fn cached_axis(
@@ -3651,6 +3723,20 @@ impl MdfIndex {
         window: Window,
         raw: bool,
     ) -> Result<Vec<Signal>, MdfError> {
+        self.read_many_url_limited(url, targets, window, raw, BATCH_MEMORY_LIMIT)
+    }
+
+    /// [`read_many_url`](Self::read_many_url) with the size above which
+    /// whole channels are streamed instead of fetched as one batch.
+    #[cfg(feature = "http")]
+    fn read_many_url_limited(
+        &self,
+        url: &str,
+        targets: &[(usize, usize)],
+        window: Window,
+        raw: bool,
+        batch_limit: u64,
+    ) -> Result<Vec<Signal>, MdfError> {
         let mut cached = CachingRangeReader::with_chunk_size(self.http_source(url)?, 64 * 1024);
         if self.file_size > 0 {
             cached.set_known_size(self.file_size);
@@ -3674,7 +3760,35 @@ impl MdfIndex {
         }
         let (mut http, fetched) = cached.into_parts();
         let store = FragmentStore::from_pairs(fetched)?;
+        if window == Window::All && self.whole_read_bytes(targets) > batch_limit {
+            // Too much to hold at once: stream channel by channel (one
+            // section in memory at a time), each large section still fetched
+            // as concurrent chunks; time axes are still read once.
+            let mut reader = ChunkedUrlReader { http, store };
+            return self.read_many_at(targets, window, raw, &mut reader);
+        }
         self.batched_reads_seeded(&mut http, store, |r| self.read_many_at(targets, window, raw, r))
+    }
+
+    /// Bytes a whole-channel `read_many` of `targets` fetches: every data
+    /// block of their groups and of their time groups (each group once),
+    /// plus the `##SD` streams of VLSD channels.
+    #[cfg(feature = "http")]
+    fn whole_read_bytes(&self, targets: &[(usize, usize)]) -> u64 {
+        let mut groups = std::collections::BTreeSet::new();
+        let mut total = 0u64;
+        for &(g, c) in targets {
+            groups.insert(g);
+            if let Some((mg, _)) = self.master_location(g, c) {
+                groups.insert(mg);
+            }
+            let channel = &self.channel_groups[g].channels[c];
+            total = total.saturating_add(channel.vlsd_data_blocks.iter().map(|b| b.size).sum());
+        }
+        groups
+            .iter()
+            .flat_map(|&g| self.channel_groups[g].data_blocks.iter())
+            .fold(total, |sum, b| sum.saturating_add(b.size))
     }
 
     /// Records `[start, start + count)` a window selects in the group of `(g, c)`.
@@ -4556,5 +4670,120 @@ mod http_retry_tests {
         let error = HttpRangeReader::new(url).unwrap().read_range(0, 4).unwrap_err().to_string();
         assert!(error.contains("404"), "{error}");
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(all(test, feature = "http"))]
+mod url_read_tests {
+    use super::{DataBlockInfo, MdfIndex, Window};
+    use crate::fragments::{FragmentStore, RecordingRangeReader};
+    use crate::{ColumnData, Mdf, MdfWriter, ReadOptions};
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::Arc;
+
+    /// Thread-per-connection server honouring single `Range` requests.
+    fn serve(bytes: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/f.mf4", listener.local_addr().unwrap());
+        let bytes = Arc::new(bytes);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let bytes = bytes.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut stream = stream;
+                    loop {
+                        let mut range = None;
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some(v) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                                let (a, b) = v.trim().split_once('-').unwrap();
+                                range = Some((a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
+                            }
+                        }
+                        let (a, b) = range.unwrap_or((0, bytes.len() - 1));
+                        let b = b.min(bytes.len() - 1);
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{b}/{}\r\nContent-Length: {}\r\n\r\n",
+                            bytes.len(),
+                            b + 1 - a
+                        );
+                        if stream.write_all(head.as_bytes()).is_err() || stream.write_all(&bytes[a..=b]).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        url
+    }
+
+    fn build(path: &std::path::Path) {
+        let mut w = MdfWriter::new(path.to_str().unwrap()).unwrap();
+        w.init_mdf_file().unwrap();
+        let g = w.add_channel_group(Some("G")).unwrap();
+        w.add_time_channel(&g, "t").unwrap();
+        let a = w.add_float_channel(&g, "A").unwrap();
+        w.add_float_channel(&g, "B").unwrap();
+        w.add_linear_conversion(&a, 1.0, 2.0).unwrap();
+        let n = 300_000;
+        let t: Vec<f64> = (0..n).map(|i| i as f64 * 1e-3).collect();
+        let x: Vec<f64> = (0..n).map(|i| (i % 977) as f64).collect();
+        w.start_data_block(&g).unwrap();
+        w.write_columns(&g, &[ColumnData::F64(&t), ColumnData::F64(&x), ColumnData::F64(&x)]).unwrap();
+        w.finish_data_block(&g).unwrap();
+        w.finalize().unwrap();
+    }
+
+    /// Whole channels over a URL give the same signals batched and streamed
+    /// (the path taken above the memory limit), on a row-oriented file split
+    /// into several data blocks and on its column-oriented conversion.
+    #[test]
+    fn streamed_and_batched_whole_reads_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let (row, col) = (dir.path().join("row.mf4"), dir.path().join("col.mf4"));
+        build(&row);
+        let opts = crate::ColumnOptions { block_size: 256 * 1024, ..Default::default() };
+        crate::to_column_oriented(&row, &col, &opts).unwrap();
+        for path in [&row, &col] {
+            let mdf = Mdf::from_file(path.to_str().unwrap()).unwrap();
+            let index = MdfIndex::from_file(path.to_str().unwrap()).unwrap();
+            assert!(index.channel_groups.iter().any(|g| g.data_blocks.len() > 1), "several data blocks");
+            let url = serve(std::fs::read(path).unwrap());
+            let names = ["A", "t", "B", "A"];
+            let targets = index.locate_all(&names, None).unwrap();
+            let expected = mdf.read_many(&names, &ReadOptions::new()).unwrap();
+            for limit in [0, u64::MAX] {
+                for raw in [false, true] {
+                    let got = index.read_many_url_limited(&url, &targets, Window::All, raw, limit).unwrap();
+                    let want = if raw { mdf.read_many(&names, &ReadOptions::new().raw(true)).unwrap() } else { expected.clone() };
+                    for (g, w) in got.iter().zip(&want) {
+                        assert_eq!((&g.values, &g.timestamps), (&w.values, &w.timestamps), "limit {limit} raw {raw}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A probing reader records every missing data section in one pass.
+    #[test]
+    fn probing_whole_reads_record_every_section() {
+        let blocks: Vec<DataBlockInfo> = [0u64, 10_000, 20_000]
+            .iter()
+            .map(|&o| DataBlockInfo { file_offset: o, size: 24 + 800, is_compressed: false })
+            .collect();
+        let store = FragmentStore::new();
+        let mut reader = RecordingRangeReader { store: &store, misses: Vec::new(), whole_request: true };
+        let result = MdfIndex::for_each_data_section(&mut reader, &blocks, |_| Ok(()));
+        assert!(result.is_err());
+        assert_eq!(reader.misses, vec![(0, 824), (10_000, 824), (20_000, 824)]);
     }
 }

@@ -610,6 +610,56 @@ impl WasmMdfIndex {
         serde_wasm_bindgen::to_value(&step).map_err(|e| JsError::new(&e.to_string()))
     }
 
+    /// `conversionRangesStep` for a whole `readMany` batch: the conversion
+    /// blocks every name needs (and, with `withMaster`, their time axes'),
+    /// each block once. Drive it with only the conversion fragments fetched
+    /// so far — never the data — so each call stays cheap.
+    #[wasm_bindgen(js_name = conversionRangesManyStep)]
+    pub fn conversion_ranges_many_step(
+        &self,
+        names: Vec<String>,
+        group: Option<String>,
+        with_master: bool,
+        ranges: JsValue,
+        fragments: JsValue,
+        raw: Option<bool>,
+    ) -> Result<JsValue, JsError> {
+        let targets = self.index.locate_all(&names, group.as_deref()).map_err(err_to_js)?;
+        let raw = raw.unwrap_or(false);
+        let mut wanted: Vec<(usize, usize)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (g, c) in targets {
+            let own = (!raw).then_some((g, c));
+            let master = if with_master { self.index.master_location(g, c) } else { None };
+            for (tg, tc) in own.into_iter().chain(master) {
+                let channel = &self.index.channel_groups[tg].channels[tc];
+                if channel.conversion.is_none() && channel.conversion_addr != 0 && seen.insert(channel.conversion_addr) {
+                    wanted.push((tg, tc));
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return serde_wasm_bindgen::to_value(&BuildStepJs { done: true, json: None, needed: None })
+                .map_err(|e| JsError::new(&e.to_string()));
+        }
+        let parsed = build_fragment_reader(&ranges, &fragments)?;
+        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: false };
+        for (tg, tc) in wanted {
+            let before = reader.misses.len();
+            if let Err(e) = self.index.resolve_channel_conversion(tg, tc, &mut reader) {
+                if reader.misses.len() == before {
+                    return Err(err_to_js(e));
+                }
+            }
+        }
+        let step = if reader.misses.is_empty() {
+            BuildStepJs { done: true, json: None, needed: None }
+        } else {
+            BuildStepJs { done: false, json: None, needed: Some(misses_to_needed(reader.misses)) }
+        };
+        serde_wasm_bindgen::to_value(&step).map_err(|e| JsError::new(&e.to_string()))
+    }
+
     /// Serialise the index to a JSON string.
     #[wasm_bindgen(js_name = toJson)]
     pub fn to_json(&self) -> Result<String, JsError> {

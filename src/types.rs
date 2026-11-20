@@ -75,11 +75,23 @@ impl GroupInfo {
 /// group — which may carry *another* source group's name when identical time
 /// axes were merged. The logical group is then: that time group (if it has a
 /// different name) followed by every group with `first`'s name that shares
-/// its time axis. A row-oriented group (local master, or untimed) is just
-/// itself.
-pub(crate) fn logical_group_members(names: &[Option<String>], time_groups: &[Option<usize>], first: usize) -> Vec<usize> {
+/// its time axis. An untimed source group becomes untimed one-channel groups
+/// of the same name, which are merged too (`channel_counts[i]` is the number
+/// of channels of group `i`). A row-oriented group (local master, or untimed
+/// with several channels) is just itself.
+pub(crate) fn logical_group_members(
+    names: &[Option<String>],
+    time_groups: &[Option<usize>],
+    channel_counts: &[usize],
+    first: usize,
+) -> Vec<usize> {
     let Some(time_group) = time_groups[first] else {
-        return vec![first];
+        if channel_counts[first] != 1 {
+            return vec![first];
+        }
+        return (0..names.len())
+            .filter(|&h| names[h] == names[first] && time_groups[h].is_none() && channel_counts[h] == 1)
+            .collect();
     };
     let mut members = Vec::new();
     if names[time_group] != names[first] {

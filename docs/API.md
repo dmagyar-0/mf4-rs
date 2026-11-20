@@ -191,7 +191,8 @@ response, or status `408`, `429`, `500`, `502`, `503` or `504` (e.g. S3
 a `Retry-After` of up to 10 s); other statuses fail at once. Rust and Python
 give up on a connection after 30 s and on a response that sends nothing for
 60 s. In TypeScript, `FetchRangeSource` takes `retries`, `retryDelayMs` and
-`timeoutMs` (time to the response headers, default 60 s) options.
+`timeoutMs` options; the timeout (default 60 s) applies whenever the server
+sends nothing — no headers, or no next part of the body.
 
 ### `Mdf` only
 

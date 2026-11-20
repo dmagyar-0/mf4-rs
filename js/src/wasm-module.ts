@@ -59,6 +59,14 @@ export interface WasmMdfIndex {
     fragments: unknown,
     raw?: boolean | null,
   ): WasmBuildStep;
+  conversionRangesManyStep(
+    names: string[],
+    group: string | null | undefined,
+    with_master: boolean,
+    ranges: unknown,
+    fragments: unknown,
+    raw?: boolean | null,
+  ): WasmBuildStep;
   readFromFragments(
     name: string,
     group: string | null | undefined,
