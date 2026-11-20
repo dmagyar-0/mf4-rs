@@ -73,6 +73,67 @@ test("FetchRangeSource over a Range-honouring server matches direct read", async
   }
 });
 
+test("FetchRangeSource retries transient failures and gives up on permanent ones", async () => {
+  const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  const script: number[] = [];
+  let requests = 0;
+  const fetchImpl = async (_url: string, init?: { headers?: Record<string, string> }) => {
+    requests++;
+    const status = script.shift() ?? 206;
+    const [, a, b] = /bytes=(\d+)-(\d+)/.exec(init?.headers?.Range ?? "")!;
+    const body = bytes.slice(Number(a), Number(b) + 1);
+    const headers = new Map<string, string>([
+      ["content-range", `bytes ${a}-${b}/${bytes.length}`],
+      ["retry-after", "0"],
+    ]);
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: (name: string) => (status === 206 ? (headers.get(name.toLowerCase()) ?? null) : name === "retry-after" ? "0" : null) },
+      arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+    };
+  };
+  const source = new FetchRangeSource("http://example.invalid/f.mf4", fetchImpl, { retryDelayMs: 1 });
+
+  script.push(503, 500);
+  assert.deepEqual(Array.from(await source.read(2, 3)), [3, 4, 5]);
+  assert.equal(requests, 3, "two retries");
+
+  requests = 0;
+  script.push(503, 503, 503, 503);
+  await assert.rejects(source.read(0, 2), /status 503/);
+  assert.equal(requests, 4, "three retries, then the error");
+
+  requests = 0;
+  script.push(404);
+  await assert.rejects(source.read(0, 2), /status 404/);
+  assert.equal(requests, 1, "a 404 is not retried");
+
+  // A network error is retried too.
+  let failures = 1;
+  const flaky = new FetchRangeSource(
+    "http://example.invalid/f.mf4",
+    async (url, init) => {
+      if (failures-- > 0) throw new TypeError("fetch failed");
+      return fetchImpl(url, init);
+    },
+    { retryDelayMs: 1 },
+  );
+  assert.deepEqual(Array.from(await flaky.read(0, 1)), [1]);
+});
+
+test("FetchRangeSource times out a request that never answers", async () => {
+  let calls = 0;
+  const hanging = (_url: string, init?: { signal?: AbortSignal }) =>
+    new Promise<never>((_, reject) => {
+      calls++;
+      init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    });
+  const source = new FetchRangeSource("http://example.invalid/f.mf4", hanging, { timeoutMs: 20, retries: 1, retryDelayMs: 1 });
+  await assert.rejects(source.read(0, 4), /no response .* within 20 ms/);
+  assert.equal(calls, 2, "the timed-out request is retried once");
+});
+
 test("FetchRangeSource over a Range-ignoring (200-only) server matches direct read", async () => {
   const { bytes } = buildSampleFile(60);
   const mdf = Mdf.fromBytes(bytes);

@@ -8,6 +8,7 @@ import {
 } from "./range-source";
 import { ChannelNotFoundError, guard } from "./errors";
 import { hasWindow, wasmWindow } from "./signal-util";
+import { mergeByteRanges } from "./byte-ranges";
 import type {
   ByteRange,
   ChannelInfo,
@@ -565,6 +566,46 @@ export class MdfIndex {
   }
 
   /**
+   * Read several channels at once, with the same `options` for all of them:
+   * one `Signal` per name, in order — like calling {@link read} for each,
+   * but every byte range of the batch is fetched concurrently, a time axis
+   * shared by several of the channels (every signal of a source group in a
+   * column-oriented file) is fetched and decoded once, and a time window is
+   * searched once per time axis. Throws `ChannelNotFoundError` — before
+   * fetching anything — if any name is unknown.
+   */
+  async readMany(names: string[], options: ReadOptions = {}): Promise<Signal[]> {
+    const window = wasmWindow(options);
+    const raw = window.raw === true;
+    for (const name of names) this.#requireChannel(name, options.group);
+    if (names.length === 0) return [];
+    const source = this.#requireSource(options);
+    const ranges: ByteRange[] = [];
+    const fragments: Uint8Array[] = [];
+    if (!hasWindow(options)) {
+      // Whole channels: every data block of the batch (channels and their
+      // time axes, each once) in one concurrent fetch, then any deferred
+      // conversion blocks, so the decode below needs no further round.
+      const spans = mergeByteRanges(names.flatMap((name) => this.signalByteRanges(name, options.group)));
+      const fetched = await this.#fetchAll(source, spans);
+      spans.forEach((span, i) => {
+        ranges.push(span);
+        fragments.push(fetched[i]!);
+      });
+      for (const name of new Set(names)) {
+        await this.#fetchConversionRanges(name, options.group, true, source, ranges, fragments, raw);
+      }
+    }
+    const step = await this.#gapLoop(
+      source,
+      (r, f) => this.inner.readManyStep(names, options.group, window, r, f),
+      ranges,
+      fragments,
+    );
+    return step.signals as Signal[];
+  }
+
+  /**
    * Read a numeric channel as a plain `Float64Array` (no timestamps),
    * fetching only the bytes it needs. Conversions are applied unless
    * `options.raw`; invalid and non-numeric samples are `NaN`. `options` as
@@ -657,10 +698,10 @@ export class MdfIndex {
   async #gapLoop<T extends { done: boolean; needed?: [number, number][] }>(
     source: RangeSource,
     step: (ranges: ByteRange[], fragments: Uint8Array[]) => T,
+    ranges: ByteRange[] = [],
+    fragments: Uint8Array[] = [],
   ): Promise<T> {
     const size = this.fileSize();
-    const ranges: ByteRange[] = [];
-    const fragments: Uint8Array[] = [];
     const maxRounds = 10_000;
     for (let round = 0; round < maxRounds; round++) {
       const result = guard(() => step(ranges, fragments));

@@ -135,7 +135,7 @@ fn reader_mirrors_the_index_read_api() {
     // `MdfReader` (an index bound to a custom byte source) must offer the
     // same data methods as `MdfIndex`.
     let reader = public_methods(&["src/index.rs"], "MdfReader");
-    for name in ["read", "values", "time_range"] {
+    for name in ["read", "read_many", "values", "time_range"] {
         assert!(reader.contains(name), "MdfReader is missing `{name}`");
     }
 }
@@ -225,6 +225,7 @@ trait Reader {
     fn channel_names(&mut self) -> Vec<String>;
     fn start_time_ns(&mut self) -> Option<u64>;
     fn read(&mut self, name: &str, options: &ReadOptions) -> Result<Signal, MdfError>;
+    fn read_many(&mut self, names: &[&str], options: &ReadOptions) -> Result<Vec<Signal>, MdfError>;
     fn values(&mut self, name: &str, options: &ReadOptions) -> Result<Vec<f64>, MdfError>;
     fn time_range(&mut self, name: &str, group: Option<&str>) -> Result<Option<TimeRange>, MdfError>;
     fn conversion(&mut self, name: &str, group: Option<&str>) -> Result<Option<ConversionInfo>, MdfError>;
@@ -250,6 +251,9 @@ macro_rules! impl_reader {
             }
             fn read(&mut self, name: &str, options: &ReadOptions) -> Result<Signal, MdfError> {
                 <$ty>::read(self, name, options)
+            }
+            fn read_many(&mut self, names: &[&str], options: &ReadOptions) -> Result<Vec<Signal>, MdfError> {
+                <$ty>::read_many(self, names, options)
             }
             fn values(&mut self, name: &str, options: &ReadOptions) -> Result<Vec<f64>, MdfError> {
                 <$ty>::values(self, name, options)
@@ -358,8 +362,26 @@ fn every_reader_gives_the_same_answers() -> Result<(), MdfError> {
             }
         }
 
+        // read_many = one read per name, for every option set.
+        let names = ["Speed", "Time", "Label", "Gear", "Speed"];
+        for options in &option_sets {
+            let many = reader.read_many(&names, options)?;
+            let one_by_one = names.iter().map(|n| Reader::read(&mut mdf, n, options)).collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(many.len(), names.len(), "{label}: read_many {options:?}");
+            for (got, want) in many.iter().zip(&one_by_one) {
+                assert_eq!((&got.name, &got.values), (&want.name, &want.values), "{label}: read_many {options:?}");
+                assert!(same_floats(&got.timestamps, &want.timestamps), "{label}: read_many {options:?}");
+            }
+            assert_eq!(Reader::read_many(&mut mdf, &names, options)?.len(), names.len());
+        }
+        assert!(reader.read_many(&[], &ReadOptions::new())?.is_empty(), "{label}");
+
         // The one error rule: data operations on a missing channel fail with
         // ChannelNotFound; invalid windows with InvalidArgument.
+        assert!(
+            matches!(reader.read_many(&["Speed", "Nope"], &ReadOptions::new()), Err(MdfError::ChannelNotFound { .. })),
+            "{label}"
+        );
         let missing = ReadOptions::new().group("Engine");
         assert!(matches!(reader.read("Nope", &missing), Err(MdfError::ChannelNotFound { .. })), "{label}");
         assert!(matches!(reader.values("Nope", &missing), Err(MdfError::ChannelNotFound { .. })), "{label}");
@@ -526,7 +548,12 @@ fn canonical(value: Value) -> Value {
 }
 
 fn case_label(case: &Value) -> String {
-    let mut parts = vec![case["name"].as_str().unwrap().to_string()];
+    let base = match case["names"].as_array() {
+        // read_many cases: the names joined by commas.
+        Some(names) => names.iter().map(|n| n.as_str().unwrap()).collect::<Vec<_>>().join(","),
+        None => case["name"].as_str().unwrap().to_string(),
+    };
+    let mut parts = vec![base];
     for key in ["group", "start_time", "end_time", "start_record", "record_count", "raw"] {
         match &case[key] {
             Value::Null | Value::Bool(false) => {}
@@ -554,6 +581,15 @@ fn dump(reader: &mut dyn Reader, scenario: &Value) -> Value {
         };
         reads.insert(case_label(case), serde_json::json!({ "read": read, "values": values }));
     }
+    let mut many = serde_json::Map::new();
+    for case in scenario["read_many_cases"].as_array().unwrap() {
+        let names: Vec<&str> = case["names"].as_array().unwrap().iter().map(|n| n.as_str().unwrap()).collect();
+        let result = match reader.read_many(&names, &case_options(case)) {
+            Ok(signals) => Value::from(signals.iter().map(signal_json).collect::<Vec<_>>()),
+            Err(e) => error_kind(&e),
+        };
+        many.insert(case_label(case), result);
+    }
     let mut channels = serde_json::Map::new();
     for case in scenario["channel_cases"].as_array().unwrap() {
         let (name, group) = (case["name"].as_str().unwrap(), case["group"].as_str());
@@ -579,6 +615,7 @@ fn dump(reader: &mut dyn Reader, scenario: &Value) -> Value {
         "channel_names": reader.channel_names(),
         "groups": serde_json::to_value(reader.groups()).unwrap(),
         "reads": reads,
+        "read_many": many,
         "channels": channels,
     }))
 }

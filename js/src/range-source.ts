@@ -71,6 +71,25 @@ type FullBodyResponse = Awaited<ReturnType<FetchLike>> & {
 
 /** Default {@link FetchRangeSourceOptions.maxFullDownloadBytes}: 64 MiB. */
 const DEFAULT_MAX_FULL_DOWNLOAD_BYTES = 64 * 1024 * 1024;
+/** Default {@link FetchRangeSourceOptions.retries}. */
+const DEFAULT_RETRIES = 3;
+/** Default {@link FetchRangeSourceOptions.retryDelayMs}. */
+const DEFAULT_RETRY_DELAY_MS = 200;
+/** Default {@link FetchRangeSourceOptions.timeoutMs}. */
+const DEFAULT_TIMEOUT_MS = 60_000;
+/** Upper bound on one retry delay, including a server's `Retry-After`. */
+const MAX_RETRY_DELAY_MS = 10_000;
+/** Statuses that signal a temporary condition: request timeout, throttling
+ * (S3 `503 SlowDown`, `429`) and server/gateway errors. */
+const TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A `Retry-After: <seconds>` header in milliseconds (the HTTP-date form is ignored). */
+function retryAfterMs(header: string | null): number | undefined {
+  if (header === null || !/^\s*\d+\s*$/.test(header)) return undefined;
+  return Number(header) * 1000;
+}
 
 /** Options for {@link FetchRangeSource}. */
 export interface FetchRangeSourceOptions {
@@ -82,6 +101,21 @@ export interface FetchRangeSourceOptions {
    * always allow it.
    */
   maxFullDownloadBytes?: number;
+  /**
+   * Retries of a request that failed transiently — a network error, a
+   * timeout, or status `408` / `429` / `500` / `502` / `503` / `504` — with
+   * exponential backoff (or the server's `Retry-After`, capped at 10 s).
+   * Default 3; `0` disables retrying.
+   */
+  retries?: number;
+  /** Delay before the first retry, doubled for each further one. Default 200 ms. */
+  retryDelayMs?: number;
+  /**
+   * Abort (and retry) a request whose response headers have not arrived
+   * after this many milliseconds. Downloading the body is not limited.
+   * Default 60 000; `0` disables the timeout.
+   */
+  timeoutMs?: number;
 }
 
 /**
@@ -98,6 +132,9 @@ export class FetchRangeSource implements RangeSource {
   private readonly url: string;
   private readonly fetchImpl: FetchLike;
   private readonly maxFullDownloadBytes: number;
+  private readonly retries: number;
+  private readonly retryDelayMs: number;
+  private readonly timeoutMs: number;
   private cachedSize: number | undefined;
   /** Full body cached after a `200` (Range-ignoring) response, served locally. */
   private cachedBody: Uint8Array | undefined;
@@ -105,6 +142,12 @@ export class FetchRangeSource implements RangeSource {
   constructor(url: string, fetchImpl?: FetchLike, options: FetchRangeSourceOptions = {}) {
     this.url = url;
     this.maxFullDownloadBytes = options.maxFullDownloadBytes ?? DEFAULT_MAX_FULL_DOWNLOAD_BYTES;
+    this.retries = options.retries ?? DEFAULT_RETRIES;
+    this.retryDelayMs = options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    if (!Number.isInteger(this.retries) || this.retries < 0) {
+      throw new RangeError(`FetchRangeSource: retries must be a non-negative integer, got ${this.retries}`);
+    }
     const impl = fetchImpl ?? (globalThis as { fetch?: FetchLike }).fetch;
     if (!impl) {
       throw new Error(
@@ -122,11 +165,55 @@ export class FetchRangeSource implements RangeSource {
     return this.cachedSize;
   }
 
+  /**
+   * `fetch` the URL, retrying transient failures (see
+   * {@link FetchRangeSourceOptions.retries}). A response that is still
+   * transient after the last retry is returned as is, for the caller's
+   * status handling.
+   */
+  private async request(headers?: Record<string, string>): Promise<FullBodyResponse> {
+    let delay = this.retryDelayMs;
+    for (let attempt = 0; ; attempt++) {
+      let res: FullBodyResponse;
+      try {
+        res = await this.fetchOnce(headers);
+      } catch (e) {
+        if (attempt >= this.retries) throw e;
+        await sleep(delay);
+        delay *= 2;
+        continue;
+      }
+      if (!TRANSIENT_STATUSES.has(res.status) || attempt >= this.retries) return res;
+      await sleep(Math.min(retryAfterMs(res.headers.get("retry-after")) ?? delay, MAX_RETRY_DELAY_MS));
+      delay *= 2;
+    }
+  }
+
+  /** One `fetch`, aborted if its response headers take longer than `timeoutMs`. */
+  private async fetchOnce(headers?: Record<string, string>): Promise<FullBodyResponse> {
+    const init = headers ? { headers } : undefined;
+    if (this.timeoutMs <= 0 || typeof AbortController === "undefined") {
+      return this.fetchImpl(this.url, init);
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      return await this.fetchImpl(this.url, { ...init, signal: controller.signal });
+    } catch (e) {
+      if (controller.signal.aborted) {
+        throw new Error(`FetchRangeSource: no response from ${this.url} within ${this.timeoutMs} ms`, { cause: e });
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async size(): Promise<number> {
     if (this.cachedSize !== undefined) {
       return this.cachedSize;
     }
-    const res = await this.fetchImpl(this.url, { headers: { Range: "bytes=0-0" } });
+    const res = await this.request({ Range: "bytes=0-0" });
     if (!res.ok) {
       throw new Error(`FetchRangeSource: HEAD-equivalent request failed with status ${res.status}`);
     }
@@ -143,7 +230,7 @@ export class FetchRangeSource implements RangeSource {
       // be cached as the full file. Fall back to a plain GET. (In a browser
       // this usually means the server's CORS policy does not expose
       // `Content-Range`: add `Access-Control-Expose-Headers: Content-Range`.)
-      const full = await this.fetchImpl(this.url);
+      const full = await this.request();
       if (!full.ok) {
         throw new Error(`FetchRangeSource: full GET for size failed with status ${full.status}`);
       }
@@ -169,9 +256,7 @@ export class FetchRangeSource implements RangeSource {
     }
 
     const end = offset + length - 1;
-    const res = await this.fetchImpl(this.url, {
-      headers: { Range: `bytes=${offset}-${end}` },
-    });
+    const res = await this.request({ Range: `bytes=${offset}-${end}` });
     // Every ranged response states the resource's total size; remember it
     // (it costs no request) so a mismatch with an index can be reported.
     const total = contentRangeTotal(res.headers.get("content-range"));

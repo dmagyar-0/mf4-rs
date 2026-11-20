@@ -45,6 +45,7 @@ for group in mdf.groups()? {
     println!("{:?}: {} records, {:?}", group.name, group.record_count, group.channel_names);
 }
 let speed = mdf.read("Speed", None)?;                            // Signal
+let both = mdf.read_many(&["Speed", "RPM"], None)?;              // Vec<Signal>
 let rpm = mdf.values("RPM", &ReadOptions::new().group("Engine"))?;
 let part = mdf.read("Speed", &ReadOptions::new().time(Some(1.0), Some(2.5)))?;
 
@@ -61,6 +62,7 @@ mdf = mf4_rs.Mdf.from_file("recording.mf4")
 for group in mdf.groups:
     print(group.name, group.record_count, group.channel_names)
 speed = mdf.read("Speed")                         # Signal
+both = mdf.read_many(["Speed", "RPM"])            # list of Signal
 rpm = mdf.values("RPM", group="Engine")           # numpy float64
 part = mdf.read("Speed", start_time=1.0, end_time=2.5)
 speed.to_series()                                 # pandas Series, datetime index
@@ -79,6 +81,7 @@ for (const group of mdf.groups()) {
   console.log(group.name, group.recordCount, group.channelNames);
 }
 const speed = mdf.read("Speed");                           // Signal
+const both = mdf.readMany(["Speed", "RPM"]);               // Signal[]
 const rpm = mdf.values("RPM", { group: "Engine" });        // Float64Array
 const part = mdf.read("Speed", { startTime: 1.0, endTime: 2.5 });
 
@@ -111,7 +114,7 @@ const lazySpeed = await index.read("Speed");               // range requests hap
 | `groups` | list of `GroupInfo` | Every channel group, in file order. |
 | `channel_names` | list of names | Every named channel across all groups (duplicates kept). |
 | `start_time_ns` | integer or nothing | Measurement start, nanoseconds since the Unix epoch. |
-| `group(name)` | `GroupInfo` or nothing | First group with that name. |
+| `group(name)` | `GroupInfo` or nothing | First group with that name. In a column-oriented file the per-signal groups of a source group are merged back into it, time channel first, so the answer matches the source file's. |
 | `channel(name, group?)` | `ChannelInfo` or nothing | First channel with that name; `group` restricts the search. |
 
 ### Data
@@ -119,6 +122,7 @@ const lazySpeed = await index.read("Speed");               // range requests hap
 | Contract | Returns | |
 |---|---|---|
 | `read(name, options?)` | `Signal` | Values with conversions applied (unless `raw`), paired with the group's time axis. |
+| `read_many(names, options?)` | list of `Signal` | One `Signal` per name, in order, as `read` would return them with the same `options`. A time axis shared by several of the channels is read once, a time window searched once per time axis, and on `MdfIndex` over a URL every byte range of the batch is fetched concurrently. Fails with *channel not found* before reading anything if any name is unknown. Prefer it to a loop of `read` when reading several signals. |
 | `values(name, options?)` | `float64` array | Just the numbers — no timestamps. Conversions applied unless `raw`. Invalid and non-numeric samples are `NaN`. |
 | `time_range(name, group?)` | `TimeRange` or nothing | First and last master (time) value of the channel's group; nothing for an empty group, an error for a non-empty group without a master. On `MdfIndex` this reads two records. |
 | `conversion(name, group?)` | `ConversionInfo` or nothing | The conversion `read` / `values` apply, fully resolved. |
@@ -127,7 +131,7 @@ const lazySpeed = await index.read("Speed");               // range requests hap
 
 | Field | |
 |---|---|
-| `group` | Look only in the group(s) with this name. A column-oriented file has one group per signal, all named after the source group — every group with the name is searched. |
+| `group` | Look only in the group(s) with this name. A column-oriented file has one group per signal, all named after the source group — every group with the name is searched, then the time groups they use (a time axis shared by several source groups carries only one of their names, but its time channel is found under each). |
 | `start_time`, `end_time` | Inclusive time window in the master channel's unit (seconds relative to the measurement start). Either bound may be omitted. |
 | `start_record`, `record_count` | Record window `[start_record, start_record + record_count)`. Reaching past the last record is an error. |
 | `raw` | `true`: return the values as stored in the file, without the channel's conversion (default `false`). A linear channel gives its stored numbers, a value-to-text channel its integer keys instead of the texts. Only the requested channel is affected: `timestamps` and time windows still use the physical (converted) time axis. On `MdfIndex` a raw read never fetches the channel's conversion block. Invalidation bits still apply. `unit` is the channel's (physical) unit, unchanged. |
@@ -151,15 +155,18 @@ How `options` is passed:
 mdf.read("Speed", None)?;                                              // Rust: None = no options
 mdf.read("Speed", &ReadOptions::new().group("Engine").records(0, 100))?;
 mdf.values("Speed", &ReadOptions::new().raw(true))?;                  // stored values
+mdf.read_many(&["Speed", "Gear"], &ReadOptions::new().time(Some(1.0), None))?;
 ```
 ```python
 mdf.read("Speed", group="Engine", start_record=0, record_count=100)    # Python: keywords
 mdf.values("Speed", raw=True)                                          # stored values
 mdf["Speed"], mdf["Speed", "Engine"]                                   # shorthand for read
+mdf.read_many(["Speed", "Gear"], start_time=1.0)
 ```
 ```ts
 mdf.read("Speed", { group: "Engine", startRecord: 0, recordCount: 100 });  // TypeScript: object
 mdf.values("Speed", { raw: true });                                         // stored values
+mdf.readMany(["Speed", "Gear"], { startTime: 1.0 });
 ```
 
 ### `MdfIndex` only
@@ -177,6 +184,14 @@ The source is a string in Rust and Python (`http(s)://` URLs, in any letter
 case, use range requests; another scheme such as `s3://` is refused — use a
 presigned `https://` URL; anything else is a file path). In TypeScript it is a `RangeSource`
 object (`FetchRangeSource`, `FileRangeSource`, `BytesRangeSource`, or your own).
+
+Over HTTP a request that fails transiently — a connection error, a stalled
+response, or status `408`, `429`, `500`, `502`, `503` or `504` (e.g. S3
+`503 SlowDown`) — is retried up to 3 times with exponential backoff (honouring
+a `Retry-After` of up to 10 s); other statuses fail at once. Rust and Python
+give up on a connection after 30 s and on a response that sends nothing for
+60 s. In TypeScript, `FetchRangeSource` takes `retries`, `retryDelayMs` and
+`timeoutMs` (time to the response headers, default 60 s) options.
 
 ### `Mdf` only
 
@@ -322,7 +337,7 @@ in `api-contract.json`, so they are deliberate rather than drift.
 **Rust**
 
 - Block access underneath the contract: `Mdf::channel_groups()` → `ChannelGroup` → `Channel` (`decoded_values()`, `values()`, `conversion()`, `block()`), `Mdf::find_channel`, the public `MdfIndex.channel_groups` field, `MdfIndex::indexed_channel` and `conversion_block`.
-- Custom byte sources: implement `ByteRangeReader`, build with `MdfIndex::from_range_reader`, read through `index.open(reader)` → `MdfReader`, which has the same `read` / `values` / `time_range` methods.
+- Custom byte sources: implement `ByteRangeReader`, build with `MdfIndex::from_range_reader`, read through `index.open(reader)` → `MdfReader`, which has the same `read` / `read_many` / `values` / `time_range` methods.
 - Low-level writer building blocks: `add_channel_with`, `add_channel_group_with`, `start_data_block_with`, `write_records*`, `write_raw_record`, `write_block`, …
 
 **Python**

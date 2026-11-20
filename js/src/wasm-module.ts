@@ -25,6 +25,7 @@ export interface WasmMdf {
   group(name: string): unknown;
   channel(name: string, group?: string | null): unknown;
   read(name: string, group: string | null | undefined, window: unknown): unknown;
+  readMany(names: string[], group: string | null | undefined, window: unknown): unknown;
   startTimeNs(): bigint | undefined;
   values(name: string, group: string | null | undefined, window: unknown): Float64Array;
   timeRange(name: string, group?: string | null): unknown;
@@ -80,6 +81,13 @@ export interface WasmMdfIndex {
     ranges: unknown,
     fragments: unknown,
   ): WasmWindowStep;
+  readManyStep(
+    names: string[],
+    group: string | null | undefined,
+    window: unknown,
+    ranges: unknown,
+    fragments: unknown,
+  ): { done: boolean; needed?: [number, number][]; signals?: unknown };
   valuesWindowStep(
     name: string,
     group: string | null | undefined,

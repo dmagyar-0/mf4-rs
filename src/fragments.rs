@@ -173,31 +173,39 @@ impl FragmentStore {
             }
         }
 
-        // Assembly path: stitch the request together from overlapping fragments.
-        let mut out = vec![0u8; len];
-        let mut covered = vec![false; len];
+        // Assembly path: stitch the request together from overlapping
+        // fragments. They are sorted by start, so one sweep finds the first
+        // uncovered byte: a fragment starting past the covered prefix leaves a
+        // gap no later fragment can fill. (A large read fetched as several
+        // concurrent chunks lands here; no per-byte bookkeeping.)
+        let mut covered_to = offset;
         for (start, bytes) in window {
             let fstart = *start;
-            let fend = fragment_end(fstart, bytes.len())?;
-            let lo = offset.max(fstart);
-            let hi = req_end.min(fend);
-            if lo < hi {
-                let dst_lo = u64_to_usize(lo - offset)?;
-                let dst_hi = u64_to_usize(hi - offset)?;
-                let src_lo = u64_to_usize(lo - fstart)?;
-                out[dst_lo..dst_hi].copy_from_slice(&bytes[src_lo..src_lo + (dst_hi - dst_lo)]);
-                for c in &mut covered[dst_lo..dst_hi] {
-                    *c = true;
-                }
+            if fstart > covered_to {
+                break;
+            }
+            covered_to = covered_to.max(fragment_end(fstart, bytes.len())?.min(req_end));
+            if covered_to == req_end {
+                break;
             }
         }
-        match covered.iter().position(|&c| !c) {
-            None => Ok(Coverage::Full(out)),
-            Some(pos) => {
-                let miss_off = offset + pos as u64;
-                Ok(Coverage::Gap { offset: miss_off, length: req_end - miss_off })
+        if covered_to < req_end {
+            return Ok(Coverage::Gap { offset: covered_to, length: req_end - covered_to });
+        }
+        let mut out = Vec::with_capacity(len);
+        for (start, bytes) in window {
+            let cursor = offset + out.len() as u64;
+            if cursor == req_end {
+                break;
+            }
+            let fend = fragment_end(*start, bytes.len())?;
+            if *start <= cursor && fend > cursor {
+                let src_lo = u64_to_usize(cursor - start)?;
+                let src_hi = u64_to_usize(fend.min(req_end) - start)?;
+                out.extend_from_slice(&bytes[src_lo..src_hi]);
             }
         }
+        Ok(Coverage::Full(out))
     }
 }
 
@@ -297,5 +305,49 @@ impl<'a> ByteRangeReader for RecordingRangeReader<'a> {
 
     fn is_probing(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Coverage, FragmentStore};
+
+    fn store(fragments: &[(u64, &[u8])]) -> FragmentStore {
+        FragmentStore::from_pairs(fragments.iter().map(|(o, b)| (*o, b.to_vec())).collect()).unwrap()
+    }
+
+    fn full(s: &FragmentStore, offset: u64, length: u64) -> Option<Vec<u8>> {
+        match s.assemble(offset, length).unwrap() {
+            Coverage::Full(bytes) => Some(bytes),
+            Coverage::Gap { .. } => None,
+        }
+    }
+
+    fn gap(s: &FragmentStore, offset: u64, length: u64) -> Option<(u64, u64)> {
+        match s.assemble(offset, length).unwrap() {
+            Coverage::Full(_) => None,
+            Coverage::Gap { offset, length } => Some((offset, length)),
+        }
+    }
+
+    #[test]
+    fn assembles_across_adjacent_and_overlapping_fragments() {
+        // Chunks of one big read, plus overlapping and spanning fragments (all
+        // slices of the same file, so overlaps agree).
+        let s = store(&[(10, b"abcd"), (14, b"efgh"), (12, b"cdef"), (18, b"ij"), (0, b"0123456789ab")]);
+        assert_eq!(full(&s, 10, 10).unwrap(), b"abcdefghij");
+        assert_eq!(full(&s, 8, 6).unwrap(), b"89abcd");
+        assert_eq!(full(&s, 15, 3).unwrap(), b"fgh");
+        assert_eq!(full(&s, 0, 0).unwrap(), b"");
+    }
+
+    #[test]
+    fn reports_the_first_missing_byte() {
+        let s = store(&[(0, b"0123"), (6, b"67"), (2, b"23")]);
+        assert_eq!(gap(&s, 0, 8), Some((4, 4)));
+        assert_eq!(gap(&s, 5, 2), Some((5, 2)));
+        assert_eq!(gap(&s, 6, 4), Some((8, 2)));
+        assert_eq!(gap(&s, 20, 1), Some((20, 1)));
+        assert_eq!(full(&s, 6, 2).unwrap(), b"67");
     }
 }

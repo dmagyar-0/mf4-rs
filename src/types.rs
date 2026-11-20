@@ -62,6 +62,47 @@ impl GroupInfo {
     }
 }
 
+/// Physical groups that make up the logical group `first` — shared by `Mdf`
+/// and `MdfIndex` so both answer `group(name)` and group-filtered lookups
+/// alike.
+///
+/// `names[i]` is the name of physical group `i`; `time_groups[i]` the group
+/// holding its time axis (itself for a local master, the referenced group for
+/// an MDF 4.2 remote master, `None` when untimed).
+///
+/// A column-oriented file splits one source group into one physical group per
+/// signal, all carrying the source group's name and pointing at a shared time
+/// group — which may carry *another* source group's name when identical time
+/// axes were merged. The logical group is then: that time group (if it has a
+/// different name) followed by every group with `first`'s name that shares
+/// its time axis. A row-oriented group (local master, or untimed) is just
+/// itself.
+pub(crate) fn logical_group_members(names: &[Option<String>], time_groups: &[Option<usize>], first: usize) -> Vec<usize> {
+    let Some(time_group) = time_groups[first] else {
+        return vec![first];
+    };
+    let mut members = Vec::new();
+    if names[time_group] != names[first] {
+        members.push(time_group);
+    }
+    members.extend(
+        (0..names.len()).filter(|&h| names[h] == names[first] && time_groups[h] == Some(time_group)),
+    );
+    members
+}
+
+/// Merge the [`GroupInfo`] of `first` with those of the other `members` of
+/// its logical group (see [`logical_group_members`]): the channels of all
+/// members, in member order; every other field is `first`'s.
+pub(crate) fn merge_group_infos(first: GroupInfo, members: impl IntoIterator<Item = GroupInfo>) -> GroupInfo {
+    let mut merged = GroupInfo { channel_names: Vec::new(), channels: Vec::new(), ..first };
+    for info in members {
+        merged.channel_names.extend(info.channel_names);
+        merged.channels.extend(info.channels);
+    }
+    merged
+}
+
 /// First and last master (time) value of a channel's group.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TimeRange {

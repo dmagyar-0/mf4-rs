@@ -183,3 +183,41 @@ test("a column file indexes in one range request and reads a signal in at most t
   ref.dispose();
   index.dispose();
 });
+
+test("readMany fetches a shared time axis once and matches the source groups", async () => {
+  const source = buildSource();
+  const { bytes } = toColumnOriented(source, { blockSize: 64 * 1024 });
+  const ref = Mdf.fromBytes(source);
+  const column = Mdf.fromBytes(bytes);
+  const counter = new CountingSource(new BytesRangeSource(bytes));
+  const index = await MdfIndex.fromRangeSource(counter, { seedBytes: 64 * 1024 });
+
+  // Engine and Chassis share one time axis: three signals, one time fetch.
+  const names = ["Speed", "Rpm", "Lateral"];
+  const before = counter.bytes;
+  const signals = await index.readMany(names, { source: counter });
+  const transferred = counter.bytes - before;
+  names.forEach((name, i) => {
+    const expected = ref.read(name);
+    assert.deepEqual(signals[i]!.values, expected.values, name);
+    assert.deepEqual(signals[i]!.timestamps, expected.timestamps, `${name} timestamps`);
+  });
+  assert.ok(transferred < 4 * 8 * FAST + 4096, `${transferred} bytes for 3 signals + 1 time axis`);
+  assert.deepEqual(column.readMany(names).map((s) => s.values), signals.map((s) => s.values));
+
+  // A time window, searched once.
+  const window = { startTime: 1, endTime: 2 };
+  const windowed = await index.readMany(names, { ...window, source: counter });
+  names.forEach((name, i) => assert.deepEqual(windowed[i]!.values, ref.read(name, window).values, name));
+
+  // The column file's groups (and a time channel shared under another
+  // group's name) answer like the source file's.
+  for (const g of ["Engine", "Chassis", "Slow"]) {
+    assert.deepEqual(column.group(g), ref.group(g), `Mdf group ${g}`);
+    assert.deepEqual(index.group(g), ref.group(g), `MdfIndex group ${g}`);
+    assert.deepEqual(column.read("Time", { group: g }).values, ref.read("Time", { group: g }).values, `${g}/Time`);
+  }
+  ref.dispose();
+  column.dispose();
+  index.dispose();
+});

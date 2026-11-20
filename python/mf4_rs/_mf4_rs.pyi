@@ -339,6 +339,29 @@ class Mdf:
         """
         ...
 
+    def read_many(self, names:typing.Sequence[builtins.str], group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None, raw:typing.Optional[builtins.bool] = None) -> builtins.list[Signal]:
+        r"""
+        Read several channels at once, with the same options for all of
+        them: a list with one :py:class:`Signal` per name, in order.
+        
+        Equivalent to calling :py:meth:`read` for each name, but a time axis
+        shared by several of the channels is read once.
+        Prefer it to a loop of :py:meth:`read` when reading several signals.
+        
+        Parameters
+        ----------
+        names : list[str]
+            Channel names (case-sensitive). Duplicates are allowed.
+        group, start_time, end_time, start_record, record_count, raw
+            As for :py:meth:`read`, applied to every name.
+        
+        Raises
+        ------
+        ChannelNotFoundError
+            If any name has no matching channel (nothing is read then).
+        """
+        ...
+
     def values(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None, raw:typing.Optional[builtins.bool] = None) -> typing.Any:
         r"""
         Read a numeric channel as a plain numpy ``float64`` array (no
@@ -525,6 +548,31 @@ class MdfIndex:
             If no matching channel exists.
         MdfException
             If no source is attached, or the read fails.
+        """
+        ...
+
+    def read_many(self, names:typing.Sequence[builtins.str], group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None, raw:typing.Optional[builtins.bool] = None) -> builtins.list[Signal]:
+        r"""
+        Read several channels at once, with the same options for all of
+        them: a list with one :py:class:`Signal` per name, in order.
+        
+        Equivalent to calling :py:meth:`read` for each name, but a time axis
+        shared by several of the channels is read once, a time window is
+        searched once per time axis, and over a URL every byte range of the
+        batch is fetched concurrently.
+        Prefer it to a loop of :py:meth:`read` when reading several signals.
+        
+        Parameters
+        ----------
+        names : list[str]
+            Channel names (case-sensitive). Duplicates are allowed.
+        group, start_time, end_time, start_record, record_count, raw
+            As for :py:meth:`read`, applied to every name.
+        
+        Raises
+        ------
+        ChannelNotFoundError
+            If any name has no matching channel (nothing is read then).
         """
         ...
 

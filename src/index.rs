@@ -13,7 +13,11 @@ use crate::error::MdfError;
 use crate::fragments::{merge_ranges_bridging, FragmentStore, RecordingRangeReader};
 use crate::parsing::decoder::{check_value_validity, decode_channel_value, decode_channel_value_with_validity, decode_f64_from_record, DecodedValue};
 use crate::signal::{decoded_opt_to_f64, Signal};
-use crate::types::{resolve_records, search_time_window, ChannelInfo, ConversionInfo, GroupInfo, ReadOptions, TimeRange, Window};
+use crate::types::{
+    logical_group_members, merge_group_infos, resolve_records, search_time_window, ChannelInfo, ConversionInfo,
+    GroupInfo, ReadOptions, TimeRange, Window,
+};
+use std::collections::HashMap;
 
 /// Largest single read issued when coalescing adjacent data blocks (64 MiB).
 const MAX_COALESCED_READ: u64 = 64 * 1024 * 1024;
@@ -311,6 +315,28 @@ const BATCH_BRIDGE_BYTES: u64 = 4 * 1024;
 #[cfg(feature = "http")]
 const MAX_BATCH_ROUNDS: usize = 1_000;
 
+/// Batched reads fetch a range larger than this as several concurrent
+/// requests of at most this size (8 MiB): one connection to an object store
+/// is far slower than several in parallel.
+#[cfg(feature = "http")]
+const PARALLEL_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Split every `(offset, length)` span longer than `chunk` into consecutive
+/// pieces of at most `chunk` bytes.
+#[cfg(feature = "http")]
+fn split_spans(spans: Vec<(u64, u64)>, chunk: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(spans.len());
+    for (offset, length) in spans {
+        let mut at = 0;
+        while at < length {
+            let take = chunk.min(length - at);
+            out.push((offset + at, take));
+            at += take;
+        }
+    }
+    out
+}
+
 /// Reader over an index's attached [`Source`], for windowed reads.
 enum SourceReader {
     #[cfg(not(target_arch = "wasm32"))]
@@ -332,6 +358,14 @@ impl ByteRangeReader for SourceReader {
         }
     }
 }
+
+/// Record windows resolved during one `read_many`, keyed by the time axis
+/// searched (`None` for a record window) and the group's record count.
+type WindowCache = HashMap<(Option<(usize, usize)>, u64), (u64, u64)>;
+
+/// Time axes decoded during one `read_many`, keyed by the master's
+/// `(group, channel)` and the record window `(start, count)`.
+type AxisCache = HashMap<(usize, usize, u64, u64), Vec<f64>>;
 
 /// Complete MDF file index
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -583,6 +617,19 @@ impl<R: ByteRangeReader<Error = MdfError>> CachingRangeReader<R> {
     #[allow(dead_code)]
     pub(crate) fn inner_mut(&mut self) -> &mut R {
         &mut self.inner
+    }
+
+    /// The wrapped reader and every cached chunk as `(offset, bytes)`.
+    #[allow(dead_code)]
+    pub(crate) fn into_parts(self) -> (R, Vec<(u64, Vec<u8>)>) {
+        let chunk_size = self.chunk_size;
+        let chunks = self
+            .chunks
+            .into_iter()
+            .filter(|(_, bytes)| !bytes.is_empty())
+            .map(|(i, bytes)| (i * chunk_size, bytes))
+            .collect();
+        (self.inner, chunks)
     }
 
     /// Wrap a reader with the default chunk size (1 MiB).
@@ -922,12 +969,16 @@ impl HttpRangeReader {
     pub(crate) fn fetch_all(&mut self) -> Result<Vec<u8>, MdfError> {
         use std::io::Read;
         self.request_count += 1;
-        let response = self.agent.get(&self.url).call().map_err(|e| {
-            MdfError::BlockSerializationError(format!("HTTP request failed: {e}"))
-        })?;
-        let mut body = Vec::new();
-        response.into_reader().read_to_end(&mut body).map_err(MdfError::IOError)?;
-        Ok(body)
+        let (agent, url) = (&self.agent, self.url.as_str());
+        with_retries(|| {
+            let response = agent.get(url).call().map_err(classify_call_error)?;
+            let mut body = Vec::new();
+            response
+                .into_reader()
+                .read_to_end(&mut body)
+                .map_err(|e| HttpFailure::Transient(MdfError::IOError(e), None))?;
+            Ok(body)
+        })
     }
 
     /// Learn the resource's total size with a single-byte ranged GET.
@@ -940,12 +991,8 @@ impl HttpRangeReader {
     pub fn probe_size(&mut self) -> Result<u64, MdfError> {
         use std::io::Read;
 
-        let resp = self
-            .agent
-            .get(&self.url)
-            .set("Range", "bytes=0-0")
-            .call()
-            .map_err(|e| MdfError::BlockSerializationError(format!("HTTP GET error: {e}")))?;
+        let (agent, url) = (&self.agent, self.url.as_str());
+        let resp = with_retries(|| agent.get(url).set("Range", "bytes=0-0").call().map_err(classify_call_error))?;
         self.request_count += 1;
 
         // Preferred: total size from the Content-Range header of a 206 response.
@@ -1032,9 +1079,110 @@ fn shared_http_agent() -> Result<ureq::Agent, MdfError> {
     let agent = ureq::AgentBuilder::new()
         .tls_connector(std::sync::Arc::new(connector))
         .max_idle_connections_per_host(MAX_PARALLEL_REQUESTS)
+        // Without a read timeout a stalled connection would block a read
+        // (and the Python caller) forever; a timed-out attempt is retried.
+        .timeout_connect(HTTP_CONNECT_TIMEOUT)
+        .timeout_read(HTTP_READ_TIMEOUT)
+        .timeout_write(HTTP_READ_TIMEOUT)
         .build();
     *slot = Some((pid, agent.clone()));
     Ok(agent)
+}
+
+/// Time allowed to establish a connection.
+#[cfg(feature = "http")]
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Longest wait for the next bytes of a response (a stall, not a slow
+/// download: every socket read restarts it).
+#[cfg(feature = "http")]
+const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Retries of a request that failed transiently (connection error, timeout,
+/// `408` / `429` / `5xx`) before giving up.
+#[cfg(feature = "http")]
+const HTTP_MAX_RETRIES: u32 = 3;
+
+/// Delay before the first retry; doubled for each further one.
+#[cfg(feature = "http")]
+const HTTP_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Upper bound on a single retry delay, including a server's `Retry-After`.
+#[cfg(feature = "http")]
+const HTTP_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Outcome of one failed HTTP attempt.
+#[cfg(feature = "http")]
+enum HttpFailure {
+    /// Worth retrying (connection error, timeout, throttling, server
+    /// error), optionally after the delay the server asked for.
+    Transient(MdfError, Option<std::time::Duration>),
+    /// Retrying would not help (`404`, `403`, a wrong range, a replaced file).
+    Fatal(MdfError),
+}
+
+/// Statuses that signal a temporary condition: request timeout, throttling
+/// (S3 `503 SlowDown`, `429`) and server/gateway errors.
+#[cfg(feature = "http")]
+fn is_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// A `Retry-After: <seconds>` header (the HTTP-date form is ignored).
+#[cfg(feature = "http")]
+fn retry_after(resp: &ureq::Response) -> Option<std::time::Duration> {
+    resp.header("Retry-After")?.trim().parse::<u64>().ok().map(std::time::Duration::from_secs)
+}
+
+/// Classify a failed `call()`: transport errors and transient statuses are
+/// retried, every other status is final.
+#[cfg(feature = "http")]
+fn classify_call_error(error: ureq::Error) -> HttpFailure {
+    match error {
+        ureq::Error::Status(status, resp) if is_transient_status(status) => {
+            let after = retry_after(&resp);
+            HttpFailure::Transient(
+                MdfError::BlockSerializationError(format!("HTTP request failed with status {status}")),
+                after,
+            )
+        }
+        ureq::Error::Status(status, _) => {
+            HttpFailure::Fatal(MdfError::BlockSerializationError(format!("HTTP request failed with status {status}")))
+        }
+        transport => HttpFailure::Transient(
+            MdfError::BlockSerializationError(format!("HTTP request failed: {transport}")),
+            None,
+        ),
+    }
+}
+
+/// Run `attempt` until it succeeds, fails for good, or has been retried
+/// [`HTTP_MAX_RETRIES`] times, sleeping with exponential backoff (or the
+/// server's `Retry-After`, capped) between attempts.
+#[cfg(feature = "http")]
+fn with_retries<T>(mut attempt: impl FnMut() -> Result<T, HttpFailure>) -> Result<T, MdfError> {
+    let mut delay = HTTP_RETRY_BASE_DELAY;
+    let mut retries = 0;
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(HttpFailure::Fatal(e)) => return Err(e),
+            Err(HttpFailure::Transient(e, after)) => {
+                if retries == HTTP_MAX_RETRIES {
+                    return Err(match e {
+                        MdfError::BlockSerializationError(msg) => MdfError::BlockSerializationError(format!(
+                            "{msg} (gave up after {} attempts)",
+                            HTTP_MAX_RETRIES + 1
+                        )),
+                        other => other,
+                    });
+                }
+                std::thread::sleep(after.unwrap_or(delay).min(HTTP_MAX_RETRY_DELAY));
+                delay *= 2;
+                retries += 1;
+            }
+        }
+    }
 }
 
 /// Total size from a `Content-Range: bytes A-B/<total>` (or `bytes */<total>`)
@@ -1065,7 +1213,8 @@ fn check_resource_size(source: &str, expected: u64, actual: u64) -> Result<(), M
     Ok(())
 }
 
-/// One `Range: bytes=A-B` GET of `[offset, offset + length)`.
+/// One `Range: bytes=A-B` GET of `[offset, offset + length)`, retried on
+/// transient failures (see [`with_retries`]).
 #[cfg(feature = "http")]
 fn http_get_range(
     agent: &ureq::Agent,
@@ -1074,11 +1223,24 @@ fn http_get_range(
     length: u64,
     expected_size: Option<u64>,
 ) -> Result<Vec<u8>, MdfError> {
-    use std::io::Read;
-
     if length == 0 {
         return Ok(Vec::new());
     }
+    with_retries(|| http_get_range_once(agent, url, offset, length, expected_size))
+}
+
+/// A single attempt of [`http_get_range`].
+#[cfg(feature = "http")]
+fn http_get_range_once(
+    agent: &ureq::Agent,
+    url: &str,
+    offset: u64,
+    length: u64,
+    expected_size: Option<u64>,
+) -> Result<Vec<u8>, HttpFailure> {
+    use std::io::Read;
+    use HttpFailure::Fatal;
+
     let range_header = format!("bytes={}-{}", offset, offset + length - 1);
     let resp = match agent.get(url).set("Range", &range_header).call() {
         Ok(resp) => resp,
@@ -1087,18 +1249,18 @@ fn http_get_range(
         Err(ureq::Error::Status(416, resp)) => {
             let total = content_range_total(resp.header("Content-Range"));
             if let (Some(expected), Some(actual)) = (expected_size, total) {
-                check_resource_size(url, expected, actual)?;
+                check_resource_size(url, expected, actual).map_err(Fatal)?;
             }
-            return Err(MdfError::BlockSerializationError(format!(
+            return Err(Fatal(MdfError::BlockSerializationError(format!(
                 "HTTP range {offset}..{} is past the end of {url}{}",
                 offset + length,
                 total.map(|t| format!(" ({t} bytes)")).unwrap_or_default()
-            )));
+            ))));
         }
-        Err(e) => return Err(MdfError::BlockSerializationError(format!("HTTP GET error: {e}"))),
+        Err(e) => return Err(classify_call_error(e)),
     };
     if let (Some(expected), Some(actual)) = (expected_size, content_range_total(resp.header("Content-Range"))) {
-        check_resource_size(url, expected, actual)?;
+        check_resource_size(url, expected, actual).map_err(Fatal)?;
     }
     // A 206 must carry exactly the requested range: a proxy or a shared
     // connection that answers with other bytes of the right length would
@@ -1108,9 +1270,9 @@ fn http_get_range(
             let want_end = offset + length - 1;
             // (A shorter range at end-of-file is caught by the short-body check below.)
             if start != offset || end > want_end {
-                return Err(MdfError::BlockSerializationError(format!(
+                return Err(Fatal(MdfError::BlockSerializationError(format!(
                     "HTTP server returned bytes {start}-{end} for requested range {offset}-{want_end}"
-                )));
+                ))));
             }
         }
     }
@@ -1125,17 +1287,17 @@ fn http_get_range(
         206 => {}
         200 => {
             if offset != 0 {
-                return Err(MdfError::BlockSerializationError(format!(
+                return Err(Fatal(MdfError::BlockSerializationError(format!(
                     "HTTP server ignored Range request (status 200) for offset {}; \
                      refusing to return bytes from the wrong position",
                     offset
-                )));
+                ))));
             }
         }
         other => {
-            return Err(MdfError::BlockSerializationError(format!(
+            return Err(Fatal(MdfError::BlockSerializationError(format!(
                 "HTTP range request returned unexpected status {other}"
-            )));
+            ))));
         }
     }
 
@@ -1145,19 +1307,20 @@ fn http_get_range(
     // records. Capacity is capped so a forged huge length cannot abort
     // on allocation.
     let mut buf = Vec::with_capacity(length.min(1 << 20) as usize);
+    // A connection reset or read timeout mid-body is transient.
     resp.into_reader()
         .take(length)
         .read_to_end(&mut buf)
-        .map_err(MdfError::IOError)?;
+        .map_err(|e| HttpFailure::Transient(MdfError::IOError(e), None))?;
     if (buf.len() as u64) < length {
         // Report absolute positions so wrappers (e.g. CachingRangeReader)
         // can learn the resource's true end from `actual`.
-        return Err(MdfError::TooShortBuffer {
+        return Err(Fatal(MdfError::TooShortBuffer {
             actual: (offset + buf.len() as u64) as usize,
             expected: (offset + length) as usize,
             file: file!(),
             line: line!(),
-        });
+        }));
     }
     Ok(buf)
 }
@@ -2959,12 +3122,40 @@ impl MdfIndex {
     }
 
     /// Metadata of the first channel group named `name`, or `None`.
+    ///
+    /// The groups of a column-oriented (MDF 4.2) file are merged back into
+    /// their source group, as [`Mdf::group`] does.
     pub fn group(&self, name: &str) -> Result<Option<GroupInfo>, MdfError> {
-        Ok(self
-            .channel_groups
-            .iter()
-            .position(|g| g.name.as_deref() == Some(name))
-            .map(|g| self.group_info(g)))
+        let names = self.group_names();
+        let Some(first) = names.iter().position(|n| n.as_deref() == Some(name)) else {
+            return Ok(None);
+        };
+        let members = logical_group_members(&names, &self.time_groups(), first);
+        Ok(Some(merge_group_infos(
+            self.group_info(first),
+            members.iter().map(|&m| self.group_info(m)),
+        )))
+    }
+
+    fn group_names(&self) -> Vec<Option<String>> {
+        self.channel_groups.iter().map(|g| g.name.clone()).collect()
+    }
+
+    /// For each group, the group holding its time axis: itself for a local
+    /// master, the remote master group of an MDF 4.2 column-oriented group,
+    /// `None` when untimed.
+    fn time_groups(&self) -> Vec<Option<usize>> {
+        (0..self.channel_groups.len()).map(|g| self.time_group(g)).collect()
+    }
+
+    fn time_group(&self, g: usize) -> Option<usize> {
+        let group = self.channel_groups.get(g)?;
+        if group.master_channel().is_some() {
+            return Some(g);
+        }
+        group
+            .master_group
+            .filter(|&m| m != g && self.channel_groups.get(m).is_some_and(|mg| mg.master_channel().is_some()))
     }
 
     /// Metadata of the first channel named `name`, or `None`. Pass `group` to
@@ -3056,18 +3247,24 @@ impl MdfIndex {
     /// Resolve a `(group name, channel name)` pair to indices.
     ///
     /// Every group carrying that name is searched (a column-oriented file has
-    /// one channel group per signal, all named after the source group).
+    /// one channel group per signal, all named after the source group), then
+    /// the time groups they reference under another name — a time axis shared
+    /// by several source groups carries only one of their names.
     pub(crate) fn locate_in(&self, group: &str, name: &str) -> Option<(usize, usize)> {
-        self.channel_groups
+        let named: Vec<usize> = (0..self.channel_groups.len())
+            .filter(|&g| self.channel_groups[g].name.as_deref() == Some(group))
+            .collect();
+        let remote = named
             .iter()
-            .enumerate()
-            .filter(|(_, grp)| grp.name.as_deref() == Some(group))
-            .find_map(|(g, grp)| {
-                grp.channels
-                    .iter()
-                    .position(|ch| ch.name.as_deref() == Some(name))
-                    .map(|c| (g, c))
-            })
+            .filter_map(|&g| self.time_group(g))
+            .filter(|&t| self.channel_groups[t].name.as_deref() != Some(group));
+        named.iter().copied().chain(remote).find_map(|g| {
+            self.channel_groups[g]
+                .channels
+                .iter()
+                .position(|ch| ch.name.as_deref() == Some(name))
+                .map(|c| (g, c))
+        })
     }
 
     /// `(group, channel)` of the master (time) channel for the channel at
@@ -3139,12 +3336,58 @@ impl MdfIndex {
         let options = options.into().unwrap_or(&default);
         let window = options.window()?;
         let (g, c) = self.locate_checked(name, options.group_name())?;
+        // Over a URL the channel and its time axis are fetched concurrently.
+        #[cfg(feature = "http")]
+        if let Source::Url(url) = self.require_source()? {
+            let mut signals = self.read_many_url(url, &[(g, c)], window, options.raw)?;
+            return signals.pop().ok_or_else(|| MdfError::BlockSerializationError("no signal read".to_string()));
+        }
         if window == Window::All {
             return self.read_signal(g, c, options.raw);
         }
         let mut reader = self.source_reader(g, c, options.raw, true)?;
         let (start, count) = self.resolve_window_via(g, c, window, &mut reader)?;
         read_signal_window(self, g, c, start, count, options.raw, &mut reader)
+    }
+
+    /// Read several channels at once, with the same `options` for all of
+    /// them: one [`Signal`] per name, in the order given.
+    ///
+    /// Equivalent to calling [`read`](Self::read) for each name, but each
+    /// time axis shared by several of the channels is fetched and decoded
+    /// once (in a column-oriented file every signal of a source group shares
+    /// one), a time window is searched once per time axis, and over a URL
+    /// every byte range of the whole batch is fetched concurrently. Errors
+    /// with [`MdfError::ChannelNotFound`] — before fetching anything — if any
+    /// name is unknown.
+    pub fn read_many<'o, S: AsRef<str>>(
+        &self,
+        names: &[S],
+        options: impl Into<Option<&'o ReadOptions>>,
+    ) -> Result<Vec<Signal>, MdfError> {
+        let default = ReadOptions::default();
+        let options = options.into().unwrap_or(&default);
+        let window = options.window()?;
+        let targets = self.locate_all(names, options.group_name())?;
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self.require_source()? {
+            #[cfg(not(target_arch = "wasm32"))]
+            Source::File(path) => {
+                let mmap = self.map_source_file(path)?;
+                if window == Window::All {
+                    return self.read_many_from_slice(&targets, options.raw, &mmap);
+                }
+                self.read_many_at(&targets, window, options.raw, &mut MmapRangeReader { mmap })
+            }
+            #[cfg(target_arch = "wasm32")]
+            Source::File(_) => Err(MdfError::BlockSerializationError(
+                "file sources are not available on wasm32".to_string(),
+            )),
+            #[cfg(feature = "http")]
+            Source::Url(url) => self.read_many_url(url, &targets, window, options.raw),
+        }
     }
 
     /// Read a numeric channel as plain `f64` values (no timestamps).
@@ -3210,9 +3453,22 @@ impl MdfIndex {
     fn batched_reads<T>(
         &self,
         http: &mut HttpRangeReader,
+        op: impl FnMut(&mut RecordingRangeReader<'_>) -> Result<T, MdfError>,
+    ) -> Result<T, MdfError> {
+        self.batched_reads_seeded(http, FragmentStore::new(), op)
+    }
+
+    /// [`batched_reads`](Self::batched_reads) starting from bytes already
+    /// fetched (`store`). Large gaps are split into
+    /// [`PARALLEL_CHUNK_BYTES`] pieces so one big signal is also fetched over
+    /// several connections at once.
+    #[cfg(feature = "http")]
+    fn batched_reads_seeded<T>(
+        &self,
+        http: &mut HttpRangeReader,
+        mut store: FragmentStore,
         mut op: impl FnMut(&mut RecordingRangeReader<'_>) -> Result<T, MdfError>,
     ) -> Result<T, MdfError> {
-        let mut store = FragmentStore::new();
         for _ in 0..MAX_BATCH_ROUNDS {
             let mut recorder = RecordingRangeReader { store: &store, misses: Vec::new(), whole_request: true };
             let result = op(&mut recorder);
@@ -3220,7 +3476,7 @@ impl MdfIndex {
             if misses.is_empty() {
                 return result;
             }
-            let spans = merge_ranges_bridging(misses, BATCH_BRIDGE_BYTES);
+            let spans = split_spans(merge_ranges_bridging(misses, BATCH_BRIDGE_BYTES), PARALLEL_CHUNK_BYTES);
             let fetched = http.read_ranges_parallel(&spans)?;
             for ((offset, _), bytes) in spans.iter().zip(fetched) {
                 store.push(*offset, bytes)?;
@@ -3238,6 +3494,187 @@ impl MdfIndex {
     /// it is then fetched through the attached source on demand.
     pub fn conversion(&self, name: &str, group: Option<&str>) -> Result<Option<ConversionInfo>, MdfError> {
         Ok(self.conversion_block(name, group)?.as_ref().map(ConversionInfo::from))
+    }
+
+    /// Locate every name (in the group(s) named `group`, when given), failing
+    /// with `ChannelNotFound` on the first unknown one.
+    pub(crate) fn locate_all<S: AsRef<str>>(&self, names: &[S], group: Option<&str>) -> Result<Vec<(usize, usize)>, MdfError> {
+        names.iter().map(|name| self.locate_checked(name.as_ref(), group)).collect()
+    }
+
+    /// A [`Signal`] for channel `(g, c)` from its decoded parts.
+    fn make_signal(&self, g: usize, c: usize, timestamps: Vec<f64>, values: Vec<Option<DecodedValue>>) -> Signal {
+        let channel = &self.channel_groups[g].channels[c];
+        Signal { name: channel.name.clone().unwrap_or_default(), unit: channel.unit.clone(), timestamps, values }
+    }
+
+    /// `read_many` of whole channels from an in-memory file (a mapped file
+    /// source): the same decoding as [`read`](Self::read), each time axis once.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_many_from_slice(&self, targets: &[(usize, usize)], raw: bool, data: &[u8]) -> Result<Vec<Signal>, MdfError> {
+        let mut axes: HashMap<(usize, usize), Vec<f64>> = HashMap::new();
+        let mut out = Vec::with_capacity(targets.len());
+        for &(g, c) in targets {
+            let values = self.read_channel_values_from_slice(g, c, raw, data)?;
+            let timestamps = match self.master_location(g, c) {
+                Some(m) => match axes.get(&m) {
+                    Some(axis) => axis.clone(),
+                    None => {
+                        let axis = self.read_channel_values_from_slice_as_f64(m.0, m.1, false, data)?;
+                        axes.insert(m, axis.clone());
+                        axis
+                    }
+                },
+                None => Vec::new(),
+            };
+            out.push(self.make_signal(g, c, timestamps, values));
+        }
+        Ok(out)
+    }
+
+    /// `read_many` over any byte-range reader — the shared core of the URL,
+    /// wasm-fragment and [`MdfReader`] paths.
+    ///
+    /// Every channel is attempted even after one fails, so a probing reader
+    /// ([`RecordingRangeReader`](crate::fragments::RecordingRangeReader))
+    /// records the gaps of the whole batch in one pass; the first error is
+    /// returned. Within the call, a window is resolved once per time axis and
+    /// each time axis (or its window) is decoded once.
+    pub(crate) fn read_many_at<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        targets: &[(usize, usize)],
+        window: Window,
+        raw: bool,
+        reader: &mut R,
+    ) -> Result<Vec<Signal>, MdfError> {
+        let mut windows = WindowCache::new();
+        let mut axes = AxisCache::new();
+        let mut out = Vec::with_capacity(targets.len());
+        let mut first_error = None;
+        for &(g, c) in targets {
+            match self.read_one_at(g, c, window, raw, reader, &mut windows, &mut axes) {
+                Ok(signal) => out.push(signal),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+
+    /// One channel of [`read_many_at`](Self::read_many_at): the same reads
+    /// as [`read`](Self::read) (`read_signal` / [`read_signal_window`]), with
+    /// resolved windows and time axes shared through the two caches.
+    #[allow(clippy::too_many_arguments)]
+    fn read_one_at<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        g: usize,
+        c: usize,
+        window: Window,
+        raw: bool,
+        reader: &mut R,
+        windows: &mut WindowCache,
+        axes: &mut AxisCache,
+    ) -> Result<Signal, MdfError> {
+        let master = self.master_location(g, c);
+        if window == Window::All {
+            let values = self.read_channel_values(g, c, raw, reader);
+            // Read the time axis even when the values failed, so a probing
+            // reader records both gaps in one pass.
+            let timestamps = match master {
+                Some((mg, m)) => Self::cached_axis(axes, (mg, m, 0, u64::MAX), || {
+                    self.read_channel_values_as_f64(mg, m, false, reader)
+                })?,
+                None => Vec::new(),
+            };
+            return Ok(self.make_signal(g, c, timestamps, values?));
+        }
+        // A time window depends on the time axis searched, a record window
+        // only on the group's record count.
+        let axis = match window {
+            Window::Time(..) => self.time_axis_location(g, c),
+            _ => None,
+        };
+        let key = (axis, self.channel_groups[g].record_count);
+        let (start, count) = match windows.get(&key) {
+            Some(&resolved) => resolved,
+            None => {
+                let resolved = self.resolve_window(g, c, window, reader)?;
+                windows.insert(key, resolved);
+                resolved
+            }
+        };
+        let values = self.read_channel_values_window(g, c, start, count, raw, reader);
+        let timestamps = match master {
+            Some((mg, m)) => Self::cached_axis(axes, (mg, m, start, count), || {
+                Ok(self
+                    .read_channel_values_window(mg, m, start, count, false, reader)?
+                    .iter()
+                    .map(decoded_opt_to_f64)
+                    .collect())
+            })?,
+            None => Vec::new(),
+        };
+        Ok(self.make_signal(g, c, timestamps, values?))
+    }
+
+    fn cached_axis(
+        axes: &mut AxisCache,
+        key: (usize, usize, u64, u64),
+        decode: impl FnOnce() -> Result<Vec<f64>, MdfError>,
+    ) -> Result<Vec<f64>, MdfError> {
+        if let Some(axis) = axes.get(&key) {
+            return Ok(axis.clone());
+        }
+        let axis = decode()?;
+        axes.insert(key, axis.clone());
+        Ok(axis)
+    }
+
+    /// `read_many` over a URL: deferred conversions are fetched first through
+    /// a small read-ahead cache (a `##CC` block and the blocks it references
+    /// usually sit together, so this costs one request instead of one round
+    /// per chain level), then every data range of the batch — channels and
+    /// time axes — is fetched concurrently in [`batched_reads_seeded`]
+    /// rounds (one round for whole channels; a few more to search a time
+    /// window).
+    ///
+    /// [`batched_reads_seeded`]: Self::batched_reads_seeded
+    #[cfg(feature = "http")]
+    fn read_many_url(
+        &self,
+        url: &str,
+        targets: &[(usize, usize)],
+        window: Window,
+        raw: bool,
+    ) -> Result<Vec<Signal>, MdfError> {
+        let mut cached = CachingRangeReader::with_chunk_size(self.http_source(url)?, 64 * 1024);
+        if self.file_size > 0 {
+            cached.set_known_size(self.file_size);
+        }
+        let mut primed = std::collections::HashSet::new();
+        for &(g, c) in targets {
+            let mut conversions = Vec::with_capacity(3);
+            if !raw {
+                conversions.push((g, c));
+            }
+            conversions.extend(self.master_location(g, c));
+            if matches!(window, Window::Time(..)) {
+                conversions.extend(self.time_axis_location(g, c));
+            }
+            for (tg, tc) in conversions {
+                let channel = &self.channel_groups[tg].channels[tc];
+                if channel.conversion.is_none() && channel.conversion_addr != 0 && primed.insert(channel.conversion_addr) {
+                    self.resolve_channel_conversion(tg, tc, &mut cached)?;
+                }
+            }
+        }
+        let (mut http, fetched) = cached.into_parts();
+        let store = FragmentStore::from_pairs(fetched)?;
+        self.batched_reads_seeded(&mut http, store, |r| self.read_many_at(targets, window, raw, r))
     }
 
     /// Records `[start, start + count)` a window selects in the group of `(g, c)`.
@@ -3958,6 +4395,19 @@ impl<'a, R: ByteRangeReader<Error = MdfError>> MdfReader<'a, R> {
         read_signal_window(self.index, g, c, start, count, options.raw, &mut self.reader)
     }
 
+    /// Read several channels at once — see [`MdfIndex::read_many`].
+    pub fn read_many<'o, S: AsRef<str>>(
+        &mut self,
+        names: &[S],
+        options: impl Into<Option<&'o ReadOptions>>,
+    ) -> Result<Vec<Signal>, MdfError> {
+        let default = ReadOptions::default();
+        let options = options.into().unwrap_or(&default);
+        let window = options.window()?;
+        let targets = self.index.locate_all(names, options.group_name())?;
+        self.index.read_many_at(&targets, window, options.raw, &mut self.reader)
+    }
+
     /// Read a numeric channel as plain `f64` values — see [`MdfIndex::values`].
     pub fn values<'o>(&mut self, name: &str, options: impl Into<Option<&'o ReadOptions>>) -> Result<Vec<f64>, MdfError> {
         let default = ReadOptions::default();
@@ -4045,5 +4495,66 @@ mod http_header_tests {
         assert_eq!(content_range_total(Some("bytes 10-19/100")), Some(100));
         assert_eq!(content_range_total(Some("bytes */100")), Some(100));
         assert_eq!(content_range_total(Some("bytes 0-0/*")), None);
+    }
+}
+
+#[cfg(all(test, feature = "http"))]
+mod http_retry_tests {
+    use super::{ByteRangeReader, HttpRangeReader};
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const OK: &str = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/10\r\nContent-Length: 4\r\n\
+                      Connection: close\r\n\r\nabcd";
+    const BUSY: &str = "HTTP/1.1 503 Slow Down\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const MISSING: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// Serve `script` (one response per connection) and count requests.
+    fn serve(script: &[&'static str]) -> (String, Arc<AtomicU64>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/file.mf4", listener.local_addr().unwrap());
+        let script = Arc::new(Mutex::new(script.iter().copied().collect::<VecDeque<_>>()));
+        let count = Arc::new(AtomicU64::new(0));
+        let served = count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                served.fetch_add(1, Ordering::SeqCst);
+                let response = script.lock().unwrap().pop_front().unwrap_or(MISSING);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (url, count)
+    }
+
+    #[test]
+    fn transient_failures_are_retried() {
+        let (url, count) = serve(&[BUSY, BUSY, OK]);
+        let bytes = HttpRangeReader::new(url).unwrap().read_range(0, 4).unwrap();
+        assert_eq!(bytes, b"abcd");
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn retries_are_bounded() {
+        let (url, count) = serve(&[BUSY, BUSY, BUSY, BUSY, BUSY, OK]);
+        let error = HttpRangeReader::new(url).unwrap().read_range(0, 4).unwrap_err().to_string();
+        assert!(error.contains("503") && error.contains("gave up after 4 attempts"), "{error}");
+        assert_eq!(count.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn permanent_failures_are_not_retried() {
+        let (url, count) = serve(&[MISSING, OK]);
+        let error = HttpRangeReader::new(url).unwrap().read_range(0, 4).unwrap_err().to_string();
+        assert!(error.contains("404"), "{error}");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

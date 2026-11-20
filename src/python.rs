@@ -537,6 +537,42 @@ impl PyMDF {
         PySignal::new(py, signal, self.mdf.start_time_ns())
     }
 
+    /// Read several channels at once, with the same options for all of
+    /// them: a list with one :py:class:`Signal` per name, in order.
+    ///
+    /// Equivalent to calling :py:meth:`read` for each name, but a time axis
+    /// shared by several of the channels is read once.
+    /// Prefer it to a loop of :py:meth:`read` when reading several signals.
+    ///
+    /// Parameters
+    /// ----------
+    /// names : list[str]
+    ///     Channel names (case-sensitive). Duplicates are allowed.
+    /// group, start_time, end_time, start_record, record_count, raw
+    ///     As for :py:meth:`read`, applied to every name.
+    ///
+    /// Raises
+    /// ------
+    /// ChannelNotFoundError
+    ///     If any name has no matching channel (nothing is read then).
+    fn read_many(
+        &self,
+        py: Python,
+        names: Vec<String>,
+        group: Option<&str>,
+        start_time: Option<f64>,
+        end_time: Option<f64>,
+        start_record: Option<u64>,
+        record_count: Option<u64>,
+        raw: Option<bool>,
+    ) -> PyResult<Vec<PySignal>> {
+        let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count)
+            .raw(raw.unwrap_or(false));
+        let signals = py.allow_threads(|| self.mdf.read_many(&names, &options))?;
+        let start = self.mdf.start_time_ns();
+        signals.into_iter().map(|signal| PySignal::new(py, signal, start)).collect()
+    }
+
     /// Read a numeric channel as a plain numpy ``float64`` array (no
     /// timestamps). Conversions are applied unless ``raw=True``; invalid and
     /// non-numeric samples are ``NaN``. Parameters as for :py:meth:`read`.
@@ -777,6 +813,44 @@ impl PyMdfIndex {
         // Release the GIL during the (potentially blocking, e.g. HTTP) read.
         let signal = py.allow_threads(|| self.index.read(name, &options))?;
         PySignal::new(py, signal, self.index.start_time_ns())
+    }
+
+    /// Read several channels at once, with the same options for all of
+    /// them: a list with one :py:class:`Signal` per name, in order.
+    ///
+    /// Equivalent to calling :py:meth:`read` for each name, but a time axis
+    /// shared by several of the channels is read once, a time window is
+    /// searched once per time axis, and over a URL every byte range of the
+    /// batch is fetched concurrently.
+    /// Prefer it to a loop of :py:meth:`read` when reading several signals.
+    ///
+    /// Parameters
+    /// ----------
+    /// names : list[str]
+    ///     Channel names (case-sensitive). Duplicates are allowed.
+    /// group, start_time, end_time, start_record, record_count, raw
+    ///     As for :py:meth:`read`, applied to every name.
+    ///
+    /// Raises
+    /// ------
+    /// ChannelNotFoundError
+    ///     If any name has no matching channel (nothing is read then).
+    fn read_many(
+        &self,
+        py: Python,
+        names: Vec<String>,
+        group: Option<&str>,
+        start_time: Option<f64>,
+        end_time: Option<f64>,
+        start_record: Option<u64>,
+        record_count: Option<u64>,
+        raw: Option<bool>,
+    ) -> PyResult<Vec<PySignal>> {
+        let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count)
+            .raw(raw.unwrap_or(false));
+        let signals = py.allow_threads(|| self.index.read_many(&names, &options))?;
+        let start = self.index.start_time_ns();
+        signals.into_iter().map(|signal| PySignal::new(py, signal, start)).collect()
     }
 
     /// Read a numeric channel as a plain numpy ``float64`` array (no

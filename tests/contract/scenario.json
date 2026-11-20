@@ -44,6 +44,15 @@
     { "name": "Count", "group": "NoMaster", "raw": true },
     { "name": "Nope", "raw": true }
   ],
+  "read_many_cases": [
+    { "names": ["Speed", "Gear", "Time", "Label"] },
+    { "names": ["Speed", "Label", "Count"], "start_record": 1, "record_count": 2 },
+    { "names": ["Speed", "Blob", "Speed"], "start_time": 1.0, "end_time": 2.0 },
+    { "names": ["Speed", "Gear"], "raw": true },
+    { "names": ["Value"], "group": "Empty", "start_time": 0.0 },
+    { "names": ["Speed", "Nope"] },
+    { "names": [] }
+  ],
   "channel_cases": [
     { "name": "Speed" },
     { "name": "Gear", "group": "Engine" },
