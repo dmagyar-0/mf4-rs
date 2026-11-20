@@ -56,12 +56,14 @@ export interface WasmMdfIndex {
     with_master: boolean,
     ranges: unknown,
     fragments: unknown,
+    raw?: boolean | null,
   ): WasmBuildStep;
   readFromFragments(
     name: string,
     group: string | null | undefined,
     ranges: unknown,
     fragments: unknown,
+    raw?: boolean | null,
   ): unknown;
   signalByteRanges(name: string, group?: string | null, withMaster?: boolean | null): unknown;
   startTimeNs(): bigint | undefined;
@@ -98,6 +100,7 @@ export interface WasmMdfIndex {
     group: string | null | undefined,
     ranges: unknown,
     fragments: unknown,
+    raw?: boolean | null,
   ): Float64Array;
 }
 

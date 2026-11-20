@@ -310,7 +310,7 @@ class Mdf:
         """
         ...
 
-    def read(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None) -> Signal:
+    def read(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None, raw:typing.Optional[builtins.bool] = None) -> Signal:
         r"""
         Read a channel as a :class:`Signal`: its values (conversions applied)
         paired with the group's time axis.
@@ -328,6 +328,9 @@ class Mdf:
         start_record, record_count : Optional[int]
             Record window ``[start_record, start_record + record_count)``.
             Pass either a time window or a record window, not both.
+        raw : Optional[bool]
+            ``True`` returns the values as stored in the file, without the
+            channel's conversion. ``timestamps`` stay physical (converted).
         
         Raises
         ------
@@ -336,11 +339,11 @@ class Mdf:
         """
         ...
 
-    def values(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None) -> typing.Any:
+    def values(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None, raw:typing.Optional[builtins.bool] = None) -> typing.Any:
         r"""
         Read a numeric channel as a plain numpy ``float64`` array (no
-        timestamps). Conversions are applied; invalid and non-numeric samples
-        are ``NaN``. Parameters as for :py:meth:`read`.
+        timestamps). Conversions are applied unless ``raw=True``; invalid and
+        non-numeric samples are ``NaN``. Parameters as for :py:meth:`read`.
         """
         ...
 
@@ -491,7 +494,7 @@ class MdfIndex:
         """
         ...
 
-    def read(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None) -> Signal:
+    def read(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None, raw:typing.Optional[builtins.bool] = None) -> Signal:
         r"""
         Read a channel as a :class:`Signal`, fetching only the bytes it needs
         from the ``source``.
@@ -512,6 +515,9 @@ class MdfIndex:
         start_record, record_count : Optional[int]
             Record window ``[start_record, start_record + record_count)``.
             Pass either a time window or a record window, not both.
+        raw : Optional[bool]
+            ``True`` returns the values as stored in the file, without the
+            channel's conversion. ``timestamps`` stay physical (converted).
         
         Raises
         ------
@@ -522,11 +528,11 @@ class MdfIndex:
         """
         ...
 
-    def values(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None) -> typing.Any:
+    def values(self, name:builtins.str, group:typing.Optional[builtins.str] = None, start_time:typing.Optional[builtins.float] = None, end_time:typing.Optional[builtins.float] = None, start_record:typing.Optional[builtins.int] = None, record_count:typing.Optional[builtins.int] = None, raw:typing.Optional[builtins.bool] = None) -> typing.Any:
         r"""
         Read a numeric channel as a plain numpy ``float64`` array (no
-        timestamps). Conversions are applied; invalid and non-numeric samples
-        are ``NaN``. Parameters as for :py:meth:`read`.
+        timestamps). Conversions are applied unless ``raw=True``; invalid and
+        non-numeric samples are ``NaN``. Parameters as for :py:meth:`read`.
         """
         ...
 

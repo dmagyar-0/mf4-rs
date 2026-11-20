@@ -41,6 +41,16 @@ export function windowOf(w: ReadWindow): ReadWindow {
 }
 
 /**
+ * The object handed to the wasm `read` / `values` / `*WindowStep` calls: the
+ * validated window plus `raw` when set.
+ */
+export function wasmWindow(options: ReadWindow & { raw?: boolean }): ReadWindow & { raw?: boolean } {
+  const out: ReadWindow & { raw?: boolean } = windowOf(options);
+  if (options.raw) out.raw = true;
+  return out;
+}
+
+/**
  * Convert relative master times (seconds) to absolute nanoseconds since the
  * Unix epoch: `startTimeNs + round(t * 1e9)`.
  *

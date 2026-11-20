@@ -101,6 +101,22 @@ impl<'a> Channel<'a> {
     /// - `Some(value)` for valid samples
     /// - `None` for invalid samples (invalidation bit set or decoding failed)
     pub fn decoded_values(&self) -> Result<Vec<Option<DecodedValue>>, MdfError> {
+        self.decoded_values_as(false)
+    }
+
+    /// The channel's conversion applied to `value`, or `value` unchanged when
+    /// `raw` (the stored value is wanted).
+    fn physical(&self, value: DecodedValue, raw: bool) -> Result<DecodedValue, MdfError> {
+        if raw {
+            Ok(value)
+        } else {
+            self.block.apply_conversion_value(value, self.mmap)
+        }
+    }
+
+    /// [`decoded_values`](Self::decoded_values), or the stored values without
+    /// the conversion when `raw`.
+    pub(crate) fn decoded_values_as(&self, raw: bool) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         let record_id_len = self.raw_data_group.block.record_id_len as usize;
         let cg_data_bytes = self.raw_channel_group.block.samples_byte_nr;
         let invalidation_bytes_nr = self.raw_channel_group.block.invalidation_bytes_nr;
@@ -114,7 +130,7 @@ impl<'a> Channel<'a> {
         // raw value is the record index.
         if matches!(self.block.channel_type, 3 | 6) {
             for i in 0..self.raw_channel_group.block.cycles_nr {
-                out.push(Some(self.block.apply_conversion_value(DecodedValue::UnsignedInteger(i), self.mmap)?));
+                out.push(Some(self.physical(DecodedValue::UnsignedInteger(i), raw)?));
             }
             return Ok(out);
         }
@@ -131,7 +147,7 @@ impl<'a> Channel<'a> {
                 if all_invalid {
                     out.push(None);
                 } else if let Some(decoded) = decode_channel_value(rec, record_id_len, self.block) {
-                    let phys = self.block.apply_conversion_value(decoded, self.mmap)?;
+                    let phys = self.physical(decoded, raw)?;
                     out.push(Some(phys));
                 } else {
                     out.push(None);
@@ -154,13 +170,13 @@ impl<'a> Channel<'a> {
         if invalidation_bytes_nr == 0 && !all_invalid {
             // Fast path: no invalidation bytes and no all-invalid flag
             for data_block in &blocks {
-                let raw = data_block.data;
-                let valid_len = (raw.len() / record_size) * record_size;
+                let bytes = data_block.data;
+                let valid_len = (bytes.len() / record_size) * record_size;
                 let mut offset = 0;
                 while offset + record_size <= valid_len {
-                    let rec = &raw[offset..offset + record_size];
+                    let rec = &bytes[offset..offset + record_size];
                     if let Some(decoded) = decode_channel_value(rec, record_id_len, self.block) {
-                        let phys = self.block.apply_conversion_value(decoded, self.mmap)?;
+                        let phys = self.physical(decoded, raw)?;
                         out.push(Some(phys));
                     } else {
                         out.push(None);
@@ -171,16 +187,16 @@ impl<'a> Channel<'a> {
         } else {
             // Slow path: must check invalidation flags/bits per record
             for data_block in &blocks {
-                let raw = data_block.data;
-                let valid_len = (raw.len() / record_size) * record_size;
+                let bytes = data_block.data;
+                let valid_len = (bytes.len() / record_size) * record_size;
                 let mut offset = 0;
                 while offset + record_size <= valid_len {
-                    let rec = &raw[offset..offset + record_size];
+                    let rec = &bytes[offset..offset + record_size];
                     if let Some(decoded) = decode_channel_value_with_validity(
                         rec, record_id_len, cg_data_bytes, self.block
                     ) {
                         if decoded.is_valid {
-                            let phys = self.block.apply_conversion_value(decoded.value, self.mmap)?;
+                            let phys = self.physical(decoded.value, raw)?;
                             out.push(Some(phys));
                         } else {
                             out.push(None);
@@ -204,18 +220,24 @@ impl<'a> Channel<'a> {
     /// are returned as NaN — matching `MdfIndex`'s `values_f64` semantics.
     /// Non-numeric results (e.g. text conversions) are returned as NaN.
     pub fn values(&self) -> Result<Vec<f64>, MdfError> {
+        self.values_as(false)
+    }
+
+    /// [`values`](Self::values), or the stored values without the conversion
+    /// when `raw`.
+    pub(crate) fn values_as(&self, raw: bool) -> Result<Vec<f64>, MdfError> {
         let record_id_len = self.raw_data_group.block.record_id_len as usize;
         let cg_data_bytes = self.raw_channel_group.block.samples_byte_nr;
         let capacity = self.raw_channel_group.block.cycles_nr as usize;
         let mut out = Vec::with_capacity(capacity);
 
         if matches!(self.block.channel_type, 3 | 6) {
-            return Ok(self.decoded_values()?.iter().map(crate::signal::decoded_opt_to_f64).collect());
+            return Ok(self.decoded_values_as(raw)?.iter().map(crate::signal::decoded_opt_to_f64).collect());
         }
 
         let all_invalid = self.block.flags & 0x01 != 0;
-        let conv = self.block.conversion.as_ref();
-        let has_conversion = conv.is_some_and(|c| c.cc_type != ConversionType::Identity);
+        let conv = if raw { None } else { self.block.conversion.as_ref() };
+        let has_conversion = !raw && conv.is_some_and(|c| c.cc_type != ConversionType::Identity);
         let linear_coeffs = conv.and_then(|c| {
             if c.cc_type == ConversionType::Linear && c.cc_val.len() >= 2 {
                 Some((c.cc_val[0], c.cc_val[1]))
@@ -274,11 +296,11 @@ impl<'a> Channel<'a> {
 
         let blocks = self.raw_data_group.data_blocks(self.mmap)?;
         for data_block in &blocks {
-            let raw = data_block.data;
-            let valid_len = (raw.len() / record_size) * record_size;
+            let bytes = data_block.data;
+            let valid_len = (bytes.len() / record_size) * record_size;
             let mut offset = 0;
             while offset + record_size <= valid_len {
-                let rec = &raw[offset..offset + record_size];
+                let rec = &bytes[offset..offset + record_size];
                 if all_invalid
                     || (invalidation_bytes > 0
                         && !check_value_validity(rec, record_id_len, cg_data_bytes, self.block))

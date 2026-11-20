@@ -2023,9 +2023,10 @@ impl MdfIndex {
     /// - `Some(value)` represents a valid decoded value
     /// - `None` represents an invalid value (invalidation bit set or decoding failed)
     pub(crate) fn read_channel_values<R: ByteRangeReader<Error = MdfError>>(
-        &self, 
-        group_index: usize, 
+        &self,
+        group_index: usize,
         channel_index: usize,
+        raw: bool,
         reader: &mut R
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         let group = self.channel_groups.get(group_index)
@@ -2034,7 +2035,7 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
-        let conversion = Self::resolve_conversion(channel, reader)?;
+        let conversion = Self::read_conversion(channel, reader, raw)?;
 
         if channel.is_virtual() {
             return self.virtual_values(group, 0, group.record_count, conversion.as_ref());
@@ -2108,11 +2109,12 @@ impl MdfIndex {
         c: usize,
         start: u64,
         count: u64,
+        raw: bool,
         reader: &mut R,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         let (group, channel) = self.group_and_channel(g, c)?;
         Self::check_window(group, start, count)?;
-        let conversion = Self::resolve_conversion(channel, reader)?;
+        let conversion = Self::read_conversion(channel, reader, raw)?;
         self.window_values(group, channel, conversion.as_ref(), start, count, reader)
     }
 
@@ -2350,6 +2352,20 @@ impl MdfIndex {
         let mut cc = ConversionBlock::from_bytes(&full)?;
         cc.resolve_all_dependencies_via_reader(reader, addr)?;
         Ok(Some(cc))
+    }
+
+    /// The conversion a read applies: none for a `raw` read (the stored
+    /// values are wanted, so a deferred conversion is not even fetched),
+    /// else [`resolve_conversion`](Self::resolve_conversion).
+    fn read_conversion<R: ByteRangeReader<Error = MdfError>>(
+        channel: &IndexedChannel,
+        reader: &mut R,
+        raw: bool,
+    ) -> Result<Option<ConversionBlock>, MdfError> {
+        if raw {
+            return Ok(None);
+        }
+        Self::resolve_conversion(channel, reader)
     }
 
     /// Resolve the conversion of the channel at `(g, c)` using `reader`,
@@ -3124,11 +3140,11 @@ impl MdfIndex {
         let window = options.window()?;
         let (g, c) = self.locate_checked(name, options.group_name())?;
         if window == Window::All {
-            return self.read_signal(g, c);
+            return self.read_signal(g, c, options.raw);
         }
-        let mut reader = self.source_reader(g, c)?;
+        let mut reader = self.source_reader(g, c, options.raw)?;
         let (start, count) = self.resolve_window_via(g, c, window, &mut reader)?;
-        read_signal_window(self, g, c, start, count, &mut reader)
+        read_signal_window(self, g, c, start, count, options.raw, &mut reader)
     }
 
     /// Read a numeric channel as plain `f64` values (no timestamps).
@@ -3140,11 +3156,11 @@ impl MdfIndex {
         let window = options.window()?;
         let (g, c) = self.locate_checked(name, options.group_name())?;
         if window == Window::All {
-            return self.read_values_f64_via_source(g, c);
+            return self.read_values_f64_via_source(g, c, options.raw);
         }
-        let mut reader = self.source_reader(g, c)?;
+        let mut reader = self.source_reader(g, c, options.raw)?;
         let (start, count) = self.resolve_window_via(g, c, window, &mut reader)?;
-        self.values_f64_window(g, c, start, count, &mut reader)
+        self.values_f64_window(g, c, start, count, options.raw, &mut reader)
     }
 
     /// First and last master (time) value of the group holding `name`, or
@@ -3159,7 +3175,7 @@ impl MdfIndex {
             let mut http = self.http_source(url)?;
             return self.batched_reads(&mut http, |r| self.time_range_at(g, c, r));
         }
-        let mut reader = self.source_reader(g, c)?;
+        let mut reader = self.source_reader(g, c, true)?;
         self.time_range_at(g, c, &mut reader)
     }
 
@@ -3246,10 +3262,11 @@ impl MdfIndex {
         c: usize,
         start: u64,
         count: u64,
+        raw: bool,
         reader: &mut R,
     ) -> Result<Vec<f64>, MdfError> {
         Ok(self
-            .read_channel_values_window(g, c, start, count, reader)?
+            .read_channel_values_window(g, c, start, count, raw, reader)?
             .iter()
             .map(decoded_opt_to_f64)
             .collect())
@@ -3276,10 +3293,10 @@ impl MdfIndex {
         if n == 0 {
             return Ok(None);
         }
-        let first = self.values_f64_window(mg, m, 0, 1, reader);
+        let first = self.values_f64_window(mg, m, 0, 1, false, reader);
         // Attempt the second read even when the first failed, so a probing
         // reader records both gaps in one pass.
-        let last = self.values_f64_window(mg, m, n - 1, 1, reader)?;
+        let last = self.values_f64_window(mg, m, n - 1, 1, false, reader)?;
         Ok(Some(TimeRange { start: first?[0], end: last[0] }))
     }
 
@@ -3325,8 +3342,8 @@ impl MdfIndex {
 
     /// A byte-range reader over the attached source, with the conversion of
     /// `(g, c)` resolved up front for URL sources.
-    fn source_reader(&self, g: usize, c: usize) -> Result<SourceReader, MdfError> {
-        let _ = (g, c);
+    fn source_reader(&self, g: usize, c: usize, raw: bool) -> Result<SourceReader, MdfError> {
+        let _ = (g, c, raw);
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
             Source::File(path) => Ok(SourceReader::File(MmapRangeReader { mmap: self.map_source_file(path)? })),
@@ -3337,19 +3354,19 @@ impl MdfIndex {
             #[cfg(feature = "http")]
             Source::Url(url) => {
                 let http = self.http_source(url)?;
-                Ok(SourceReader::Url(self.url_reader_with_conversion(http, g, c)?))
+                Ok(SourceReader::Url(self.url_reader_with_conversion(http, g, c, raw)?))
             }
         }
     }
 
     /// Decode a channel + its group master from the attached source.
-    fn read_signal(&self, g: usize, c: usize) -> Result<Signal, MdfError> {
+    fn read_signal(&self, g: usize, c: usize, raw: bool) -> Result<Signal, MdfError> {
         let channel = &self.channel_groups[g].channels[c];
         let (name, unit) = (channel.name.clone().unwrap_or_default(), channel.unit.clone());
 
-        let values = self.read_values_via_source(g, c)?;
+        let values = self.read_values_via_source(g, c, raw)?;
         let timestamps = match self.master_location(g, c) {
-            Some((mg, m)) => self.read_values_f64_via_source(mg, m)?,
+            Some((mg, m)) => self.read_values_f64_via_source(mg, m, false)?,
             None => Vec::new(),
         };
 
@@ -3368,13 +3385,14 @@ impl MdfIndex {
         http: HttpRangeReader,
         g: usize,
         c: usize,
+        raw: bool,
     ) -> Result<CachingRangeReader<HttpRangeReader>, MdfError> {
         let mut cached = CachingRangeReader::with_chunk_size(http, 64 * 1024);
         if self.file_size > 0 {
             cached.set_known_size(self.file_size);
         }
         let channel = &self.channel_groups[g].channels[c];
-        if channel.conversion.is_none() && channel.conversion_addr != 0 {
+        if !raw && channel.conversion.is_none() && channel.conversion_addr != 0 {
             self.resolve_channel_conversion(g, c, &mut cached)?;
         }
         cached.set_bypass(true);
@@ -3405,14 +3423,15 @@ impl MdfIndex {
         &self,
         g: usize,
         c: usize,
+        raw: bool,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         #[cfg(target_arch = "wasm32")]
-        let _ = (g, c);
+        let _ = (g, c, raw);
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
             Source::File(path) => {
                 let mmap = self.map_source_file(path)?;
-                self.read_channel_values_from_slice(g, c, &mmap)
+                self.read_channel_values_from_slice(g, c, raw, &mmap)
             }
             #[cfg(target_arch = "wasm32")]
             Source::File(_) => Err(MdfError::BlockSerializationError(
@@ -3421,8 +3440,8 @@ impl MdfIndex {
             #[cfg(feature = "http")]
             Source::Url(url) => {
                 let http = self.http_source(url)?;
-                let mut cached = self.url_reader_with_conversion(http, g, c)?;
-                self.read_channel_values(g, c, &mut cached)
+                let mut cached = self.url_reader_with_conversion(http, g, c, raw)?;
+                self.read_channel_values(g, c, raw, &mut cached)
             }
         }
     }
@@ -3471,14 +3490,15 @@ impl MdfIndex {
         &self,
         g: usize,
         c: usize,
+        raw: bool,
     ) -> Result<Vec<f64>, MdfError> {
         #[cfg(target_arch = "wasm32")]
-        let _ = (g, c);
+        let _ = (g, c, raw);
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
             Source::File(path) => {
                 let mmap = self.map_source_file(path)?;
-                self.read_channel_values_from_slice_as_f64(g, c, &mmap)
+                self.read_channel_values_from_slice_as_f64(g, c, raw, &mmap)
             }
             #[cfg(target_arch = "wasm32")]
             Source::File(_) => Err(MdfError::BlockSerializationError(
@@ -3487,8 +3507,8 @@ impl MdfIndex {
             #[cfg(feature = "http")]
             Source::Url(url) => {
                 let http = self.http_source(url)?;
-                let mut cached = self.url_reader_with_conversion(http, g, c)?;
-                self.read_channel_values_as_f64(g, c, &mut cached)
+                let mut cached = self.url_reader_with_conversion(http, g, c, raw)?;
+                self.read_channel_values_as_f64(g, c, raw, &mut cached)
             }
         }
     }
@@ -3697,6 +3717,7 @@ impl MdfIndex {
         &self,
         group_index: usize,
         channel_index: usize,
+        raw: bool,
         reader: &mut R,
     ) -> Result<Vec<f64>, MdfError> {
         let group = self.channel_groups.get(group_index)
@@ -3704,7 +3725,7 @@ impl MdfIndex {
         let channel = group.channels.get(channel_index)
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
-        let conversion = Self::resolve_conversion(channel, reader)?;
+        let conversion = Self::read_conversion(channel, reader, raw)?;
 
         if channel.is_virtual() {
             let vals = self.virtual_values(group, 0, group.record_count, conversion.as_ref())?;
@@ -3752,6 +3773,7 @@ impl MdfIndex {
         &self,
         group_index: usize,
         channel_index: usize,
+        raw: bool,
         file_data: &[u8],
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         let group = self.channel_groups.get(group_index)
@@ -3760,7 +3782,7 @@ impl MdfIndex {
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
         let mut slice_reader = BorrowedSliceReader { data: file_data };
-        let conversion = Self::resolve_conversion(channel, &mut slice_reader)?;
+        let conversion = Self::read_conversion(channel, &mut slice_reader, raw)?;
 
         if channel.is_virtual() {
             return self.virtual_values(group, 0, group.record_count, conversion.as_ref());
@@ -3803,6 +3825,7 @@ impl MdfIndex {
         &self,
         group_index: usize,
         channel_index: usize,
+        raw: bool,
         file_data: &[u8],
     ) -> Result<Vec<f64>, MdfError> {
         let group = self.channel_groups.get(group_index)
@@ -3811,7 +3834,7 @@ impl MdfIndex {
             .ok_or_else(|| MdfError::BlockSerializationError("Invalid channel index".to_string()))?;
 
         let mut slice_reader = BorrowedSliceReader { data: file_data };
-        let conversion = Self::resolve_conversion(channel, &mut slice_reader)?;
+        let conversion = Self::read_conversion(channel, &mut slice_reader, raw)?;
 
         if channel.is_virtual() {
             let vals = self.virtual_values(group, 0, group.record_count, conversion.as_ref())?;
@@ -3910,10 +3933,10 @@ impl<'a, R: ByteRangeReader<Error = MdfError>> MdfReader<'a, R> {
         let window = options.window()?;
         let (g, c) = self.index.locate_checked(name, options.group_name())?;
         if window == Window::All {
-            return self.read_signal(g, c);
+            return self.read_signal(g, c, options.raw);
         }
         let (start, count) = self.index.resolve_window(g, c, window, &mut self.reader)?;
-        read_signal_window(self.index, g, c, start, count, &mut self.reader)
+        read_signal_window(self.index, g, c, start, count, options.raw, &mut self.reader)
     }
 
     /// Read a numeric channel as plain `f64` values — see [`MdfIndex::values`].
@@ -3923,17 +3946,17 @@ impl<'a, R: ByteRangeReader<Error = MdfError>> MdfReader<'a, R> {
         let window = options.window()?;
         let (g, c) = self.index.locate_checked(name, options.group_name())?;
         if window == Window::All {
-            return self.index.read_channel_values_as_f64(g, c, &mut self.reader);
+            return self.index.read_channel_values_as_f64(g, c, options.raw, &mut self.reader);
         }
         let (start, count) = self.index.resolve_window(g, c, window, &mut self.reader)?;
-        self.index.values_f64_window(g, c, start, count, &mut self.reader)
+        self.index.values_f64_window(g, c, start, count, options.raw, &mut self.reader)
     }
 
     /// Rust-only: all samples of a channel as decoded values (no time axis),
     /// keeping text and byte values that `values` would turn into `NaN`.
     pub fn decoded_values(&mut self, name: &str, group: Option<&str>) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         let (g, c) = self.index.locate_checked(name, group)?;
-        self.index.read_channel_values(g, c, &mut self.reader)
+        self.index.read_channel_values(g, c, false, &mut self.reader)
     }
 
     /// First and last master (time) value of the group holding `name` — see
@@ -3943,15 +3966,15 @@ impl<'a, R: ByteRangeReader<Error = MdfError>> MdfReader<'a, R> {
         self.index.time_range_at(g, c, &mut self.reader)
     }
 
-    fn read_signal(&mut self, g: usize, c: usize) -> Result<Signal, MdfError> {
+    fn read_signal(&mut self, g: usize, c: usize, raw: bool) -> Result<Signal, MdfError> {
         let channel = &self.index.channel_groups[g].channels[c];
         let (name, unit) = (channel.name.clone().unwrap_or_default(), channel.unit.clone());
 
-        let values = self.index.read_channel_values(g, c, &mut self.reader)?;
+        let values = self.index.read_channel_values(g, c, raw, &mut self.reader)?;
         let timestamps = match self.index.master_location(g, c) {
             Some((mg, m)) => self
                 .index
-                .read_channel_values(mg, m, &mut self.reader)?
+                .read_channel_values(mg, m, false, &mut self.reader)?
                 .iter()
                 .map(decoded_opt_to_f64)
                 .collect(),
@@ -3970,17 +3993,18 @@ pub(crate) fn read_signal_window<R: ByteRangeReader<Error = MdfError>>(
     c: usize,
     start: u64,
     count: u64,
+    raw: bool,
     reader: &mut R,
 ) -> Result<Signal, MdfError> {
     let channel = &index.channel_groups[g].channels[c];
     let (name, unit) = (channel.name.clone().unwrap_or_default(), channel.unit.clone());
-    let values = index.read_channel_values_window(g, c, start, count, reader);
+    let values = index.read_channel_values_window(g, c, start, count, raw, reader);
     // Read the master even when the values failed, so a probing reader
     // records both gaps in one pass. Like a full read, the master itself
     // carries no separate timestamps.
     let timestamps = match index.master_location(g, c) {
         Some((mg, m)) => index
-            .read_channel_values_window(mg, m, start, count, reader)?
+            .read_channel_values_window(mg, m, start, count, false, reader)?
             .iter()
             .map(decoded_opt_to_f64)
             .collect(),

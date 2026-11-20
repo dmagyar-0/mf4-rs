@@ -149,9 +149,15 @@ impl<'a> ChannelGroup<'a> {
 
     /// Read the channel at position `ci` as a [`Signal`].
     pub(crate) fn read_at(&self, ci: usize) -> Result<Signal, MdfError> {
+        self.read_at_as(ci, false)
+    }
+
+    /// [`read_at`](Self::read_at), with the channel's stored values (no
+    /// conversion) when `raw`. The time axis is always physical.
+    pub(crate) fn read_at_as(&self, ci: usize, raw: bool) -> Result<Signal, MdfError> {
         let channels = self.channels();
         let channel = &channels[ci];
-        let values = channel.decoded_values()?;
+        let values = channel.decoded_values_as(raw)?;
         // First master wins (matches MdfIndex's master selection)
         let timestamps = match self.master_channel() {
             Some(m) if !std::ptr::eq(m.block(), channel.block()) => m.values()?,

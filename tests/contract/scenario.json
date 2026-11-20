@@ -31,7 +31,18 @@
     { "name": "Value", "group": "Empty", "start_time": 0.0 },
     { "name": "Speed", "group": "Empty" },
     { "name": "Nope" },
-    { "name": "Nope", "start_time": 0.0, "start_record": 0 }
+    { "name": "Nope", "start_time": 0.0, "start_record": 0 },
+    { "name": "Speed", "raw": true },
+    { "name": "Speed", "group": "Engine", "start_time": 1.0, "end_time": 2.0, "raw": true },
+    { "name": "Speed", "start_record": 4, "record_count": 2, "raw": true },
+    { "name": "Gear", "raw": true },
+    { "name": "Gear", "start_record": 1, "record_count": 2, "raw": true },
+    { "name": "Time", "start_time": 0.5, "end_time": 1.0, "raw": true },
+    { "name": "Raw", "raw": true },
+    { "name": "Label", "raw": true },
+    { "name": "Blob", "raw": true },
+    { "name": "Count", "group": "NoMaster", "raw": true },
+    { "name": "Nope", "raw": true }
   ],
   "channel_cases": [
     { "name": "Speed" },

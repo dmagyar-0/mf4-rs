@@ -304,11 +304,14 @@ function buildScenarioFile(): Uint8Array {
   return bytes;
 }
 
-const WINDOW_KEYS = ["group", "start_time", "end_time", "start_record", "record_count"] as const;
+const WINDOW_KEYS = ["group", "start_time", "end_time", "start_record", "record_count", "raw"] as const;
 
 function caseLabel(c: Case): string {
-  // `1.0` prints as `1`, in every language.
-  return [c.name, ...WINDOW_KEYS.filter((k) => c[k] !== undefined).map((k) => `${k}=${c[k]}`)].join(" ");
+  // `1.0` prints as `1`, in every language; a flag prints as its bare name.
+  const parts = WINDOW_KEYS.filter((k) => c[k] !== undefined && c[k] !== false).map((k) =>
+    c[k] === true ? k : `${k}=${c[k]}`,
+  );
+  return [c.name, ...parts].join(" ");
 }
 
 function caseOptions(c: Case): ReadOptions {

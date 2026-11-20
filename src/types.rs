@@ -148,7 +148,14 @@ impl From<&ConversionBlock> for ConversionInfo {
 /// use mf4_rs::ReadOptions;
 /// let opts = ReadOptions::new().group("Engine").time(Some(1.0), Some(2.5));
 /// let page = ReadOptions::new().records(1_000, 500);
+/// let stored = ReadOptions::new().raw(true); // skip the conversion
 /// ```
+///
+/// `raw` returns the values as stored in the file, without the channel's
+/// conversion (a linear channel gives its stored numbers, a value-to-text
+/// channel its keys instead of the texts). Only the requested channel is
+/// affected: `timestamps` and time windows still use the physical (converted)
+/// time axis.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReadOptions {
     /// Group name, to disambiguate a channel name used by several groups.
@@ -161,6 +168,8 @@ pub struct ReadOptions {
     pub start_record: Option<u64>,
     /// Number of records in a record window.
     pub record_count: Option<u64>,
+    /// Return the stored values, without applying the channel's conversion.
+    pub raw: bool,
 }
 
 /// A validated [`ReadOptions`] window.
@@ -200,6 +209,12 @@ impl ReadOptions {
         self
     }
 
+    /// Return the values as stored, without the channel's conversion.
+    pub fn raw(mut self, raw: bool) -> Self {
+        self.raw = raw;
+        self
+    }
+
     /// Build options from the flat optional arguments the bindings take.
     pub fn from_parts(
         group: Option<&str>,
@@ -214,6 +229,7 @@ impl ReadOptions {
             end_time,
             start_record,
             record_count,
+            raw: false,
         }
     }
 

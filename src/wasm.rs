@@ -255,10 +255,12 @@ fn read_options(group: Option<String>, window: JsValue) -> Result<ReadOptions, J
         end_time: w.end_time,
         start_record: integer(w.start_record, "startRecord")?,
         record_count: integer(w.record_count, "recordCount")?,
+        raw: w.raw.unwrap_or(false),
     })
 }
 
-/// Record or time window passed to `readWindowStep` (all fields optional).
+/// Record or time window passed to `readWindowStep` (all fields optional),
+/// plus `raw` (skip the channel's conversion).
 #[derive(serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 struct WindowJs {
@@ -266,6 +268,7 @@ struct WindowJs {
     end_time: Option<f64>,
     start_record: Option<f64>,
     record_count: Option<f64>,
+    raw: Option<bool>,
 }
 
 /// One step of the incremental index build (`buildIndexStep`): either the
@@ -540,7 +543,8 @@ impl WasmMdfIndex {
     /// whose timestamps decode the group master and thus also need the
     /// master's conversion; `false` for a plain values read. For a
     /// self-contained index (built from bytes, or a channel with no
-    /// conversion) it returns `done` immediately with no fetching.
+    /// conversion) it returns `done` immediately with no fetching. `raw`
+    /// (default `false`) skips the channel's own conversion, for a raw read.
     #[wasm_bindgen(js_name = conversionRangesStep)]
     pub fn conversion_ranges_step(
         &self,
@@ -549,12 +553,15 @@ impl WasmMdfIndex {
         with_master: bool,
         ranges: JsValue,
         fragments: JsValue,
+        raw: Option<bool>,
     ) -> Result<JsValue, JsError> {
         let (g, c) = self.locate(name, group.as_deref())?;
         let parsed = build_fragment_reader(&ranges, &fragments)?;
         let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: false };
 
-        let mut targets = vec![(g, c)];
+        // A raw read applies no conversion to the channel itself (the
+        // master's is still needed for its timestamps).
+        let mut targets = if raw.unwrap_or(false) { Vec::new() } else { vec![(g, c)] };
         if with_master {
             if let Some(m) = self.index.master_location(g, c) {
                 targets.push(m);
@@ -664,7 +671,8 @@ impl WasmMdfIndex {
     ///
     /// `window` is `{ startTime?, endTime? }` (seconds of the master channel,
     /// inclusive; the master is searched, not read in full) or
-    /// `{ startRecord?, recordCount? }` (a record window). Drive it like
+    /// `{ startRecord?, recordCount? }` (a record window), either with an
+    /// optional `raw: true` to skip the channel's conversion. Drive it like
     /// `conversionRangesStep`: start with empty `ranges`/`fragments`; each
     /// call returns `{ done: false, needed: [[offset, length], ...] }` until
     /// every byte the read touches is present, then
@@ -681,13 +689,14 @@ impl WasmMdfIndex {
         fragments: JsValue,
     ) -> Result<JsValue, JsError> {
         let (g, c) = self.locate(name, group.as_deref())?;
-        let window = read_options(None, window)?.window().map_err(err_to_js)?;
+        let options = read_options(None, window)?;
+        let window = options.window().map_err(err_to_js)?;
 
         let parsed = build_fragment_reader(&ranges, &fragments)?;
         let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: true };
         let result = (|| {
             let (start, count) = self.index.resolve_window(g, c, window, &mut reader)?;
-            let signal = crate::index::read_signal_window(&self.index, g, c, start, count, &mut reader)?;
+            let signal = crate::index::read_signal_window(&self.index, g, c, start, count, options.raw, &mut reader)?;
             Ok::<_, MdfError>((start, count, signal))
         })();
 
@@ -725,12 +734,13 @@ impl WasmMdfIndex {
         fragments: JsValue,
     ) -> Result<JsValue, JsError> {
         let (g, c) = self.locate(name, group.as_deref())?;
-        let window = read_options(None, window)?.window().map_err(err_to_js)?;
+        let options = read_options(None, window)?;
+        let window = options.window().map_err(err_to_js)?;
         let parsed = build_fragment_reader(&ranges, &fragments)?;
         let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: true };
         let result = (|| {
             let (start, count) = self.index.resolve_window(g, c, window, &mut reader)?;
-            self.index.values_f64_window(g, c, start, count, &mut reader)
+            self.index.values_f64_window(g, c, start, count, options.raw, &mut reader)
         })();
         gap_step(reader.misses, result, "values", |values| {
             Ok(Float64Array::from(values.as_slice()).into())
@@ -832,7 +842,8 @@ impl WasmMdfIndex {
     /// `Uint8Array` byte blobs fetched for those ranges. The decoder reads
     /// whole data blocks and verifies each 24-byte block header, so the
     /// fragments must cover the blocks including their headers (`byteRanges`
-    /// spans do not).
+    /// spans do not). `raw` (default `false`) returns the stored values,
+    /// without the channel's conversion.
     #[wasm_bindgen(js_name = valuesFromFragments)]
     pub fn values_from_fragments(
         &self,
@@ -840,10 +851,11 @@ impl WasmMdfIndex {
         group: Option<String>,
         ranges: JsValue,
         fragments: JsValue,
+        raw: Option<bool>,
     ) -> Result<Vec<f64>, JsError> {
         let reader = build_fragment_reader(&ranges, &fragments)?;
         let mut bound = self.index.open(reader);
-        let options = ReadOptions { group, ..ReadOptions::default() };
+        let options = ReadOptions { group, raw: raw.unwrap_or(false), ..ReadOptions::default() };
         bound.values(name, &options).map_err(err_to_js)
     }
 
@@ -851,7 +863,9 @@ impl WasmMdfIndex {
     /// caller-fetched fragments.
     ///
     /// Pass the ranges from `signalByteRanges` (channel + master, merged) and
-    /// the fragments fetched for them.
+    /// the fragments fetched for them. `raw` (default `false`) returns the
+    /// stored values, without the channel's conversion (timestamps stay
+    /// physical).
     #[wasm_bindgen(js_name = readFromFragments)]
     pub fn read_from_fragments(
         &self,
@@ -859,10 +873,11 @@ impl WasmMdfIndex {
         group: Option<String>,
         ranges: JsValue,
         fragments: JsValue,
+        raw: Option<bool>,
     ) -> Result<JsValue, JsError> {
         let reader = build_fragment_reader(&ranges, &fragments)?;
         let mut bound = self.index.open(reader);
-        let options = ReadOptions { group, ..ReadOptions::default() };
+        let options = ReadOptions { group, raw: raw.unwrap_or(false), ..ReadOptions::default() };
         signal_to_js(bound.read(name, &options).map_err(err_to_js)?)
     }
 }

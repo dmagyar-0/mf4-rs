@@ -456,6 +456,7 @@ fn case_options(case: &Value) -> ReadOptions {
         end_time: case["end_time"].as_f64(),
         start_record: case["start_record"].as_u64(),
         record_count: case["record_count"].as_u64(),
+        raw: case["raw"].as_bool().unwrap_or(false),
     }
 }
 
@@ -526,9 +527,10 @@ fn canonical(value: Value) -> Value {
 
 fn case_label(case: &Value) -> String {
     let mut parts = vec![case["name"].as_str().unwrap().to_string()];
-    for key in ["group", "start_time", "end_time", "start_record", "record_count"] {
+    for key in ["group", "start_time", "end_time", "start_record", "record_count", "raw"] {
         match &case[key] {
-            Value::Null => {}
+            Value::Null | Value::Bool(false) => {}
+            Value::Bool(true) => parts.push(key.to_string()),
             Value::String(text) => parts.push(format!("{key}={text}")),
             // `1.0` prints as `1`, in every language.
             number => parts.push(format!("{key}={}", number.as_f64().unwrap())),

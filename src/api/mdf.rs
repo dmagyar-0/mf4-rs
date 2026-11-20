@@ -119,7 +119,9 @@ impl Mdf {
 
     /// Read a channel as a [`Signal`]: its values (conversions applied,
     /// `None` = invalid sample) paired with the group's time axis. For the
-    /// master channel itself `timestamps` is empty.
+    /// master channel itself `timestamps` is empty. With
+    /// [`ReadOptions::raw`] the values are the stored ones, unconverted
+    /// (the time axis stays physical).
     ///
     /// Errors with [`MdfError::ChannelNotFound`] if no such channel exists.
     ///
@@ -142,19 +144,30 @@ impl Mdf {
     fn read_impl(&self, name: &str, options: &ReadOptions) -> Result<Signal, MdfError> {
         let window = options.window()?;
         let (g, ci) = self.locate(name, options.group_name())?;
-        let signal = g.read_at(ci)?;
-        slice_signal(signal, window, g.channels()[ci].is_master())
+        let mut signal = g.read_at_as(ci, options.raw)?;
+        let channel = &g.channels()[ci];
+        let is_master = channel.is_master();
+        if options.raw && is_master && matches!(window, Window::Time(..)) {
+            // The raw master's own values are not its time axis: search the
+            // physical one (as `MdfIndex` does), carried as timestamps while
+            // slicing and dropped afterwards.
+            signal.timestamps = channel.values()?;
+            let mut sliced = slice_signal(signal, window, false)?;
+            sliced.timestamps.clear();
+            return Ok(sliced);
+        }
+        slice_signal(signal, window, is_master)
     }
 
     /// Read a numeric channel as plain `f64` values (no timestamps).
-    /// Conversions are applied; invalid and non-numeric samples are `NaN`.
-    /// `options` as for [`read`](Self::read).
+    /// Conversions are applied unless `options.raw`; invalid and non-numeric
+    /// samples are `NaN`. `options` as for [`read`](Self::read).
     pub fn values<'o>(&self, name: &str, options: impl Into<Option<&'o ReadOptions>>) -> Result<Vec<f64>, MdfError> {
         let default = ReadOptions::default();
         let options = options.into().unwrap_or(&default);
         if options.window()? == Window::All {
             let (g, ci) = self.locate(name, options.group_name())?;
-            return g.channels()[ci].values();
+            return g.channels()[ci].values_as(options.raw);
         }
         Ok(self.read_impl(name, options)?.values_f64())
     }

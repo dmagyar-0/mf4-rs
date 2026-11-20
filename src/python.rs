@@ -511,6 +511,9 @@ impl PyMDF {
     /// start_record, record_count : Optional[int]
     ///     Record window ``[start_record, start_record + record_count)``.
     ///     Pass either a time window or a record window, not both.
+    /// raw : Optional[bool]
+    ///     ``True`` returns the values as stored in the file, without the
+    ///     channel's conversion. ``timestamps`` stay physical (converted).
     ///
     /// Raises
     /// ------
@@ -525,16 +528,18 @@ impl PyMDF {
         end_time: Option<f64>,
         start_record: Option<u64>,
         record_count: Option<u64>,
+        raw: Option<bool>,
     ) -> PyResult<PySignal> {
-        let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count);
+        let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count)
+            .raw(raw.unwrap_or(false));
         // Decode without holding the GIL so other Python threads can run.
         let signal = py.allow_threads(|| self.mdf.read(name, &options))?;
         PySignal::new(py, signal, self.mdf.start_time_ns())
     }
 
     /// Read a numeric channel as a plain numpy ``float64`` array (no
-    /// timestamps). Conversions are applied; invalid and non-numeric samples
-    /// are ``NaN``. Parameters as for :py:meth:`read`.
+    /// timestamps). Conversions are applied unless ``raw=True``; invalid and
+    /// non-numeric samples are ``NaN``. Parameters as for :py:meth:`read`.
     fn values(
         &self,
         py: Python,
@@ -544,8 +549,10 @@ impl PyMDF {
         end_time: Option<f64>,
         start_record: Option<u64>,
         record_count: Option<u64>,
+        raw: Option<bool>,
     ) -> PyResult<PyObject> {
-        let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count);
+        let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count)
+            .raw(raw.unwrap_or(false));
         let values = py.allow_threads(|| self.mdf.values(name, &options))?;
         Ok(PyArray1::from_vec_bound(py, values).into())
     }
@@ -556,7 +563,7 @@ impl PyMDF {
     /// several groups, e.g. ``mdf["Speed", "Engine"]``.
     fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<PySignal> {
         let (name, group) = parse_lookup_key(key)?;
-        self.read(py, &name, group.as_deref(), None, None, None, None)
+        self.read(py, &name, group.as_deref(), None, None, None, None, None)
     }
 
     /// First and last master (time) value of the group holding ``name`` as a
@@ -744,6 +751,9 @@ impl PyMdfIndex {
     /// start_record, record_count : Optional[int]
     ///     Record window ``[start_record, start_record + record_count)``.
     ///     Pass either a time window or a record window, not both.
+    /// raw : Optional[bool]
+    ///     ``True`` returns the values as stored in the file, without the
+    ///     channel's conversion. ``timestamps`` stay physical (converted).
     ///
     /// Raises
     /// ------
@@ -760,16 +770,18 @@ impl PyMdfIndex {
         end_time: Option<f64>,
         start_record: Option<u64>,
         record_count: Option<u64>,
+        raw: Option<bool>,
     ) -> PyResult<PySignal> {
-        let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count);
+        let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count)
+            .raw(raw.unwrap_or(false));
         // Release the GIL during the (potentially blocking, e.g. HTTP) read.
         let signal = py.allow_threads(|| self.index.read(name, &options))?;
         PySignal::new(py, signal, self.index.start_time_ns())
     }
 
     /// Read a numeric channel as a plain numpy ``float64`` array (no
-    /// timestamps). Conversions are applied; invalid and non-numeric samples
-    /// are ``NaN``. Parameters as for :py:meth:`read`.
+    /// timestamps). Conversions are applied unless ``raw=True``; invalid and
+    /// non-numeric samples are ``NaN``. Parameters as for :py:meth:`read`.
     fn values(
         &self,
         py: Python,
@@ -779,8 +791,10 @@ impl PyMdfIndex {
         end_time: Option<f64>,
         start_record: Option<u64>,
         record_count: Option<u64>,
+        raw: Option<bool>,
     ) -> PyResult<PyObject> {
-        let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count);
+        let options = ReadOptions::from_parts(group, start_time, end_time, start_record, record_count)
+            .raw(raw.unwrap_or(false));
         let values = py.allow_threads(|| self.index.values(name, &options))?;
         Ok(PyArray1::from_vec_bound(py, values).into())
     }
@@ -791,7 +805,7 @@ impl PyMdfIndex {
     /// several groups, e.g. ``idx["Speed", "Engine"]``.
     fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<PySignal> {
         let (name, group) = parse_lookup_key(key)?;
-        self.read(py, &name, group.as_deref(), None, None, None, None)
+        self.read(py, &name, group.as_deref(), None, None, None, None, None)
     }
 
     /// First and last master (time) value of the group holding ``name`` as a
