@@ -994,6 +994,8 @@ mod http {
     struct Server {
         url: String,
         requests: Arc<AtomicU64>,
+        /// Inclusive `(start, end)` byte range of every ranged request.
+        ranges: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
@@ -1020,14 +1022,15 @@ mod http {
         let url = format!("http://{}/file.mf4", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
-        let (req_count, stop_flag) = (requests.clone(), stop.clone());
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (req_count, stop_flag, range_log) = (requests.clone(), stop.clone(), ranges.clone());
         let handle = std::thread::spawn(move || {
             while !stop_flag.load(Ordering::SeqCst) {
                 let Ok((stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                let (bytes, req_count) = (bytes.clone(), req_count.clone());
+                let (bytes, req_count, range_log) = (bytes.clone(), req_count.clone(), range_log.clone());
                 std::thread::spawn(move || {
                     stream.set_nonblocking(false).ok();
                     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -1065,6 +1068,7 @@ mod http {
                             let e: u64 = if e.is_empty() { total - 1 } else { e.parse().ok()? };
                             Some((s, e.min(total - 1)))
                         });
+                        range_log.lock().unwrap().extend(range);
                         let (head, body): (String, &[u8]) = match range {
                             Some((s, _)) if s >= total => {
                                 (format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\n\r\n"), &[])
@@ -1082,7 +1086,7 @@ mod http {
                 });
             }
         });
-        Server { url, requests, stop, handle: Some(handle) }
+        Server { url, requests, ranges, stop, handle: Some(handle) }
     }
 
     #[test]
@@ -1161,6 +1165,93 @@ mod http {
         assert_eq!(tr, mdf.time_range("X", None)?);
         let used = server.requests.load(Ordering::SeqCst) - before;
         assert!(used <= 80, "values + time_range took {used} requests");
+        Ok(())
+    }
+
+    /// `ReadOptions::raw` over a URL: the stored values, the physical time
+    /// axis, and no request for the channel's own conversion block on a
+    /// values read; a raw signal / time window costs no more requests than a
+    /// converted one (the master's conversion is primed up front).
+    #[test]
+    fn raw_reads_over_a_url() -> Result<(), MdfError> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("raw.mf4");
+        let mut w = MdfWriter::new(path.to_str().unwrap())?;
+        w.init_mdf_file()?;
+        let g = w.add_channel_group(Some("Engine"))?;
+        let time = w.add_int_channel(&g, "Time")?;
+        w.set_time_channel(&time)?;
+        let speed = w.add_float_channel(&g, "Speed")?;
+        let gear = w.add_int_channel(&g, "Gear")?;
+        w.add_float_channel(&g, "Plain")?;
+        w.add_linear_conversion(&time, 0.0, 0.01)?;
+        w.add_linear_conversion(&speed, 1.0, 2.0)?;
+        w.add_value_to_text_conversion(&gear, &[(0, "N"), (1, "D")], "?")?;
+        w.start_data_block(&g)?;
+        for i in 0..20_000u64 {
+            w.write_record(
+                &g,
+                &[
+                    DecodedValue::UnsignedInteger(i),
+                    DecodedValue::Float(i as f64),
+                    DecodedValue::UnsignedInteger(i % 3),
+                    DecodedValue::Float(i as f64),
+                ],
+            )?;
+        }
+        w.finish_data_block(&g)?;
+        w.finalize()?;
+
+        let mdf = Mdf::from_file(path.to_str().unwrap())?;
+        let server = serve(&path);
+        let index = MdfIndex::from_url(&server.url)?;
+        let cc = index.indexed_channel("Speed", None).unwrap().conversion_addr;
+        assert_ne!(cc, 0, "a URL build defers conversions");
+        let raw = mf4_rs::ReadOptions::new().raw(true);
+        let page = mf4_rs::ReadOptions::new().records(100, 50);
+        let window = mf4_rs::ReadOptions::new().time(Some(20.0), Some(30.0));
+
+        for options in [raw.clone(), page.clone().raw(true)] {
+            server.ranges.lock().unwrap().clear();
+            let values = index.values("Speed", &options)?;
+            assert_eq!(values, mdf.values("Speed", &options)?);
+            assert_eq!(values[0], if options == raw { 0.0 } else { 100.0 }, "stored values");
+            let fetched = server.ranges.lock().unwrap().clone();
+            assert!(
+                !fetched.iter().any(|&(s, e)| s <= cc && cc <= e),
+                "raw values() fetched the conversion block: {fetched:?}"
+            );
+        }
+
+        let count = |name: &str, options: &mf4_rs::ReadOptions, read: bool| -> Result<u64, MdfError> {
+            let before = server.requests.load(Ordering::SeqCst);
+            if read {
+                let got = index.read(name, options)?;
+                let want = mdf.read(name, options)?;
+                assert_eq!((&got.timestamps, got.values_f64()), (&want.timestamps, want.values_f64()), "{options:?}");
+            } else {
+                assert_eq!(index.values(name, options)?, mdf.values(name, options)?, "{options:?}");
+            }
+            Ok(server.requests.load(Ordering::SeqCst) - before)
+        };
+        // A raw read costs what a channel without a conversion costs, and no
+        // more than the converted read whenever the time axis is decoded (a
+        // signal or a time window: the master's conversion is primed).
+        for base in [page, window] {
+            for read in [true, false] {
+                let converted = count("Speed", &base, read)?;
+                let raw = count("Speed", &base.clone().raw(true), read)?;
+                let plain = count("Plain", &base, read)?;
+                let label = format!("{base:?} read={read}: raw {raw}, converted {converted}, plain {plain}");
+                assert_eq!(raw, plain, "{label}");
+                if read || base.start_time.is_some() {
+                    assert!(raw <= converted, "{label}");
+                }
+            }
+        }
+        let gear = index.read("Gear", &raw)?;
+        assert!(matches!(gear.values[2], Some(DecodedValue::UnsignedInteger(2))));
+        assert!((gear.timestamps[1] - 0.01).abs() < 1e-12, "timestamps stay physical");
         Ok(())
     }
 

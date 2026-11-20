@@ -76,6 +76,11 @@ export interface ReadOptions extends ReadWindow {
   /** Group name, to disambiguate a channel name used by several groups. */
   group?: string | null;
   /**
+   * Return the values as stored in the file, without the channel's
+   * conversion. `timestamps` (and a time window) stay physical.
+   */
+  raw?: boolean;
+  /**
    * TypeScript only, `MdfIndex` only: read sample bytes from this source for
    * this one call instead of the index's bound source.
    */

@@ -11,7 +11,7 @@
 import { guard } from "./errors";
 import { getWasmModule, type WasmMdf } from "./wasm-module";
 import { readFileNodeOnly } from "./platform";
-import { windowOf } from "./signal-util";
+import { wasmWindow } from "./signal-util";
 import type {
   ChannelInfo,
   ConversionInfo,
@@ -90,8 +90,8 @@ export class Mdf {
   }
 
   /**
-   * Read a channel as a `Signal`: its values (conversions applied) paired
-   * with its group's time axis. For the master channel itself `timestamps`
+   * Read a channel as a `Signal`: its values (conversions applied, unless
+   * `options.raw`) paired with its group's time axis. For the master channel itself `timestamps`
    * is empty: its `values` are the time axis.
    *
    * `options` selects a group and/or a window (`{ group, startTime, endTime }`
@@ -99,17 +99,17 @@ export class Mdf {
    * `ChannelNotFoundError` if no such channel exists.
    */
   read(name: string, options: ReadOptions = {}): Signal {
-    const window = windowOf(options);
+    const window = wasmWindow(options);
     return guard(() => this.inner.read(name, options.group, window) as Signal);
   }
 
   /**
    * Read a numeric channel as a plain `Float64Array` (no timestamps).
-   * Conversions are applied; invalid and non-numeric samples are `NaN`.
-   * `options` as for {@link read}.
+   * Conversions are applied unless `options.raw`; invalid and non-numeric
+   * samples are `NaN`. `options` as for {@link read}.
    */
   values(name: string, options: ReadOptions = {}): Float64Array {
-    const window = windowOf(options);
+    const window = wasmWindow(options);
     return guard(() => this.inner.values(name, options.group, window));
   }
 

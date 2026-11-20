@@ -395,8 +395,9 @@ The full specification, shared with Rust and Python, is
   `finishDataBlock`, `finalize()` (returns the file as a `Uint8Array`),
   `dispose()`.
 - `ReadOptions` — `{ group, startTime, endTime }` or
-  `{ group, startRecord, recordCount }` (plus a per-call `source` on
-  `MdfIndex`).
+  `{ group, startRecord, recordCount }`, plus `raw: true` for the stored
+  values without the channel's conversion (timestamps stay physical) and a
+  per-call `source` on `MdfIndex`.
 - Column-oriented conversion: `toColumnOriented` (in memory),
   `toColumnOrientedStream` (synchronous source/sink callbacks),
   `toColumnOrientedFile` (Node); `ColumnOptions`, `ColumnReport`.

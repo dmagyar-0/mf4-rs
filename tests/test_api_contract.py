@@ -321,9 +321,13 @@ def build_scenario_file(path):
 
 def case_label(case):
     parts = [case["name"]]
-    for key in ("group", "start_time", "end_time", "start_record", "record_count"):
+    for key in ("group", "start_time", "end_time", "start_record", "record_count", "raw"):
         if key in case:
             value = case[key]
+            if isinstance(value, bool):
+                if value:
+                    parts.append(key)    # a flag prints as its bare name
+                continue
             if isinstance(value, float) and value.is_integer():
                 value = int(value)       # `1.0` prints as `1`, in every language
             parts.append(f"{key}={value}")

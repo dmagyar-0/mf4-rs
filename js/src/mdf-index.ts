@@ -7,7 +7,7 @@ import {
   type FetchLike,
 } from "./range-source";
 import { ChannelNotFoundError, guard } from "./errors";
-import { hasWindow, windowOf } from "./signal-util";
+import { hasWindow, wasmWindow } from "./signal-util";
 import type {
   ByteRange,
   ChannelInfo,
@@ -501,15 +501,16 @@ export class MdfIndex {
    * `ranges`/`fragments` must be a matching pair: the ranges from
    * `signalByteRanges` (whole data blocks including their 24-byte headers,
    * which the decoder verifies — `byteRanges` spans are not sufficient) and
-   * the bytes fetched for each span.
+   * the bytes fetched for each span. `raw` skips the channel's conversion.
    */
   valuesFromFragments(
     name: string,
     group: string | null | undefined,
     ranges: ByteRange[],
     fragments: Uint8Array[],
+    raw = false,
   ): Float64Array {
-    return guard(() => this.inner.valuesFromFragments(name, group, ranges, fragments));
+    return guard(() => this.inner.valuesFromFragments(name, group, ranges, fragments, raw));
   }
 
   /**
@@ -517,21 +518,25 @@ export class MdfIndex {
    *
    * `ranges`/`fragments` must be a matching pair: the ranges from
    * `signalByteRanges` (whole data blocks including their 24-byte headers,
-   * with the master's blocks) and the bytes fetched for each span.
+   * with the master's blocks) and the bytes fetched for each span. `raw`
+   * skips the channel's conversion (timestamps stay physical).
    */
   readFromFragments(
     name: string,
     group: string | null | undefined,
     ranges: ByteRange[],
     fragments: Uint8Array[],
+    raw = false,
   ): Signal {
-    return guard(() => this.inner.readFromFragments(name, group, ranges, fragments) as Signal);
+    return guard(() => this.inner.readFromFragments(name, group, ranges, fragments, raw) as Signal);
   }
 
   /**
    * Read a channel as a `Signal` (values paired with the group's time axis),
    * fetching only the bytes it needs from the source. For the master channel
-   * itself `timestamps` is empty: its `values` are the time axis.
+   * itself `timestamps` is empty: its `values` are the time axis. With
+   * `options.raw` the values are the stored ones, without the conversion
+   * (timestamps stay physical; the conversion block is never fetched).
    *
    * `options` selects a group and/or a window (`{ group, startTime, endTime }`
    * or `{ group, startRecord, recordCount }`). A window fetches only the
@@ -540,7 +545,8 @@ export class MdfIndex {
    * `ChannelNotFoundError` if no such channel exists.
    */
   async read(name: string, options: ReadOptions = {}): Promise<Signal> {
-    const window = windowOf(options);
+    const window = wasmWindow(options);
+    const raw = window.raw === true;
     this.#requireChannel(name, options.group);
     const source = this.#requireSource(options);
     if (hasWindow(options)) {
@@ -552,18 +558,21 @@ export class MdfIndex {
     const ranges = this.signalByteRanges(name, options.group);
     const fragments = await this.#fetchAll(source, ranges);
     // A signal read decodes the group master too, so resolve the master's
-    // conversion as well as the channel's (withMaster = true).
-    await this.#fetchConversionRanges(name, options.group, true, source, ranges, fragments);
-    return this.readFromFragments(name, options.group, ranges, fragments);
+    // conversion as well as the channel's (withMaster = true; a raw read
+    // skips the channel's own).
+    await this.#fetchConversionRanges(name, options.group, true, source, ranges, fragments, raw);
+    return this.readFromFragments(name, options.group, ranges, fragments, raw);
   }
 
   /**
    * Read a numeric channel as a plain `Float64Array` (no timestamps),
-   * fetching only the bytes it needs. Conversions are applied; invalid and
-   * non-numeric samples are `NaN`. `options` as for {@link read}.
+   * fetching only the bytes it needs. Conversions are applied unless
+   * `options.raw`; invalid and non-numeric samples are `NaN`. `options` as
+   * for {@link read}.
    */
   async values(name: string, options: ReadOptions = {}): Promise<Float64Array> {
-    const window = windowOf(options);
+    const window = wasmWindow(options);
+    const raw = window.raw === true;
     this.#requireChannel(name, options.group);
     const source = this.#requireSource(options);
     if (hasWindow(options)) {
@@ -575,9 +584,10 @@ export class MdfIndex {
     const ranges = this.signalByteRanges(name, options.group, false);
     const fragments = await this.#fetchAll(source, ranges);
     // Indexes built over the network resolve conversions lazily; fetch the
-    // channel's conversion blocks (if any) so the decoder can apply them.
-    await this.#fetchConversionRanges(name, options.group, false, source, ranges, fragments);
-    return this.valuesFromFragments(name, options.group, ranges, fragments);
+    // channel's conversion blocks (if any) so the decoder can apply them —
+    // none for a raw read.
+    await this.#fetchConversionRanges(name, options.group, false, source, ranges, fragments, raw);
+    return this.valuesFromFragments(name, options.group, ranges, fragments, raw);
   }
 
   /**
@@ -684,6 +694,7 @@ export class MdfIndex {
     source: RangeSource,
     ranges: ByteRange[],
     fragments: Uint8Array[],
+    raw = false,
   ): Promise<void> {
     const size = this.fileSize();
     // Conversion chains are short; a small look-ahead keeps this to one or two
@@ -691,7 +702,7 @@ export class MdfIndex {
     const CONVERSION_LOOKAHEAD_BYTES = 8 * 1024;
     const maxRounds = 10_000;
     for (let round = 0; round < maxRounds; round++) {
-      const step = this.inner.conversionRangesStep(name, group, withMaster, ranges, fragments);
+      const step = this.inner.conversionRangesStep(name, group, withMaster, ranges, fragments, raw);
       if (step.done) return;
       const spans = coalesceNeeded(
         step.needed as [number, number][],

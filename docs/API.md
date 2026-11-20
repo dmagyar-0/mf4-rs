@@ -118,8 +118,8 @@ const lazySpeed = await index.read("Speed");               // range requests hap
 
 | Contract | Returns | |
 |---|---|---|
-| `read(name, options?)` | `Signal` | Values with conversions applied, paired with the group's time axis. |
-| `values(name, options?)` | `float64` array | Just the numbers — no timestamps. Invalid and non-numeric samples are `NaN`. |
+| `read(name, options?)` | `Signal` | Values with conversions applied (unless `raw`), paired with the group's time axis. |
+| `values(name, options?)` | `float64` array | Just the numbers — no timestamps. Conversions applied unless `raw`. Invalid and non-numeric samples are `NaN`. |
 | `time_range(name, group?)` | `TimeRange` or nothing | First and last master (time) value of the channel's group; nothing for an empty group, an error for a non-empty group without a master. On `MdfIndex` this reads two records. |
 | `conversion(name, group?)` | `ConversionInfo` or nothing | The conversion `read` / `values` apply, fully resolved. |
 
@@ -130,6 +130,7 @@ const lazySpeed = await index.read("Speed");               // range requests hap
 | `group` | Look only in the group(s) with this name. A column-oriented file has one group per signal, all named after the source group — every group with the name is searched. |
 | `start_time`, `end_time` | Inclusive time window in the master channel's unit (seconds relative to the measurement start). Either bound may be omitted. |
 | `start_record`, `record_count` | Record window `[start_record, start_record + record_count)`. Reaching past the last record is an error. |
+| `raw` | `true`: return the values as stored in the file, without the channel's conversion (default `false`). A linear channel gives its stored numbers, a value-to-text channel its integer keys instead of the texts. Only the requested channel is affected: `timestamps` and time windows still use the physical (converted) time axis. On `MdfIndex` a raw read never fetches the channel's conversion block. Invalidation bits still apply. `unit` is the channel's (physical) unit, unchanged. |
 
 Pass a time window **or** a record window, not both. On `MdfIndex` a window
 fetches only the selected records; a time window is located by searching the
@@ -149,13 +150,16 @@ How `options` is passed:
 ```rust
 mdf.read("Speed", None)?;                                              // Rust: None = no options
 mdf.read("Speed", &ReadOptions::new().group("Engine").records(0, 100))?;
+mdf.values("Speed", &ReadOptions::new().raw(true))?;                  // stored values
 ```
 ```python
 mdf.read("Speed", group="Engine", start_record=0, record_count=100)    # Python: keywords
+mdf.values("Speed", raw=True)                                          # stored values
 mdf["Speed"], mdf["Speed", "Engine"]                                   # shorthand for read
 ```
 ```ts
 mdf.read("Speed", { group: "Engine", startRecord: 0, recordCount: 100 });  // TypeScript: object
+mdf.values("Speed", { raw: true });                                         // stored values
 ```
 
 ### `MdfIndex` only

@@ -90,8 +90,8 @@
       "methods": { "rust": [], "python": [], "typescript": [] }
     },
     "ReadOptions": {
-      "fields": ["group", "start_time", "end_time", "start_record", "record_count"],
-      "methods": { "rust": ["new", "group", "time", "records", "from_parts"], "python": [], "typescript": [] }
+      "fields": ["group", "start_time", "end_time", "start_record", "record_count", "raw"],
+      "methods": { "rust": ["new", "group", "time", "records", "raw", "from_parts"], "python": [], "typescript": [] }
     },
     "TimeRange": {
       "fields": ["start", "end"],
