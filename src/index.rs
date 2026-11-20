@@ -3775,11 +3775,13 @@ impl MdfIndex {
         } else {
             // Locate every window first (a few rounds of single-record
             // probes), to know how much the read itself will fetch.
-            // A failure here is left to the read below, which reports the
-            // channels' errors in the same order as a loop of `read`.
+            // A failure here is left to the read below — the streaming
+            // path, a plain sequential read that keeps memory bounded and
+            // reports the channels' errors in the same order as a loop of
+            // `read`.
             match self.batched_reads_seeded(&mut http, &mut store, |r| self.resolve_windows(targets, window, r)) {
                 Ok(resolved) => self.window_read_bytes(targets, &resolved),
-                Err(_) => 0,
+                Err(_) => u64::MAX,
             }
         };
         if bytes > batch_limit {

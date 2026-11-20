@@ -162,7 +162,8 @@ export interface FetchRangeSourceOptions {
    * Default 3; `0` disables retrying.
    */
   retries?: number;
-  /** Delay before the first retry, doubled for each further one. Default 200 ms. */
+  /** Delay before the first retry, doubled for each further one (each delay
+   * at most 10 s). Default 200 ms. */
   retryDelayMs?: number;
   /**
    * Abort (and retry) a request that sends nothing for this many
@@ -294,7 +295,7 @@ export class FetchRangeSource implements RangeSource {
           }
           throw e;
         }
-        await sleep(delay);
+        await sleep(Math.min(delay, MAX_RETRY_DELAY_MS));
         delay *= 2;
       } finally {
         clearTimeout(timer);
