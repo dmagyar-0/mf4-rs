@@ -291,9 +291,10 @@ pub(crate) fn slice_signal(mut signal: Signal, window: Window, is_master: bool) 
                     signal.name
                 )));
             };
-            let lo = t0.map_or(0, |t| axis.partition_point(|v| *v < t));
-            let hi = t1.map_or(axis.len(), |t| axis.partition_point(|v| *v <= t));
-            (lo as u64, hi.saturating_sub(lo) as u64)
+            // The same search the index runs over its source, so `Mdf` and
+            // `MdfIndex` select exactly the same records (and reject the same
+            // non-monotonic time axes).
+            search_time_window(axis.len() as u64, t0, t1, |i| Ok(axis[i as usize]))?
         }
     };
     let (s, e) = (start as usize, (start + count) as usize);
@@ -304,4 +305,144 @@ pub(crate) fn slice_signal(mut signal: Signal, window: Window, is_master: bool) 
         signal.timestamps.drain(..s);
     }
     Ok(signal)
+}
+
+/// Records probed per round of [`search_time_window`].
+const TIME_SEARCH_FANOUT: u64 = 16;
+
+/// Record window `(start, count)` of a time axis of `n` records whose values
+/// lie in `[t_start, t_end]` (either bound optional), reading values only
+/// through `probe(record)`.
+///
+/// The axis must be non-decreasing, as MDF requires of a time master. It is
+/// searched, not scanned: each round probes up to [`TIME_SEARCH_FANOUT`]
+/// records per bound, so a window costs about `log16(n)` rounds. Every probed
+/// value is checked against the others; a pair out of order (a time axis that
+/// resets or jumps backwards) is refused with [`MdfError::InvalidArgument`]
+/// rather than silently selecting an arbitrary part of the data. `NaN` (an
+/// invalid time sample) is not checked.
+///
+/// Both bounds' probes of a round are attempted before the first error is
+/// returned, so a probing reader (the batched / wasm fragment drivers)
+/// records every gap of a round in one pass. `Mdf` (whole axis in memory) and
+/// `MdfIndex` (probes fetched from the source) share this function, so they
+/// select identical records.
+pub(crate) fn search_time_window(
+    n: u64,
+    t_start: Option<f64>,
+    t_end: Option<f64>,
+    mut probe: impl FnMut(u64) -> Result<f64, MdfError>,
+) -> Result<(u64, u64), MdfError> {
+    // first record with t >= t_start; first record with t > t_end
+    let mut lo = Bound::new(n);
+    let mut hi = Bound::new(n);
+    if t_start.is_none() {
+        lo.done_at(0);
+    }
+    if t_end.is_none() {
+        hi.done_at(n);
+    }
+    let mut seen: Vec<(u64, f64)> = Vec::new();
+    while !(lo.done() && hi.done()) {
+        let mut first_err = None;
+        for (bound, below) in [
+            (&mut lo, &(|v: f64| t_start.is_some_and(|t| v < t)) as &dyn Fn(f64) -> bool),
+            (&mut hi, &|v: f64| t_end.is_some_and(|t| v <= t)),
+        ] {
+            if bound.done() {
+                continue;
+            }
+            let probes = bound.probes();
+            let mut below_flags = Vec::with_capacity(probes.len());
+            for &p in &probes {
+                match probe(p) {
+                    Ok(v) => {
+                        seen.push((p, v));
+                        below_flags.push(below(v));
+                    }
+                    Err(e) => {
+                        first_err.get_or_insert(e);
+                    }
+                }
+            }
+            if below_flags.len() == probes.len() {
+                bound.narrow(&probes, &below_flags);
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        check_non_decreasing(&mut seen)?;
+    }
+    let (start, end) = (lo.lo, hi.lo.max(lo.lo));
+    Ok((start, end - start))
+}
+
+/// Refuse a time axis whose probed values are out of order.
+fn check_non_decreasing(seen: &mut Vec<(u64, f64)>) -> Result<(), MdfError> {
+    seen.sort_by_key(|&(i, _)| i);
+    seen.dedup_by_key(|&mut (i, _)| i);
+    let mut prev: Option<(u64, f64)> = None;
+    for &(i, v) in seen.iter() {
+        if v.is_nan() {
+            continue;
+        }
+        if let Some((pi, pv)) = prev
+            && v < pv
+        {
+            return Err(MdfError::InvalidArgument(format!(
+                "the time axis is not monotonic (record {pi} is {pv}, record {i} is {v}); \
+                 a time window needs a non-decreasing master channel — select a record \
+                 window (start_record / record_count) instead"
+            )));
+        }
+        prev = Some((i, v));
+    }
+    Ok(())
+}
+
+/// State of one partition-point search over `[lo, hi)`: the answer is the
+/// first record for which the predicate ("still below the bound") is false.
+struct Bound {
+    lo: u64,
+    hi: u64,
+}
+
+impl Bound {
+    fn new(n: u64) -> Self {
+        Bound { lo: 0, hi: n }
+    }
+
+    fn done(&self) -> bool {
+        self.lo >= self.hi
+    }
+
+    fn done_at(&mut self, at: u64) {
+        self.lo = at;
+        self.hi = at;
+    }
+
+    /// Up to [`TIME_SEARCH_FANOUT`] distinct, increasing records in `[lo, hi)`.
+    fn probes(&self) -> Vec<u64> {
+        let span = self.hi - self.lo;
+        if span <= TIME_SEARCH_FANOUT {
+            return (self.lo..self.hi).collect();
+        }
+        (0..TIME_SEARCH_FANOUT)
+            .map(|i| self.lo + (i as u128 * span as u128 / TIME_SEARCH_FANOUT as u128) as u64)
+            .collect()
+    }
+
+    /// Narrow to the gap between the last probe below the bound and the first
+    /// one not below it (values are non-decreasing).
+    fn narrow(&mut self, probes: &[u64], below: &[bool]) {
+        match below.iter().position(|b| !b) {
+            Some(0) => self.hi = probes[0],
+            Some(j) => {
+                self.lo = probes[j - 1] + 1;
+                self.hi = probes[j];
+            }
+            None => self.lo = probes[probes.len() - 1] + 1,
+        }
+    }
 }

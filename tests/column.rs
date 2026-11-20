@@ -1007,39 +1007,79 @@ mod http {
         }
     }
 
-    /// Minimal single-range HTTP server that counts every request.
+    /// Minimal single-range HTTP/1.1 server that counts every request.
+    ///
+    /// One thread per connection (keep-alive supported), so the parallel
+    /// range requests of batched reads are all served at once — tiny_http's
+    /// fixed pool can strand concurrently opened keep-alive connections.
     fn serve(path: &Path) -> Server {
-        let bytes = std::fs::read(path).unwrap();
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/file.mf4", server.server_addr().to_ip().unwrap());
+        use std::io::{BufRead, BufReader, Write};
+        let bytes = Arc::new(std::fs::read(path).unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/file.mf4", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let (req_count, stop_flag) = (requests.clone(), stop.clone());
         let handle = std::thread::spawn(move || {
             while !stop_flag.load(Ordering::SeqCst) {
-                let Ok(Some(req)) = server.recv_timeout(Duration::from_millis(20)) else { continue };
-                req_count.fetch_add(1, Ordering::SeqCst);
-                let total = bytes.len() as u64;
-                let range = req
-                    .headers()
-                    .iter()
-                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("range"))
-                    .and_then(|h| {
-                        let (s, e) = h.value.as_str().strip_prefix("bytes=")?.split_once('-')?;
-                        let s: u64 = s.parse().ok()?;
-                        let e: u64 = if e.is_empty() { total - 1 } else { e.parse().ok()? };
-                        (s < total).then_some((s, e.min(total - 1)))
-                    });
-                let resp = match range {
-                    Some((s, e)) => tiny_http::Response::from_data(bytes[s as usize..=e as usize].to_vec())
-                        .with_status_code(206)
-                        .with_header(
-                            tiny_http::Header::from_bytes(&b"Content-Range"[..], format!("bytes {s}-{e}/{total}").as_bytes())
-                                .unwrap(),
-                        ),
-                    None => tiny_http::Response::from_data(bytes.clone()),
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
                 };
-                let _ = req.respond(resp);
+                let (bytes, req_count) = (bytes.clone(), req_count.clone());
+                std::thread::spawn(move || {
+                    stream.set_nonblocking(false).ok();
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut stream = stream;
+                    loop {
+                        // Request head: request line + headers up to a blank line.
+                        let mut range = None;
+                        let mut line = String::new();
+                        let mut saw_request = false;
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line) {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => {}
+                            }
+                            if line == "\r\n" || line == "\n" {
+                                break;
+                            }
+                            saw_request = true;
+                            if let Some((k, v)) = line.split_once(':') {
+                                if k.trim().eq_ignore_ascii_case("range") {
+                                    range = Some(v.trim().to_string());
+                                }
+                            }
+                        }
+                        if !saw_request {
+                            continue;
+                        }
+                        req_count.fetch_add(1, Ordering::SeqCst);
+                        let total = bytes.len() as u64;
+                        let range = range.and_then(|r| {
+                            let (s, e) = r.strip_prefix("bytes=")?.split_once('-')?;
+                            let s: u64 = s.parse().ok()?;
+                            let e: u64 = if e.is_empty() { total - 1 } else { e.parse().ok()? };
+                            Some((s, e.min(total - 1)))
+                        });
+                        let (head, body): (String, &[u8]) = match range {
+                            Some((s, _)) if s >= total => {
+                                (format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\n\r\n"), &[])
+                            }
+                            Some((s, e)) => (
+                                format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {s}-{e}/{total}\r\nContent-Length: {}\r\n\r\n", e - s + 1),
+                                &bytes[s as usize..=e as usize],
+                            ),
+                            None => (format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n"), &bytes[..]),
+                        };
+                        if stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(body)).is_err() {
+                            return;
+                        }
+                    }
+                });
             }
         });
         Server { url, requests, stop, handle: Some(handle) }
@@ -1075,6 +1115,79 @@ mod http {
                 _ => 2,
             };
             assert!(*n <= budget, "{name}: {n} requests (budget {budget})");
+        }
+        Ok(())
+    }
+
+    /// A time window over a URL is located in a few batched rounds of
+    /// parallel requests, not one blocking request per probed record (the
+    /// 16-way search over 100k records used to cost ~260 sequential requests).
+    #[test]
+    fn url_time_window_search_is_batched() -> Result<(), MdfError> {
+        let dir = tempfile::tempdir()?;
+        let (source, column) = (dir.path().join("long.mf4"), dir.path().join("long_col.mf4"));
+        let mut w = MdfWriter::new(source.to_str().unwrap())?;
+        w.init_mdf_file()?;
+        let cg = w.add_channel_group(Some("Long"))?;
+        w.add_time_channel(&cg, "t")?;
+        w.add_float_channel(&cg, "X")?;
+        w.start_data_block(&cg)?;
+        for i in 0..100_000u64 {
+            w.write_record(&cg, &[DecodedValue::Float(i as f64 * 1e-3), DecodedValue::Float(i as f64)])?;
+        }
+        w.finish_data_block(&cg)?;
+        w.finalize()?;
+        to_column_oriented(&source, &column, &ColumnOptions { block_size: 64 * 1024, ..Default::default() })?;
+
+        let mdf = Mdf::from_file(source.to_str().unwrap())?;
+        let server = serve(&column);
+        let mut index = MdfIndex::from_file(column.to_str().unwrap())?;
+        index.set_source(server.url.as_str());
+
+        let opts = mf4_rs::ReadOptions::new().time(Some(42.0), Some(43.5));
+        let before = server.requests.load(Ordering::SeqCst);
+        let sig = index.read("X", &opts)?;
+        let used = server.requests.load(Ordering::SeqCst) - before;
+        let expected = mdf.read("X", &opts)?;
+        assert_eq!(sig.values, expected.values);
+        assert_eq!(sig.timestamps, expected.timestamps);
+        assert_eq!(sig.values.len(), 1501);
+        eprintln!("time-window read: {used} requests");
+        assert!(used <= 80, "time-window read took {used} requests");
+
+        let before = server.requests.load(Ordering::SeqCst);
+        assert_eq!(index.values("X", &opts)?, mdf.values("X", &opts)?);
+        let tr = index.time_range("X", None)?;
+        assert_eq!(tr, mdf.time_range("X", None)?);
+        let used = server.requests.load(Ordering::SeqCst) - before;
+        assert!(used <= 80, "values + time_range took {used} requests");
+        Ok(())
+    }
+
+    /// A URL whose file was replaced after the index was built is refused
+    /// with a clear error (the size each ranged response reports differs from
+    /// the indexed size), not a cryptic 416 or a garbage block ID.
+    #[test]
+    fn url_source_that_does_not_match_the_index_is_refused() -> Result<(), MdfError> {
+        let f = fixture(&small_blocks())?;
+        let other = fixture(&ColumnOptions { block_size: 4 * 1024, ..Default::default() })?;
+        let mut index = MdfIndex::from_file(f.column.to_str().unwrap())?;
+        let original = std::fs::metadata(&f.column)?.len();
+        let replaced = std::fs::metadata(&other.source)?.len();
+        assert_ne!(original, replaced);
+        let server = serve(&other.source);
+        index.set_source(server.url.as_str());
+        let opts = mf4_rs::ReadOptions::new().group("Engine");
+        let windowed = mf4_rs::ReadOptions::new().group("Engine").time(Some(0.1), Some(0.2));
+        for result in [
+            index.read("Speed", &opts).map(|_| ()),
+            index.values("Speed", &windowed).map(|_| ()),
+            index.time_range("Speed", Some("Engine")).map(|_| ()),
+        ] {
+            match result {
+                Err(MdfError::InvalidArgument(msg)) => assert!(msg.contains("does not match the index"), "{msg}"),
+                other => panic!("expected a source mismatch, got {other:?}"),
+            }
         }
         Ok(())
     }

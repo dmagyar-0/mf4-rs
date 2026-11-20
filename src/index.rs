@@ -9,9 +9,11 @@ use crate::api::mdf::Mdf;
 use crate::blocks::common::{DataType, BlockHeader, BlockParse};
 use crate::blocks::conversion::{ConversionBlock, ConversionType};
 use crate::error::MdfError;
+#[cfg(feature = "http")]
+use crate::fragments::{merge_ranges_bridging, FragmentStore, RecordingRangeReader};
 use crate::parsing::decoder::{check_value_validity, decode_channel_value, decode_channel_value_with_validity, decode_f64_from_record, DecodedValue};
 use crate::signal::{decoded_opt_to_f64, Signal};
-use crate::types::{resolve_records, ChannelInfo, ConversionInfo, GroupInfo, ReadOptions, TimeRange, Window};
+use crate::types::{resolve_records, search_time_window, ChannelInfo, ConversionInfo, GroupInfo, ReadOptions, TimeRange, Window};
 
 /// Largest single read issued when coalescing adjacent data blocks (64 MiB).
 const MAX_COALESCED_READ: u64 = 64 * 1024 * 1024;
@@ -269,10 +271,25 @@ impl Source {
 
 /// A string is a [`Source`]: `http://` / `https://` URLs become
 /// [`Source::Url`] (with the `http` feature), anything else a file path.
+/// The URL scheme of `value` (`"https"` for `https://…`), if it has one.
+/// A Windows drive path (`C:\\…`, `C:/…`) has none.
+fn url_scheme(value: &str) -> Option<&str> {
+    let (scheme, _) = value.split_once("://")?;
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    (valid && scheme.len() > 1).then_some(scheme)
+}
+
+/// True for an `http://` / `https://` URL (scheme matched case-insensitively).
+fn is_http_url(value: &str) -> bool {
+    url_scheme(value).is_some_and(|s| s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"))
+}
+
 impl From<&str> for Source {
     fn from(value: &str) -> Self {
         #[cfg(feature = "http")]
-        if value.starts_with("http://") || value.starts_with("https://") {
+        if is_http_url(value) {
             return Source::Url(value.to_string());
         }
         Source::File(value.to_string())
@@ -284,6 +301,15 @@ impl From<String> for Source {
         Source::from(value.as_str())
     }
 }
+
+/// Ranges recorded in one batched round that lie at most this far apart are
+/// fetched as one request (mirrors `WINDOW_BRIDGE_BYTES` in the TS driver).
+#[cfg(feature = "http")]
+const BATCH_BRIDGE_BYTES: u64 = 4 * 1024;
+
+/// Upper bound on the rounds of [`MdfIndex::batched_reads`].
+#[cfg(feature = "http")]
+const MAX_BATCH_ROUNDS: usize = 1_000;
 
 /// Reader over an index's attached [`Source`], for windowed reads.
 enum SourceReader {
@@ -553,6 +579,12 @@ pub struct CachingRangeReader<R: ByteRangeReader<Error = MdfError>> {
 }
 
 impl<R: ByteRangeReader<Error = MdfError>> CachingRangeReader<R> {
+    /// The wrapped reader.
+    #[allow(dead_code)]
+    pub(crate) fn inner_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
     /// Wrap a reader with the default chunk size (1 MiB).
     pub fn new(inner: R) -> Self {
         Self::with_chunk_size(inner, 1 << 20)
@@ -827,25 +859,63 @@ pub struct HttpRangeReader {
     agent: ureq::Agent,
     url: String,
     request_count: u64,
+    /// Size the resource must have (the size an index was built from). Every
+    /// ranged response reports the resource's total size in `Content-Range`;
+    /// a different total means the file behind the URL was replaced, and is
+    /// refused instead of decoding bytes at offsets meant for another file.
+    expected_size: Option<u64>,
 }
 
 #[cfg(feature = "http")]
 impl HttpRangeReader {
     pub fn new(url: impl Into<String>) -> Result<Self, MdfError> {
-        // ureq's native-tls feature is not auto-wired (unlike rustls): the
-        // connector must be constructed and attached explicitly, otherwise
-        // HTTPS requests fail with "no TLS backend is configured".
-        let connector = native_tls::TlsConnector::new().map_err(|e| {
-            MdfError::BlockSerializationError(format!("failed to init TLS backend: {e}"))
-        })?;
-        let agent = ureq::AgentBuilder::new()
-            .tls_connector(std::sync::Arc::new(connector))
-            .build();
         Ok(Self {
-            agent,
+            agent: shared_http_agent()?,
             url: url.into(),
             request_count: 0,
+            expected_size: None,
         })
+    }
+
+    /// Require every response to report a resource of `size` bytes (see
+    /// [`MdfError::InvalidArgument`] for the mismatch error).
+    pub fn expect_size(&mut self, size: u64) {
+        self.expected_size = Some(size);
+    }
+
+    /// Fetch several byte ranges concurrently (up to
+    /// [`MAX_PARALLEL_REQUESTS`] at a time) and return their bytes in order.
+    ///
+    /// Used by the batched read driver ([`MdfIndex`]'s URL reads): a round of
+    /// a time-window search needs a few dozen small, independent ranges, and
+    /// fetching them one after another would cost one round-trip each.
+    pub(crate) fn read_ranges_parallel(&mut self, spans: &[(u64, u64)]) -> Result<Vec<Vec<u8>>, MdfError> {
+        if spans.len() <= 1 {
+            return spans.iter().map(|&(o, l)| self.read_range(o, l)).collect();
+        }
+        let (agent, url, expected) = (&self.agent, self.url.as_str(), self.expected_size);
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(spans.len());
+        for chunk in spans.chunks(MAX_PARALLEL_REQUESTS) {
+            let results: Vec<Result<Vec<u8>, MdfError>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|&(offset, length)| scope.spawn(move || http_get_range(agent, url, offset, length, expected)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(MdfError::BlockSerializationError("HTTP fetch thread panicked".to_string()))
+                        })
+                    })
+                    .collect()
+            });
+            self.request_count += chunk.len() as u64;
+            for r in results {
+                out.push(r?);
+            }
+        }
+        Ok(out)
     }
 
     /// Download the whole resource with one plain `GET`.
@@ -921,66 +991,175 @@ impl ByteRangeReader for HttpRangeReader {
     type Error = MdfError;
 
     fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, MdfError> {
-        use std::io::Read;
-
-        if length == 0 {
-            return Ok(Vec::new());
+        let bytes = http_get_range(&self.agent, &self.url, offset, length, self.expected_size);
+        if length > 0 {
+            self.request_count += 1;
         }
-        let range_header = format!("bytes={}-{}", offset, offset + length - 1);
-        let resp = self
-            .agent
-            .get(&self.url)
-            .set("Range", &range_header)
-            .call()
-            .map_err(|e| MdfError::BlockSerializationError(format!("HTTP GET error: {e}")))?;
-        self.request_count += 1;
+        bytes
+    }
+}
 
-        // 206 Partial Content is the accepted path. A 200 means the server
-        // ignored the Range header and sent the whole resource: that is only
-        // usable when the requested range starts at offset 0 (the body can be
-        // truncated to `length`); for any other offset the first `length`
-        // bytes would silently come from the wrong position, so error out.
-        let status = resp.status();
-        match status {
-            206 => {}
-            200 => {
-                if offset != 0 {
-                    return Err(MdfError::BlockSerializationError(format!(
-                        "HTTP server ignored Range request (status 200) for offset {}; \
-                         refusing to return bytes from the wrong position",
-                        offset
-                    )));
-                }
+/// Maximum concurrent range requests issued by
+/// [`HttpRangeReader::read_ranges_parallel`].
+#[cfg(feature = "http")]
+pub(crate) const MAX_PARALLEL_REQUESTS: usize = 8;
+
+/// The process-wide HTTP agent shared by every [`HttpRangeReader`].
+///
+/// Building a TLS connector loads the system trust store, and each agent has
+/// its own connection pool, so a fresh agent per read meant a fresh TCP + TLS
+/// handshake for every `read()` / `values()` call. One shared agent keeps
+/// connections alive across calls (and across indexes reading the same host).
+#[cfg(feature = "http")]
+fn shared_http_agent() -> Result<ureq::Agent, MdfError> {
+    // Keyed by process id: a forked child (multiprocessing, DataLoader
+    // workers) must not reuse the parent's pooled keep-alive sockets, or
+    // several processes would interleave requests on one TCP stream.
+    static AGENT: std::sync::Mutex<Option<(u32, ureq::Agent)>> = std::sync::Mutex::new(None);
+    let pid = std::process::id();
+    let mut slot = AGENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((owner, agent)) = slot.as_ref()
+        && *owner == pid
+    {
+        return Ok(agent.clone());
+    }
+    // ureq's native-tls feature is not auto-wired (unlike rustls): the
+    // connector must be constructed and attached explicitly, otherwise
+    // HTTPS requests fail with "no TLS backend is configured".
+    let connector = native_tls::TlsConnector::new().map_err(|e| {
+        MdfError::BlockSerializationError(format!("failed to init TLS backend: {e}"))
+    })?;
+    let agent = ureq::AgentBuilder::new()
+        .tls_connector(std::sync::Arc::new(connector))
+        .max_idle_connections_per_host(MAX_PARALLEL_REQUESTS)
+        .build();
+    *slot = Some((pid, agent.clone()));
+    Ok(agent)
+}
+
+/// Total size from a `Content-Range: bytes A-B/<total>` (or `bytes */<total>`)
+/// header, if it states one.
+#[cfg(feature = "http")]
+fn content_range_total(header: Option<&str>) -> Option<u64> {
+    header?.rsplit_once('/')?.1.trim().parse().ok()
+}
+
+/// `(A, B)` from a `Content-Range: bytes A-B/<total>` header.
+#[cfg(feature = "http")]
+fn content_range_span(header: Option<&str>) -> Option<(u64, u64)> {
+    let spec = header?.trim().strip_prefix("bytes")?.trim();
+    let (a, b) = spec.split_once('/')?.0.split_once('-')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+}
+
+/// Refuse a source whose size differs from the one the index was built from.
+#[cfg(any(feature = "http", not(target_arch = "wasm32")))]
+fn check_resource_size(source: &str, expected: u64, actual: u64) -> Result<(), MdfError> {
+    if expected != 0 && actual != expected {
+        return Err(MdfError::InvalidArgument(format!(
+            "the source does not match the index: the index was built from a {expected}-byte \
+             file but '{source}' is {actual} bytes — attach the file the index was built \
+             from, or rebuild the index"
+        )));
+    }
+    Ok(())
+}
+
+/// One `Range: bytes=A-B` GET of `[offset, offset + length)`.
+#[cfg(feature = "http")]
+fn http_get_range(
+    agent: &ureq::Agent,
+    url: &str,
+    offset: u64,
+    length: u64,
+    expected_size: Option<u64>,
+) -> Result<Vec<u8>, MdfError> {
+    use std::io::Read;
+
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    let range_header = format!("bytes={}-{}", offset, offset + length - 1);
+    let resp = match agent.get(url).set("Range", &range_header).call() {
+        Ok(resp) => resp,
+        // 416: the range starts past the end of the resource. Its
+        // `Content-Range: bytes */<size>` tells whether the file shrank.
+        Err(ureq::Error::Status(416, resp)) => {
+            let total = content_range_total(resp.header("Content-Range"));
+            if let (Some(expected), Some(actual)) = (expected_size, total) {
+                check_resource_size(url, expected, actual)?;
             }
-            other => {
+            return Err(MdfError::BlockSerializationError(format!(
+                "HTTP range {offset}..{} is past the end of {url}{}",
+                offset + length,
+                total.map(|t| format!(" ({t} bytes)")).unwrap_or_default()
+            )));
+        }
+        Err(e) => return Err(MdfError::BlockSerializationError(format!("HTTP GET error: {e}"))),
+    };
+    if let (Some(expected), Some(actual)) = (expected_size, content_range_total(resp.header("Content-Range"))) {
+        check_resource_size(url, expected, actual)?;
+    }
+    // A 206 must carry exactly the requested range: a proxy or a shared
+    // connection that answers with other bytes of the right length would
+    // otherwise be decoded silently.
+    if resp.status() == 206 {
+        if let Some((start, end)) = content_range_span(resp.header("Content-Range")) {
+            let want_end = offset + length - 1;
+            // (A shorter range at end-of-file is caught by the short-body check below.)
+            if start != offset || end > want_end {
                 return Err(MdfError::BlockSerializationError(format!(
-                    "HTTP range request returned unexpected status {other}"
+                    "HTTP server returned bytes {start}-{end} for requested range {offset}-{want_end}"
                 )));
             }
         }
-
-        // Read at most `length` bytes (a 200 response carries the whole
-        // resource and must be truncated), then insist we actually received
-        // all of them: a short body must be an error, not silently fewer
-        // records. Capacity is capped so a forged huge length cannot abort
-        // on allocation.
-        let mut buf = Vec::with_capacity(length.min(1 << 20) as usize);
-        resp.into_reader()
-            .take(length)
-            .read_to_end(&mut buf)
-            .map_err(MdfError::IOError)?;
-        if (buf.len() as u64) < length {
-            // Report absolute positions so wrappers (e.g. CachingRangeReader)
-            // can learn the resource's true end from `actual`.
-            return Err(MdfError::TooShortBuffer {
-                actual: (offset + buf.len() as u64) as usize,
-                expected: (offset + length) as usize,
-                file: file!(),
-                line: line!(),
-            });
-        }
-        Ok(buf)
     }
+
+    // 206 Partial Content is the accepted path. A 200 means the server
+    // ignored the Range header and sent the whole resource: that is only
+    // usable when the requested range starts at offset 0 (the body can be
+    // truncated to `length`); for any other offset the first `length`
+    // bytes would silently come from the wrong position, so error out.
+    let status = resp.status();
+    match status {
+        206 => {}
+        200 => {
+            if offset != 0 {
+                return Err(MdfError::BlockSerializationError(format!(
+                    "HTTP server ignored Range request (status 200) for offset {}; \
+                     refusing to return bytes from the wrong position",
+                    offset
+                )));
+            }
+        }
+        other => {
+            return Err(MdfError::BlockSerializationError(format!(
+                "HTTP range request returned unexpected status {other}"
+            )));
+        }
+    }
+
+    // Read at most `length` bytes (a 200 response carries the whole
+    // resource and must be truncated), then insist we actually received
+    // all of them: a short body must be an error, not silently fewer
+    // records. Capacity is capped so a forged huge length cannot abort
+    // on allocation.
+    let mut buf = Vec::with_capacity(length.min(1 << 20) as usize);
+    resp.into_reader()
+        .take(length)
+        .read_to_end(&mut buf)
+        .map_err(MdfError::IOError)?;
+    if (buf.len() as u64) < length {
+        // Report absolute positions so wrappers (e.g. CachingRangeReader)
+        // can learn the resource's true end from `actual`.
+        return Err(MdfError::TooShortBuffer {
+            actual: (offset + buf.len() as u64) as usize,
+            expected: (offset + length) as usize,
+            file: file!(),
+            line: line!(),
+        });
+    }
+    Ok(buf)
 }
 
 impl MdfIndex {
@@ -1950,8 +2129,7 @@ impl MdfIndex {
             return self.virtual_values(group, start, count, conversion);
         }
         if channel.channel_type == 1 {
-            let all = self.read_vlsd_channel_values(group, channel, conversion, reader)?;
-            return Ok(all.into_iter().skip(start as usize).take(count as usize).collect());
+            return self.read_vlsd_window_values(group, channel, conversion, start, count, reader);
         }
         let record_size = Self::checked_record_size(group)?;
         let temp_cb = channel.to_channel_block();
@@ -2107,7 +2285,8 @@ impl MdfIndex {
     /// master (time) values lie in `[t_start, t_end]` (either bound optional).
     ///
     /// The master must be non-decreasing, as MDF requires for a time master.
-    /// It is searched rather than read: each step reads [`TIME_SEARCH_FANOUT`]
+    /// It is searched rather than read (see [`search_time_window`], shared
+    /// with the in-memory reader so both select the same records): each step reads 16
     /// single records, so a window is found in a handful of small reads
     /// (`log16(records)` rounds per bound). With a probing reader (the wasm
     /// fragment driver) both bounds' probes of a round are attempted before the
@@ -2135,47 +2314,9 @@ impl MdfIndex {
         let (mgroup, mchannel) = self.group_and_channel(mg, m)?;
         let n = group.record_count.min(mgroup.record_count);
         let conversion = Self::resolve_conversion(mchannel, reader)?;
-        let probe = |i: u64, reader: &mut R| -> Result<f64, MdfError> {
+        search_time_window(n, t_start, t_end, |i| {
             Ok(self.window_values_f64(mgroup, mchannel, conversion.as_ref(), i, 1, reader)?[0])
-        };
-        // first record with t >= t_start; first record with t > t_end
-        let mut lo = Bound::new(n);
-        let mut hi = Bound::new(n);
-        if t_start.is_none() {
-            lo.done_at(0);
-        }
-        if t_end.is_none() {
-            hi.done_at(n);
-        }
-        while !(lo.done() && hi.done()) {
-            let mut first_err = None;
-            for (bound, below) in [
-                (&mut lo, &(|v: f64| t_start.is_some_and(|t| v < t)) as &dyn Fn(f64) -> bool),
-                (&mut hi, &|v: f64| t_end.is_some_and(|t| v <= t)),
-            ] {
-                if bound.done() {
-                    continue;
-                }
-                let probes = bound.probes();
-                let mut below_flags = Vec::with_capacity(probes.len());
-                for &p in &probes {
-                    match probe(p, reader) {
-                        Ok(v) => below_flags.push(below(v)),
-                        Err(e) => {
-                            first_err.get_or_insert(e);
-                        }
-                    }
-                }
-                if below_flags.len() == probes.len() {
-                    bound.narrow(&probes, &below_flags);
-                }
-            }
-            if let Some(e) = first_err {
-                return Err(e);
-            }
-        }
-        let (start, end) = (lo.lo, hi.lo.max(lo.lo));
-        Ok((start, end - start))
+        })
     }
 
     /// Resolve a channel's conversion for reading.
@@ -2290,45 +2431,7 @@ impl MdfIndex {
         conversion: Option<&ConversionBlock>,
         reader: &mut R,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
-        // Compressed fragments (either the fixed records or the SD stream) are
-        // not decodable yet.
-        if group.data_blocks.iter().any(|b| b.is_compressed)
-            || channel.vlsd_data_blocks.iter().any(|b| b.is_compressed)
-        {
-            return Err(MdfError::BlockSerializationError(
-                "Compressed blocks not yet supported in index reader".to_string(),
-            ));
-        }
-
-        // A VLSD channel without a data link has no signal data at all —
-        // rebuilding the index cannot help, so distinguish it from an index
-        // built before VLSD chains were captured.
-        if channel.vlsd_data_blocks.is_empty() {
-            if channel.vlsd_data_address.is_none() {
-                return Err(MdfError::BlockSerializationError(format!(
-                    "VLSD channel '{}' has no signal data (its ##SD data link is 0)",
-                    channel.name.as_deref().unwrap_or("<unnamed>")
-                )));
-            }
-            return Err(MdfError::BlockSerializationError(format!(
-                "VLSD channel '{}' has no signal-data fragments recorded in the index; \
-                 rebuild the index with this version to read it",
-                channel.name.as_deref().unwrap_or("<unnamed>")
-            )));
-        }
-
-        // The VLSD offset field is fixed at 64 bits by the spec and is
-        // byte-aligned; a nonzero bit offset would silently shift every
-        // resolved stream offset.
-        if channel.bit_count != 64 || channel.bit_offset != 0 {
-            return Err(MdfError::BlockSerializationError(format!(
-                "VLSD channel '{}' has a {}-bit record field at bit offset {}; the \
-                 inline VLSD offset must be a byte-aligned 64-bit field",
-                channel.name.as_deref().unwrap_or("<unnamed>"),
-                channel.bit_count,
-                channel.bit_offset
-            )));
-        }
+        Self::check_vlsd_readable(group, channel)?;
 
         // Fetch each SD fragment's data section, tracking each fragment's
         // virtual start offset in the concatenated stream.
@@ -2448,6 +2551,208 @@ impl MdfIndex {
         })?;
 
         Ok(values)
+    }
+
+    /// Refuse VLSD channels the index reader cannot decode (compressed
+    /// fragments, missing signal data, a malformed offset field).
+    fn check_vlsd_readable(group: &IndexedChannelGroup, channel: &IndexedChannel) -> Result<(), MdfError> {
+        // Compressed fragments (either the fixed records or the SD stream) are
+        // not decodable yet.
+        if group.data_blocks.iter().any(|b| b.is_compressed)
+            || channel.vlsd_data_blocks.iter().any(|b| b.is_compressed)
+        {
+            return Err(MdfError::BlockSerializationError(
+                "Compressed blocks not yet supported in index reader".to_string(),
+            ));
+        }
+
+        // A VLSD channel without a data link has no signal data at all —
+        // rebuilding the index cannot help, so distinguish it from an index
+        // built before VLSD chains were captured.
+        if channel.vlsd_data_blocks.is_empty() {
+            if channel.vlsd_data_address.is_none() {
+                return Err(MdfError::BlockSerializationError(format!(
+                    "VLSD channel '{}' has no signal data (its ##SD data link is 0)",
+                    channel.name.as_deref().unwrap_or("<unnamed>")
+                )));
+            }
+            return Err(MdfError::BlockSerializationError(format!(
+                "VLSD channel '{}' has no signal-data fragments recorded in the index; \
+                 rebuild the index with this version to read it",
+                channel.name.as_deref().unwrap_or("<unnamed>")
+            )));
+        }
+
+        // The VLSD offset field is fixed at 64 bits by the spec and is
+        // byte-aligned; a nonzero bit offset would silently shift every
+        // resolved stream offset.
+        if channel.bit_count != 64 || channel.bit_offset != 0 {
+            return Err(MdfError::BlockSerializationError(format!(
+                "VLSD channel '{}' has a {}-bit record field at bit offset {}; the \
+                 inline VLSD offset must be a byte-aligned 64-bit field",
+                channel.name.as_deref().unwrap_or("<unnamed>"),
+                channel.bit_count,
+                channel.bit_offset
+            )));
+        }
+        Ok(())
+    }
+
+    /// Window read of a VLSD channel: decode only records
+    /// `[start, start + count)`, fetching their inline offsets and then just
+    /// the slice of the signal-data stream those offsets point into (one
+    /// read, plus one more if the last entry runs past it) — not the whole
+    /// stream.
+    fn read_vlsd_window_values<R: ByteRangeReader<Error = MdfError>>(
+        &self,
+        group: &IndexedChannelGroup,
+        channel: &IndexedChannel,
+        conversion: Option<&ConversionBlock>,
+        start: u64,
+        count: u64,
+        reader: &mut R,
+    ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
+        Self::check_vlsd_readable(group, channel)?;
+        let record_size = Self::checked_record_size(group)?;
+        let record_id_len = group.record_id_len as usize;
+        let has_invalidation = group.invalidation_bytes > 0;
+        let all_invalid = channel.flags & 0x1 != 0;
+        let offset_pos = record_id_len + channel.byte_offset as usize;
+        let validity_cb = channel.to_channel_block();
+        let mut payload_cb = channel.to_channel_block();
+        payload_cb.data = 1;
+
+        // Inline offsets of the window's records (None = invalid sample).
+        let mut offsets: Vec<Option<u64>> = Vec::with_capacity((count as usize).min(1 << 24));
+        Self::for_each_window_section(reader, group, record_size, start, count, |data| {
+            for record in data.chunks_exact(record_size) {
+                if all_invalid
+                    || (has_invalidation
+                        && !check_value_validity(record, record_id_len, group.record_size, &validity_cb))
+                {
+                    offsets.push(None);
+                    continue;
+                }
+                let field = record.get(offset_pos..offset_pos + 8).ok_or(MdfError::TooShortBuffer {
+                    actual: record.len(),
+                    expected: offset_pos + 8,
+                    file: file!(),
+                    line: line!(),
+                })?;
+                offsets.push(Some(u64::from_le_bytes(field.try_into().unwrap())));
+            }
+            Ok(())
+        })?;
+
+        // Virtual start of each ##SD fragment in the concatenated stream.
+        let mut frag_starts = Vec::with_capacity(channel.vlsd_data_blocks.len());
+        let mut stream_len = 0u64;
+        for db in &channel.vlsd_data_blocks {
+            frag_starts.push(stream_len);
+            stream_len = stream_len.checked_add(Self::data_section_size(db)?).ok_or_else(|| {
+                MdfError::BlockSerializationError("VLSD ##SD chain total size overflows the address space".to_string())
+            })?;
+        }
+        let present = || offsets.iter().flatten().copied();
+        let (Some(lo), Some(hi)) = (present().min(), present().max()) else {
+            return Ok(vec![None; offsets.len()]);
+        };
+        let prefix_end = hi.checked_add(4).filter(|&e| e <= stream_len).ok_or_else(|| {
+            MdfError::BlockSerializationError(format!(
+                "VLSD inline offset {hi} leaves no room for a length prefix in the {stream_len}-byte signal-data stream"
+            ))
+        })?;
+        let mut buf = Self::read_vlsd_stream(reader, channel, &frag_starts, lo, prefix_end - lo)?;
+        let entry_len = |buf: &[u8], off: u64| -> usize {
+            let p = (off - lo) as usize;
+            u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize
+        };
+        let end = present().map(|off| off + 4 + entry_len(&buf, off) as u64).max().unwrap_or(prefix_end);
+        if end > stream_len {
+            return Err(MdfError::BlockSerializationError(format!(
+                "VLSD entry ending at virtual offset {end} is past the end of the {stream_len}-byte signal-data stream"
+            )));
+        }
+        if end > prefix_end {
+            let more = Self::read_vlsd_stream(reader, channel, &frag_starts, prefix_end, end - prefix_end)?;
+            buf.extend_from_slice(&more);
+        }
+
+        let mut values = Vec::with_capacity(offsets.len());
+        for off in &offsets {
+            let Some(off) = *off else {
+                values.push(None);
+                continue;
+            };
+            // Like the full read, refuse an entry that does not fit in the
+            // ##SD fragment it starts in.
+            let frag_idx = frag_starts.partition_point(|&s| s <= off) - 1;
+            let frag_end = frag_starts.get(frag_idx + 1).copied().unwrap_or(stream_len);
+            let len = entry_len(&buf, off);
+            if off + 4 + len as u64 > frag_end {
+                return Err(MdfError::BlockSerializationError(format!(
+                    "VLSD entry at virtual offset {} declares length {} which exceeds fragment {} (size {})",
+                    off,
+                    len,
+                    frag_idx,
+                    frag_end - frag_starts[frag_idx]
+                )));
+            }
+            let p = (off - lo) as usize + 4;
+            let payload = &buf[p..p + entry_len(&buf, off)];
+            values.push(match decode_channel_value(payload, 0, &payload_cb) {
+                Some(value) => Some(match conversion {
+                    Some(conversion) => conversion.apply_decoded(value, &[])?,
+                    None => value,
+                }),
+                None => None,
+            });
+        }
+        Ok(values)
+    }
+
+    /// Bytes `[from, from + len)` of a VLSD channel's concatenated
+    /// signal-data stream, read from the ##SD fragments they fall in.
+    fn read_vlsd_stream<R: ByteRangeReader<Error = MdfError>>(
+        reader: &mut R,
+        channel: &IndexedChannel,
+        frag_starts: &[u64],
+        from: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, MdfError> {
+        let to = from + len;
+        let mut out = Vec::with_capacity(len as usize);
+        // Attempt every fragment's read before failing, so a probing reader
+        // records all gaps in one pass.
+        let mut first_err = None;
+        for (db, &fs) in channel.vlsd_data_blocks.iter().zip(frag_starts) {
+            let fe = fs + Self::data_section_size(db)?;
+            let (a, b) = (from.max(fs), to.min(fe));
+            if a >= b {
+                continue;
+            }
+            match reader.read_range(db.file_offset + 24 + (a - fs), b - a) {
+                // A custom reader that returns fewer bytes (e.g. clamped at
+                // EOF) must surface as an error, not an out-of-bounds slice.
+                Ok(bytes) if bytes.len() as u64 != b - a => {
+                    return Err(MdfError::TooShortBuffer {
+                        actual: bytes.len(),
+                        expected: (b - a) as usize,
+                        file: file!(),
+                        line: line!(),
+                    });
+                }
+                Ok(bytes) => out.extend_from_slice(&bytes),
+                Err(e) if reader.is_probing() => {
+                    first_err.get_or_insert(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        Ok(out)
     }
 
     /// Map VLSD decoded values to `f64`, matching `Channel::values`:
@@ -2777,7 +3082,7 @@ impl MdfIndex {
     /// Not available on `wasm32-unknown-unknown`.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_file(&self, path: &str) -> Result<MdfReader<'_, MmapRangeReader>, MdfError> {
-        Ok(self.open(MmapRangeReader::new(path)?))
+        Ok(self.open(MmapRangeReader { mmap: self.map_source_file(path)? }))
     }
 
     /// The data source `read` / `values` fetch sample bytes from, if any.
@@ -2822,7 +3127,7 @@ impl MdfIndex {
             return self.read_signal(g, c);
         }
         let mut reader = self.source_reader(g, c)?;
-        let (start, count) = self.resolve_window(g, c, window, &mut reader)?;
+        let (start, count) = self.resolve_window_via(g, c, window, &mut reader)?;
         read_signal_window(self, g, c, start, count, &mut reader)
     }
 
@@ -2838,7 +3143,7 @@ impl MdfIndex {
             return self.read_values_f64_via_source(g, c);
         }
         let mut reader = self.source_reader(g, c)?;
-        let (start, count) = self.resolve_window(g, c, window, &mut reader)?;
+        let (start, count) = self.resolve_window_via(g, c, window, &mut reader)?;
         self.values_f64_window(g, c, start, count, &mut reader)
     }
 
@@ -2847,8 +3152,66 @@ impl MdfIndex {
     /// has no master channel.
     pub fn time_range(&self, name: &str, group: Option<&str>) -> Result<Option<TimeRange>, MdfError> {
         let (g, c) = self.locate_checked(name, group)?;
+        // Over a URL only the master is read (in batched rounds), so skip
+        // `source_reader`, which would also fetch channel `c`'s conversion.
+        #[cfg(feature = "http")]
+        if let Source::Url(url) = self.require_source()? {
+            let mut http = self.http_source(url)?;
+            return self.batched_reads(&mut http, |r| self.time_range_at(g, c, r));
+        }
         let mut reader = self.source_reader(g, c)?;
         self.time_range_at(g, c, &mut reader)
+    }
+
+    /// [`resolve_window`](Self::resolve_window) over a [`SourceReader`]: a
+    /// time window over a URL is searched in batched rounds (see
+    /// [`batched_reads`](Self::batched_reads)) instead of one blocking
+    /// request per probe.
+    fn resolve_window_via(
+        &self,
+        g: usize,
+        c: usize,
+        window: Window,
+        reader: &mut SourceReader,
+    ) -> Result<(u64, u64), MdfError> {
+        match (window, reader) {
+            #[cfg(feature = "http")]
+            (Window::Time(..), SourceReader::Url(cached)) => {
+                self.batched_reads(cached.inner_mut(), |r| self.resolve_window(g, c, window, r))
+            }
+            (_, reader) => self.resolve_window(g, c, window, reader),
+        }
+    }
+
+    /// Run `op` against the bytes fetched so far, recording every range it
+    /// could not read; fetch all of them **concurrently**, and run it again
+    /// until it needs nothing more — the native twin of the wasm gap loop
+    /// (`js/src/mdf-index.ts`). A time-window search then costs
+    /// ~`log16(records)` rounds of parallel requests instead of one blocking
+    /// round-trip per probed record (and per data-block header).
+    #[cfg(feature = "http")]
+    fn batched_reads<T>(
+        &self,
+        http: &mut HttpRangeReader,
+        mut op: impl FnMut(&mut RecordingRangeReader<'_>) -> Result<T, MdfError>,
+    ) -> Result<T, MdfError> {
+        let mut store = FragmentStore::new();
+        for _ in 0..MAX_BATCH_ROUNDS {
+            let mut recorder = RecordingRangeReader { store: &store, misses: Vec::new(), whole_request: true };
+            let result = op(&mut recorder);
+            let misses = std::mem::take(&mut recorder.misses);
+            if misses.is_empty() {
+                return result;
+            }
+            let spans = merge_ranges_bridging(misses, BATCH_BRIDGE_BYTES);
+            let fetched = http.read_ranges_parallel(&spans)?;
+            for ((offset, _), bytes) in spans.iter().zip(fetched) {
+                store.push(*offset, bytes)?;
+            }
+        }
+        Err(MdfError::BlockSerializationError(
+            "batched read did not converge; the index or source may be inconsistent".to_string(),
+        ))
     }
 
     /// The conversion `read` / `values` apply to channel `name`, fully
@@ -2920,20 +3283,60 @@ impl MdfIndex {
         Ok(Some(TimeRange { start: first?[0], end: last[0] }))
     }
 
+    /// Memory-map a file source, naming it in the error when it cannot be
+    /// opened and refusing it when its size differs from the indexed file.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn map_source_file(&self, path: &str) -> Result<memmap2::Mmap, MdfError> {
+        if is_http_url(path) {
+            #[cfg(not(feature = "http"))]
+            return Err(MdfError::InvalidArgument(format!(
+                "'{path}' is a URL, but mf4-rs was built without the `http` feature"
+            )));
+            #[cfg(feature = "http")]
+            return Err(MdfError::InvalidArgument(format!(
+                "'{path}' is a URL, not a local file: attach URLs with `set_source` or build the \
+                 index with `from_url`"
+            )));
+        }
+        if let Some(scheme) = url_scheme(path) {
+            return Err(MdfError::InvalidArgument(format!(
+                "unsupported source '{path}': {scheme}:// URLs cannot be read directly — use a \
+                 local file path or an http(s):// URL (e.g. a presigned S3 / GCS / Azure URL)"
+            )));
+        }
+        let file = std::fs::File::open(path).map_err(|e| {
+            MdfError::IOError(std::io::Error::new(e.kind(), format!("cannot open source '{path}': {e}")))
+        })?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(MdfError::IOError)?;
+        check_resource_size(path, self.file_size, mmap.len() as u64)?;
+        Ok(mmap)
+    }
+
+    /// An HTTP reader for a URL source that checks every response against
+    /// the indexed file size.
+    #[cfg(feature = "http")]
+    fn http_source(&self, url: &str) -> Result<HttpRangeReader, MdfError> {
+        let mut http = HttpRangeReader::new(url)?;
+        if self.file_size > 0 {
+            http.expect_size(self.file_size);
+        }
+        Ok(http)
+    }
+
     /// A byte-range reader over the attached source, with the conversion of
     /// `(g, c)` resolved up front for URL sources.
     fn source_reader(&self, g: usize, c: usize) -> Result<SourceReader, MdfError> {
         let _ = (g, c);
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
-            Source::File(path) => Ok(SourceReader::File(MmapRangeReader::new(path)?)),
+            Source::File(path) => Ok(SourceReader::File(MmapRangeReader { mmap: self.map_source_file(path)? })),
             #[cfg(target_arch = "wasm32")]
             Source::File(_) => Err(MdfError::BlockSerializationError(
                 "file sources are not available on wasm32".to_string(),
             )),
             #[cfg(feature = "http")]
             Source::Url(url) => {
-                let http = HttpRangeReader::new(url)?;
+                let http = self.http_source(url)?;
                 Ok(SourceReader::Url(self.url_reader_with_conversion(http, g, c)?))
             }
         }
@@ -2988,7 +3391,7 @@ impl MdfIndex {
         #[cfg(not(feature = "http"))]
         {
             let Source::File(path) = source;
-            if path.starts_with("http://") || path.starts_with("https://") {
+            if is_http_url(path) {
                 return Err(MdfError::InvalidArgument(format!(
                     "'{path}' is a URL, but mf4-rs was built without the `http` feature"
                 )));
@@ -3008,8 +3411,7 @@ impl MdfIndex {
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
             Source::File(path) => {
-                let file = std::fs::File::open(path).map_err(MdfError::IOError)?;
-                let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(MdfError::IOError)?;
+                let mmap = self.map_source_file(path)?;
                 self.read_channel_values_from_slice(g, c, &mmap)
             }
             #[cfg(target_arch = "wasm32")]
@@ -3018,7 +3420,7 @@ impl MdfIndex {
             )),
             #[cfg(feature = "http")]
             Source::Url(url) => {
-                let http = HttpRangeReader::new(url)?;
+                let http = self.http_source(url)?;
                 let mut cached = self.url_reader_with_conversion(http, g, c)?;
                 self.read_channel_values(g, c, &mut cached)
             }
@@ -3047,8 +3449,7 @@ impl MdfIndex {
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
             Source::File(path) => {
-                let file = std::fs::File::open(path).map_err(MdfError::IOError)?;
-                let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(MdfError::IOError)?;
+                let mmap = self.map_source_file(path)?;
                 let mut slice_reader = BorrowedSliceReader { data: &mmap };
                 Self::resolve_conversion(channel, &mut slice_reader)
             }
@@ -3058,7 +3459,7 @@ impl MdfIndex {
             )),
             #[cfg(feature = "http")]
             Source::Url(url) => {
-                let http = HttpRangeReader::new(url)?;
+                let http = self.http_source(url)?;
                 let mut cached = CachingRangeReader::new(http);
                 Self::resolve_conversion(channel, &mut cached)
             }
@@ -3076,8 +3477,7 @@ impl MdfIndex {
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
             Source::File(path) => {
-                let file = std::fs::File::open(path).map_err(MdfError::IOError)?;
-                let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(MdfError::IOError)?;
+                let mmap = self.map_source_file(path)?;
                 self.read_channel_values_from_slice_as_f64(g, c, &mmap)
             }
             #[cfg(target_arch = "wasm32")]
@@ -3086,7 +3486,7 @@ impl MdfIndex {
             )),
             #[cfg(feature = "http")]
             Source::Url(url) => {
-                let http = HttpRangeReader::new(url)?;
+                let http = self.http_source(url)?;
                 let mut cached = self.url_reader_with_conversion(http, g, c)?;
                 self.read_channel_values_as_f64(g, c, &mut cached)
             }
@@ -3474,56 +3874,6 @@ impl MdfIndex {
     }
 }
 
-/// Records probed per round of the time search in
-/// [`MdfIndex::record_window_for_time`].
-const TIME_SEARCH_FANOUT: u64 = 16;
-
-/// State of one partition-point search over `[lo, hi)`: the answer is the
-/// first record for which the predicate ("still below the bound") is false.
-struct Bound {
-    lo: u64,
-    hi: u64,
-}
-
-impl Bound {
-    fn new(n: u64) -> Self {
-        Bound { lo: 0, hi: n }
-    }
-
-    fn done(&self) -> bool {
-        self.lo >= self.hi
-    }
-
-    fn done_at(&mut self, at: u64) {
-        self.lo = at;
-        self.hi = at;
-    }
-
-    /// Up to [`TIME_SEARCH_FANOUT`] distinct, increasing records in `[lo, hi)`.
-    fn probes(&self) -> Vec<u64> {
-        let span = self.hi - self.lo;
-        if span <= TIME_SEARCH_FANOUT {
-            return (self.lo..self.hi).collect();
-        }
-        (0..TIME_SEARCH_FANOUT)
-            .map(|i| self.lo + (i as u128 * span as u128 / TIME_SEARCH_FANOUT as u128) as u64)
-            .collect()
-    }
-
-    /// Narrow to the gap between the last probe below the bound and the first
-    /// one not below it (values are non-decreasing).
-    fn narrow(&mut self, probes: &[u64], below: &[bool]) {
-        match below.iter().position(|b| !b) {
-            Some(0) => self.hi = probes[0],
-            Some(j) => {
-                self.lo = probes[j - 1] + 1;
-                self.hi = probes[j];
-            }
-            None => self.lo = probes[probes.len() - 1] + 1,
-        }
-    }
-}
-
 /// A reader bound to an [`MdfIndex`] and a single byte-range data source.
 ///
 /// Obtained from [`MdfIndex::open`] / [`MdfIndex::open_file`]. The source is
@@ -3637,4 +3987,20 @@ pub(crate) fn read_signal_window<R: ByteRangeReader<Error = MdfError>>(
         None => Vec::new(),
     };
     Ok(Signal { name, unit, timestamps, values: values? })
+}
+
+#[cfg(all(test, feature = "http"))]
+mod http_header_tests {
+    use super::{content_range_span, content_range_total};
+
+    #[test]
+    fn parses_content_range() {
+        assert_eq!(content_range_span(Some("bytes 10-19/100")), Some((10, 19)));
+        assert_eq!(content_range_span(Some(" bytes 0-0/*")), Some((0, 0)));
+        assert_eq!(content_range_span(Some("bytes */100")), None);
+        assert_eq!(content_range_span(None), None);
+        assert_eq!(content_range_total(Some("bytes 10-19/100")), Some(100));
+        assert_eq!(content_range_total(Some("bytes */100")), Some(100));
+        assert_eq!(content_range_total(Some("bytes 0-0/*")), None);
+    }
 }

@@ -3,6 +3,22 @@ use crate::blocks::common::{BlockHeader, BlockParse};
 use crate::error::MdfError;
 use super::types::ConversionType;
 
+/// Serialize a reference-index map with its keys in ascending order, so an
+/// index's JSON is byte-for-byte reproducible (a `HashMap` iterates in a
+/// random order per process).
+fn serialize_sorted<V: serde::Serialize, S: serde::Serializer>(
+    map: &Option<std::collections::HashMap<usize, V>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match map {
+        Some(map) => {
+            let sorted: std::collections::BTreeMap<&usize, &V> = map.iter().collect();
+            serializer.serialize_some(&sorted)
+        }
+        None => serializer.serialize_none(),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConversionBlock {
     pub header: BlockHeader,
@@ -32,10 +48,12 @@ pub struct ConversionBlock {
     // Resolved data for self-contained conversions (populated during index creation)
     /// Pre-resolved text strings for text-based conversions (ValueToText, RangeToText, etc.)
     /// Maps cc_ref indices to their resolved text content
+    #[serde(serialize_with = "serialize_sorted")]
     pub resolved_texts: Option<std::collections::HashMap<usize, String>>,
     
     /// Pre-resolved nested conversion blocks for chained conversions
     /// Maps cc_ref indices to their resolved ConversionBlock content
+    #[serde(serialize_with = "serialize_sorted")]
     pub resolved_conversions: Option<std::collections::HashMap<usize, Box<ConversionBlock>>>,
     
     /// Default conversion for fallback cases (similar to asammdf's "default_addr")

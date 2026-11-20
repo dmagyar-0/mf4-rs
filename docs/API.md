@@ -133,9 +133,16 @@ const lazySpeed = await index.read("Speed");               // range requests hap
 
 Pass a time window **or** a record window, not both. On `MdfIndex` a window
 fetches only the selected records; a time window is located by searching the
-master channel with a handful of single-record reads. (Exception:
-variable-length channels — text and byte arrays — are fetched whole and then
-cut to the window.)
+master channel with a handful of single-record reads (over a URL, each round
+of the search is fetched in parallel). For variable-length channels (text and
+byte arrays) only the part of the signal-data stream the window's records
+point into is fetched.
+
+A time window needs a non-decreasing master channel, as MDF requires. `Mdf`
+and `MdfIndex` locate it with the same search, so they select the same
+records, and both refuse a time axis they find going backwards (e.g. two
+recordings whose time restarts at 0) with an invalid-argument error rather
+than returning an arbitrary part of the data — use a record window there.
 
 How `options` is passed:
 
@@ -158,12 +165,13 @@ mdf.read("Speed", { group: "Engine", startRecord: 0, recordCount: 100 });  // Ty
 | `to_json()` / `save(path)` | Serialise the index (`save` is Node-only in TypeScript). |
 | `validate()` | Check a loaded index for internal consistency. |
 | `file_size` | Size in bytes of the indexed file. |
-| `source` / `set_source(source)` | The file path or URL reads fetch from. Not serialised — re-attach it after `load` / `from_json`. |
+| `source` / `set_source(source)` | The file path or URL reads fetch from. Not serialised — re-attach it after `load` / `from_json`. A source whose size differs from `file_size` (the file was replaced, or is the wrong one) is refused with an invalid-argument error naming both sizes. |
 | `byte_ranges(name, group?)` | `(offset, length)` spans holding a channel's samples, for issuing range requests yourself. Refused for variable-length channels. |
 | `byte_ranges_for_records(name, start_record, record_count, group?)` | The same for a record window. |
 
-The source is a string in Rust and Python (`http(s)://` URLs use range
-requests, anything else is a file path). In TypeScript it is a `RangeSource`
+The source is a string in Rust and Python (`http(s)://` URLs, in any letter
+case, use range requests; another scheme such as `s3://` is refused — use a
+presigned `https://` URL; anything else is a file path). In TypeScript it is a `RangeSource`
 object (`FetchRangeSource`, `FileRangeSource`, `BytesRangeSource`, or your own).
 
 ### `Mdf` only
