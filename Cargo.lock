@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "mf4-rs"
-version = "4.0.3"
+version = "4.1.0"
 dependencies = [
  "byteorder",
  "js-sys",

@@ -1,3 +1,8 @@
+## v4.1.0 — 2026-11-20
+
+### Features
+- add raw read option to return unconverted values (#101)
+
 ## v4.0.3 — 2026-11-20
 
 ### Fixes
