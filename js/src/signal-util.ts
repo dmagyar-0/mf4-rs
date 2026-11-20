@@ -46,7 +46,7 @@ export function windowOf(w: ReadWindow): ReadWindow {
  */
 export function wasmWindow(options: ReadWindow & { raw?: boolean }): ReadWindow & { raw?: boolean } {
   const out: ReadWindow & { raw?: boolean } = windowOf(options);
-  if (options.raw) out.raw = true;
+  if (options.raw === true) out.raw = true;
   return out;
 }
 

@@ -3142,7 +3142,7 @@ impl MdfIndex {
         if window == Window::All {
             return self.read_signal(g, c, options.raw);
         }
-        let mut reader = self.source_reader(g, c, options.raw)?;
+        let mut reader = self.source_reader(g, c, options.raw, true)?;
         let (start, count) = self.resolve_window_via(g, c, window, &mut reader)?;
         read_signal_window(self, g, c, start, count, options.raw, &mut reader)
     }
@@ -3158,7 +3158,7 @@ impl MdfIndex {
         if window == Window::All {
             return self.read_values_f64_via_source(g, c, options.raw);
         }
-        let mut reader = self.source_reader(g, c, options.raw)?;
+        let mut reader = self.source_reader(g, c, options.raw, matches!(window, Window::Time(..)))?;
         let (start, count) = self.resolve_window_via(g, c, window, &mut reader)?;
         self.values_f64_window(g, c, start, count, options.raw, &mut reader)
     }
@@ -3175,7 +3175,8 @@ impl MdfIndex {
             let mut http = self.http_source(url)?;
             return self.batched_reads(&mut http, |r| self.time_range_at(g, c, r));
         }
-        let mut reader = self.source_reader(g, c, true)?;
+        // Only a file source is left here; `raw` would only matter for a URL.
+        let mut reader = self.source_reader(g, c, false, true)?;
         self.time_range_at(g, c, &mut reader)
     }
 
@@ -3341,9 +3342,11 @@ impl MdfIndex {
     }
 
     /// A byte-range reader over the attached source, with the conversion of
-    /// `(g, c)` resolved up front for URL sources.
-    fn source_reader(&self, g: usize, c: usize, raw: bool) -> Result<SourceReader, MdfError> {
-        let _ = (g, c, raw);
+    /// `(g, c)` resolved up front for URL sources (unless `raw`).
+    /// `with_master`: the read decodes the time axis (a signal, or a time
+    /// window search), so the master's conversion is primed too.
+    fn source_reader(&self, g: usize, c: usize, raw: bool, with_master: bool) -> Result<SourceReader, MdfError> {
+        let _ = (g, c, raw, with_master);
         match self.require_source()? {
             #[cfg(not(target_arch = "wasm32"))]
             Source::File(path) => Ok(SourceReader::File(MmapRangeReader { mmap: self.map_source_file(path)? })),
@@ -3354,7 +3357,7 @@ impl MdfIndex {
             #[cfg(feature = "http")]
             Source::Url(url) => {
                 let http = self.http_source(url)?;
-                Ok(SourceReader::Url(self.url_reader_with_conversion(http, g, c, raw)?))
+                Ok(SourceReader::Url(self.url_reader_with_conversion(http, g, c, raw, with_master)?))
             }
         }
     }
@@ -3379,6 +3382,11 @@ impl MdfIndex {
     /// each other, so this costs one request instead of one per block — then
     /// the cache switches to bypass mode so the bulk data is streamed directly
     /// (cached conversion bytes are still served from memory).
+    ///
+    /// A `raw` read skips the channel's conversion. `with_master` also primes
+    /// the group master's, for reads that decode the time axis through this
+    /// reader (windows, signals): otherwise a raw read would resolve it later
+    /// in bypass mode, one sequential request per block.
     #[cfg(feature = "http")]
     fn url_reader_with_conversion(
         &self,
@@ -3386,14 +3394,24 @@ impl MdfIndex {
         g: usize,
         c: usize,
         raw: bool,
+        with_master: bool,
     ) -> Result<CachingRangeReader<HttpRangeReader>, MdfError> {
         let mut cached = CachingRangeReader::with_chunk_size(http, 64 * 1024);
         if self.file_size > 0 {
             cached.set_known_size(self.file_size);
         }
-        let channel = &self.channel_groups[g].channels[c];
-        if !raw && channel.conversion.is_none() && channel.conversion_addr != 0 {
-            self.resolve_channel_conversion(g, c, &mut cached)?;
+        let mut targets = Vec::with_capacity(2);
+        if !raw {
+            targets.push((g, c));
+        }
+        if with_master {
+            targets.extend(self.master_location(g, c));
+        }
+        for (tg, tc) in targets {
+            let channel = &self.channel_groups[tg].channels[tc];
+            if channel.conversion.is_none() && channel.conversion_addr != 0 {
+                self.resolve_channel_conversion(tg, tc, &mut cached)?;
+            }
         }
         cached.set_bypass(true);
         Ok(cached)
@@ -3440,7 +3458,7 @@ impl MdfIndex {
             #[cfg(feature = "http")]
             Source::Url(url) => {
                 let http = self.http_source(url)?;
-                let mut cached = self.url_reader_with_conversion(http, g, c, raw)?;
+                let mut cached = self.url_reader_with_conversion(http, g, c, raw, false)?;
                 self.read_channel_values(g, c, raw, &mut cached)
             }
         }
@@ -3507,7 +3525,7 @@ impl MdfIndex {
             #[cfg(feature = "http")]
             Source::Url(url) => {
                 let http = self.http_source(url)?;
-                let mut cached = self.url_reader_with_conversion(http, g, c, raw)?;
+                let mut cached = self.url_reader_with_conversion(http, g, c, raw, false)?;
                 self.read_channel_values_as_f64(g, c, raw, &mut cached)
             }
         }

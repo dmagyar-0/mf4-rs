@@ -546,7 +546,7 @@ export class MdfIndex {
    */
   async read(name: string, options: ReadOptions = {}): Promise<Signal> {
     const window = wasmWindow(options);
-    const raw = options.raw === true;
+    const raw = window.raw === true;
     this.#requireChannel(name, options.group);
     const source = this.#requireSource(options);
     if (hasWindow(options)) {
@@ -572,7 +572,7 @@ export class MdfIndex {
    */
   async values(name: string, options: ReadOptions = {}): Promise<Float64Array> {
     const window = wasmWindow(options);
-    const raw = options.raw === true;
+    const raw = window.raw === true;
     this.#requireChannel(name, options.group);
     const source = this.#requireSource(options);
     if (hasWindow(options)) {

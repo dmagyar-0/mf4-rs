@@ -237,7 +237,7 @@ impl<'a> Channel<'a> {
 
         let all_invalid = self.block.flags & 0x01 != 0;
         let conv = if raw { None } else { self.block.conversion.as_ref() };
-        let has_conversion = !raw && conv.is_some_and(|c| c.cc_type != ConversionType::Identity);
+        let has_conversion = conv.is_some_and(|c| c.cc_type != ConversionType::Identity);
         let linear_coeffs = conv.and_then(|c| {
             if c.cc_type == ConversionType::Linear && c.cc_val.len() >= 2 {
                 Some((c.cc_val[0], c.cc_val[1]))
