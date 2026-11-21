@@ -1,3 +1,8 @@
+## v4.2.0 — 2026-11-21
+
+### Features
+- add read_many, column-file group lookups and HTTP retries (#102)
+
 ## v4.1.0 — 2026-11-20
 
 ### Features
