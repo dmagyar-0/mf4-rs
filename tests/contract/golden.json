@@ -278,6 +278,216 @@
       "record_count": 0.0
     }
   ],
+  "read_many": {
+    "": [],
+    "Speed,Blob,Speed start_time=1 end_time=2": [
+      {
+        "name": "Speed",
+        "timestamps": [
+          1.0,
+          1.5,
+          2.0
+        ],
+        "values": [
+          5.0,
+          7.0,
+          9.0
+        ]
+      },
+      {
+        "name": "Blob",
+        "timestamps": [
+          1.0,
+          1.5,
+          2.0
+        ],
+        "values": [
+          {
+            "bytes": [
+              2.0,
+              3.0
+            ]
+          },
+          {
+            "bytes": [
+              3.0,
+              4.0
+            ]
+          },
+          {
+            "bytes": [
+              4.0,
+              5.0
+            ]
+          }
+        ]
+      },
+      {
+        "name": "Speed",
+        "timestamps": [
+          1.0,
+          1.5,
+          2.0
+        ],
+        "values": [
+          5.0,
+          7.0,
+          9.0
+        ]
+      }
+    ],
+    "Speed,Gear raw": [
+      {
+        "name": "Speed",
+        "timestamps": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ],
+        "values": [
+          0.0,
+          1.0,
+          2.0,
+          3.0,
+          4.0,
+          5.0
+        ]
+      },
+      {
+        "name": "Gear",
+        "timestamps": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ],
+        "values": [
+          0.0,
+          1.0,
+          2.0,
+          0.0,
+          1.0,
+          2.0
+        ]
+      }
+    ],
+    "Speed,Gear,Time,Label": [
+      {
+        "name": "Speed",
+        "timestamps": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ],
+        "values": [
+          1.0,
+          3.0,
+          5.0,
+          7.0,
+          9.0,
+          11.0
+        ]
+      },
+      {
+        "name": "Gear",
+        "timestamps": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ],
+        "values": [
+          "N",
+          "D",
+          "?",
+          "N",
+          "D",
+          "?"
+        ]
+      },
+      {
+        "name": "Time",
+        "timestamps": [],
+        "values": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ]
+      },
+      {
+        "name": "Label",
+        "timestamps": [
+          0.0,
+          0.5,
+          1.0,
+          1.5,
+          2.0,
+          2.5
+        ],
+        "values": [
+          "L0",
+          "L1",
+          "L2",
+          "L3",
+          "L4",
+          "L5"
+        ]
+      }
+    ],
+    "Speed,Label,Count start_record=1 record_count=2": [
+      {
+        "name": "Speed",
+        "timestamps": [
+          0.5,
+          1.0
+        ],
+        "values": [
+          3.0,
+          5.0
+        ]
+      },
+      {
+        "name": "Label",
+        "timestamps": [
+          0.5,
+          1.0
+        ],
+        "values": [
+          "L1",
+          "L2"
+        ]
+      },
+      {
+        "name": "Count",
+        "timestamps": [],
+        "values": [
+          11.0,
+          12.0
+        ]
+      }
+    ],
+    "Speed,Nope": "error: channel not found",
+    "Value group=Empty start_time=0": [
+      {
+        "name": "Value",
+        "timestamps": [],
+        "values": []
+      }
+    ]
+  },
   "reads": {
     "Blob": {
       "read": {

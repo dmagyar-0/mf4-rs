@@ -12,7 +12,7 @@
     "Mdf": {
       "constructors": ["from_file", "from_bytes", "from_url"],
       "accessors": ["groups", "channel_names", "start_time_ns"],
-      "methods": ["group", "channel", "read", "values", "time_range", "conversion", "file_layout"],
+      "methods": ["group", "channel", "read", "read_many", "values", "time_range", "conversion", "file_layout"],
       "only": { "file_layout": ["rust", "python"] },
       "extra": {
         "rust": ["channel_groups", "find_channel"],
@@ -25,7 +25,7 @@
       "accessors": ["groups", "channel_names", "start_time_ns", "file_size", "source"],
       "methods": [
         "to_json", "save", "validate", "set_source",
-        "group", "channel", "read", "values", "time_range", "conversion",
+        "group", "channel", "read", "read_many", "values", "time_range", "conversion",
         "byte_ranges", "byte_ranges_for_records"
       ],
       "only": {},

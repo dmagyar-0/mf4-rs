@@ -4,7 +4,11 @@ use crate::block_layout::FileLayout;
 use crate::error::MdfError;
 use crate::parsing::mdf_file::MdfFile;
 use crate::signal::Signal;
-use crate::types::{slice_signal, ChannelInfo, ConversionInfo, GroupInfo, ReadOptions, TimeRange, Window};
+use crate::types::{
+    logical_group_members, merge_group_infos, slice_signal, ChannelInfo, ConversionInfo, GroupInfo, ReadOptions,
+    TimeRange, Window,
+};
+use std::collections::HashMap;
 
 #[derive(Debug)]
 /// Reader for a whole MDF 4 file (memory-mapped, or parsed from bytes).
@@ -16,7 +20,7 @@ use crate::types::{slice_signal, ChannelInfo, ConversionInfo, GroupInfo, ReadOpt
 /// |---|---|
 /// | open | [`from_file`](Self::from_file), [`from_bytes`](Self::from_bytes), [`from_url`](Self::from_url) |
 /// | metadata | [`groups`](Self::groups), [`group`](Self::group), [`channel`](Self::channel), [`channel_names`](Self::channel_names), [`start_time_ns`](Self::start_time_ns) |
-/// | data | [`read`](Self::read) → [`Signal`], [`values`](Self::values) → `Vec<f64>` |
+/// | data | [`read`](Self::read) → [`Signal`], [`read_many`](Self::read_many) → `Vec<Signal>`, [`values`](Self::values) → `Vec<f64>` |
 /// | inspection | [`time_range`](Self::time_range), [`conversion`](Self::conversion), [`file_layout`](Self::file_layout) |
 ///
 /// Everything is addressed by **name**. Only metadata is parsed up front;
@@ -75,13 +79,22 @@ impl Mdf {
     }
 
     /// Metadata of the first channel group named `name`, or `None`.
+    ///
+    /// In a column-oriented (MDF 4.2) file one source group is stored as one
+    /// group per signal plus a shared time group; this returns them merged
+    /// back into the source group (time channel first), so the answer matches
+    /// the source file's — also when the time group was shared with another
+    /// source group and carries that group's name.
     pub fn group(&self, name: &str) -> Result<Option<GroupInfo>, MdfError> {
-        for g in self.channel_groups() {
-            if g.name()?.as_deref() == Some(name) {
-                return Ok(Some(g.info()?));
-            }
-        }
-        Ok(None)
+        let groups = self.channel_groups();
+        let names = Self::group_names(&groups)?;
+        let Some(first) = names.iter().position(|n| n.as_deref() == Some(name)) else {
+            return Ok(None);
+        };
+        let channel_counts: Vec<usize> = groups.iter().map(|g| g.raw_channel_group().raw_channels.len()).collect();
+        let members = logical_group_members(&names, &Self::time_groups(&groups), &channel_counts, first);
+        let infos = members.iter().map(|&m| groups[m].info()).collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(merge_group_infos(groups[first].info()?, infos)))
     }
 
     /// Metadata of the first channel named `name`, or `None`. Pass `group` to
@@ -141,13 +154,70 @@ impl Mdf {
         self.read_impl(name, options.into().unwrap_or(&ReadOptions::default()))
     }
 
+    /// Read several channels at once, with the same `options` for all of
+    /// them: one [`Signal`] per name, in the order given.
+    ///
+    /// Equivalent to calling [`read`](Self::read) for each name, but a time
+    /// axis shared by several of the channels is decoded once (in a
+    /// column-oriented file every signal of a source group shares one).
+    /// Errors with [`MdfError::ChannelNotFound`] — before reading anything —
+    /// if any name is unknown.
+    pub fn read_many<'o, S: AsRef<str>>(
+        &self,
+        names: &[S],
+        options: impl Into<Option<&'o ReadOptions>>,
+    ) -> Result<Vec<Signal>, MdfError> {
+        let default = ReadOptions::default();
+        let options = options.into().unwrap_or(&default);
+        let window = options.window()?;
+        let located = names
+            .iter()
+            .map(|name| self.locate(name.as_ref(), options.group_name()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut axes = HashMap::new();
+        located
+            .iter()
+            .map(|(g, ci)| self.read_located(g, *ci, options.raw, window, &mut axes))
+            .collect()
+    }
+
     fn read_impl(&self, name: &str, options: &ReadOptions) -> Result<Signal, MdfError> {
         let window = options.window()?;
         let (g, ci) = self.locate(name, options.group_name())?;
-        let mut signal = g.read_at_as(ci, options.raw)?;
-        let channel = &g.channels()[ci];
+        self.read_located(&g, ci, options.raw, window, &mut HashMap::new())
+    }
+
+    /// Read channel `ci` of `g`. `axes` caches decoded time axes by master
+    /// block (keyed by its address), so `read_many` decodes each once.
+    fn read_located(
+        &self,
+        g: &ChannelGroup<'_>,
+        ci: usize,
+        raw: bool,
+        window: Window,
+        axes: &mut HashMap<usize, Vec<f64>>,
+    ) -> Result<Signal, MdfError> {
+        let channels = g.channels();
+        let channel = &channels[ci];
+        let values = channel.decoded_values_as(raw)?;
+        // First master wins (matches MdfIndex's master selection).
+        let timestamps = match g.master_channel() {
+            Some(m) if !std::ptr::eq(m.block(), channel.block()) => {
+                let key = m.block() as *const _ as usize;
+                match axes.get(&key) {
+                    Some(axis) => axis.clone(),
+                    None => {
+                        let axis = m.values()?;
+                        axes.insert(key, axis.clone());
+                        axis
+                    }
+                }
+            }
+            _ => Vec::new(),
+        };
+        let mut signal = Signal { name: channel.name()?.unwrap_or_default(), unit: channel.unit()?, timestamps, values };
         let is_master = channel.is_master();
-        if options.raw && is_master && matches!(window, Window::Time(..)) {
+        if raw && is_master && matches!(window, Window::Time(..)) {
             // The raw master's own values are not its time axis: search the
             // physical one (as `MdfIndex` does), carried as timestamps while
             // slicing and dropped afterwards.
@@ -240,18 +310,58 @@ impl Mdf {
 
     /// First `(group, channel position)` matching `name`. With `group`, every
     /// group carrying that name is searched (a column-oriented file has one
-    /// channel group per signal, all sharing the source group's name).
+    /// channel group per signal, all sharing the source group's name), then
+    /// the time groups they reference under another name — so the shared time
+    /// channel is found in every source group it serves, as in the source file.
     fn find(&self, name: &str, group: Option<&str>) -> Result<Option<(ChannelGroup<'_>, usize)>, MdfError> {
-        for g in self.channel_groups() {
-            if let Some(wanted) = group
-                && g.name()?.as_deref() != Some(wanted) {
-                    continue;
+        let mut groups = self.channel_groups();
+        let Some(wanted) = group else {
+            for (i, g) in groups.iter().enumerate() {
+                if let Some(ci) = g.position(name)? {
+                    return Ok(Some((groups.swap_remove(i), ci)));
                 }
-            if let Some(ci) = g.position(name)? {
-                return Ok(Some((g, ci)));
+            }
+            return Ok(None);
+        };
+        let names = Self::group_names(&groups)?;
+        let named: Vec<usize> = (0..groups.len()).filter(|&i| names[i].as_deref() == Some(wanted)).collect();
+        let time_groups = Self::time_groups(&groups);
+        let remote = named.iter().filter_map(|&i| time_groups[i]).filter(|&t| names[t].as_deref() != Some(wanted));
+        let candidates: Vec<usize> = named.iter().copied().chain(remote).collect();
+        for i in candidates {
+            if let Some(ci) = groups[i].position(name)? {
+                return Ok(Some((groups.swap_remove(i), ci)));
             }
         }
         Ok(None)
+    }
+
+    fn group_names(groups: &[ChannelGroup<'_>]) -> Result<Vec<Option<String>>, MdfError> {
+        groups.iter().map(ChannelGroup::name).collect()
+    }
+
+    /// For each group, the group holding its time axis: itself for a local
+    /// master, the referenced group for an MDF 4.2 remote master, `None` when
+    /// untimed.
+    fn time_groups(groups: &[ChannelGroup<'_>]) -> Vec<Option<usize>> {
+        let has_master = |g: &ChannelGroup<'_>| {
+            g.raw_channel_group().raw_channels.iter().any(|c| matches!(c.block.channel_type, 2 | 3))
+        };
+        (0..groups.len())
+            .map(|i| {
+                if has_master(&groups[i]) {
+                    return Some(i);
+                }
+                let target = groups[i].raw_channel_group().block.master_cg_addr;
+                if target == 0 {
+                    return None;
+                }
+                groups
+                    .iter()
+                    .position(|g| g.raw_channel_group().addr == target)
+                    .filter(|&m| m != i && has_master(&groups[m]))
+            })
+            .collect()
     }
 
     fn locate(&self, name: &str, group: Option<&str>) -> Result<(ChannelGroup<'_>, usize), MdfError> {

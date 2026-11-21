@@ -176,7 +176,15 @@ def test_readers_agree():
                     same_signal(reader.read(name, **window), mdf.read(name, **window))
                     np.testing.assert_array_equal(reader.values(name, **window), mdf.values(name, **window))
             same_signal(reader["Speed", "Body"], mdf.read("Speed", group="Body"))
-            for call in (reader.read, reader.values, reader.time_range, reader.conversion):
+            names = ["Speed", "Time", "Label", "Gear", "Speed"]
+            for window in WINDOWS:
+                many = reader.read_many(names, **window)
+                assert len(many) == len(names)
+                for name, signal in zip(names, many):
+                    same_signal(signal, mdf.read(name, **window))
+            assert reader.read_many([]) == []
+            for call in (reader.read, reader.values, reader.time_range, reader.conversion,
+                         lambda name: reader.read_many(["Speed", name])):
                 try:
                     call("Nope")
                 except mf4_rs.ChannelNotFoundError:
@@ -320,7 +328,8 @@ def build_scenario_file(path):
 
 
 def case_label(case):
-    parts = [case["name"]]
+    # read_many cases: the names joined by commas.
+    parts = [",".join(case["names"]) if "names" in case else case["name"]]
     for key in ("group", "start_time", "end_time", "start_record", "record_count", "raw"):
         if key in case:
             value = case[key]
@@ -386,6 +395,12 @@ def dump(reader):
             "read": guarded(lambda: signal_json(reader.read(case["name"], **options))),
             "values": guarded(lambda: floats(reader.values(case["name"], **options))),
         }
+    many = {}
+    for case in SCENARIO["read_many_cases"]:
+        options = {k: v for k, v in case.items() if k != "names"}
+        many[case_label(case)] = guarded(
+            lambda: [signal_json(s) for s in reader.read_many(case["names"], **options)]
+        )
     channels = {}
     for case in SCENARIO["channel_cases"]:
         name, group = case["name"], case.get("group")
@@ -401,6 +416,7 @@ def dump(reader):
         "channel_names": reader.channel_names,
         "groups": [info(g, "GroupInfo") for g in reader.groups],
         "reads": reads,
+        "read_many": many,
         "channels": channels,
     })
 

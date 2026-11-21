@@ -178,25 +178,14 @@ const CHANNELS: &[(&str, &str)] = &[
     ("Untimed", "Counter"),
 ];
 
-/// When Body's time axis is shared, its time channel *is* Engine's time
-/// group, so there is no `Body/Time` in the column file any more.
-fn shared_alias(g: &str, c: &str) -> Option<(&'static str, &'static str)> {
-    (g == "Body" && c == "Time").then_some(("Engine", "Time"))
-}
-
+// When Body's time axis is shared, the column file stores it once, in a
+// time group named "Engine"; `Body/Time` must still be found (via the
+// time group Body's signals reference), as in the source file.
 fn signals_via_mdf(path: &Path) -> Result<BTreeMap<String, Signal>, MdfError> {
     let mdf = Mdf::from_file(path.to_str().unwrap())?;
     let mut out = BTreeMap::new();
     for (g, c) in CHANNELS {
-        let sig = match mdf.read(c, &mf4_rs::ReadOptions::new().group(*g)) {
-            Ok(sig) => sig,
-            Err(MdfError::ChannelNotFound { .. }) => {
-                let (ag, ac) = shared_alias(g, c).unwrap_or_else(|| panic!("{g}/{c} missing in {}", path.display()));
-                mdf.read(ac, &mf4_rs::ReadOptions::new().group(ag))?
-            }
-            Err(e) => return Err(e),
-        };
-        out.insert(format!("{g}/{c}"), sig);
+        out.insert(format!("{g}/{c}"), mdf.read(c, &mf4_rs::ReadOptions::new().group(*g))?);
     }
     Ok(out)
 }
@@ -204,14 +193,24 @@ fn signals_via_mdf(path: &Path) -> Result<BTreeMap<String, Signal>, MdfError> {
 fn signals_via_index(index: &MdfIndex) -> Result<BTreeMap<String, Signal>, MdfError> {
     let mut out = BTreeMap::new();
     for (g, c) in CHANNELS {
-        let sig = match index.read(c, &mf4_rs::ReadOptions::new().group(*g)) {
-            Ok(sig) => sig,
-            Err(e) => {
-                let (ag, ac) = shared_alias(g, c).ok_or(e)?;
-                index.read(ac, &mf4_rs::ReadOptions::new().group(ag))?
-            }
-        };
-        out.insert(format!("{g}/{c}"), sig);
+        out.insert(format!("{g}/{c}"), index.read(c, &mf4_rs::ReadOptions::new().group(*g))?);
+    }
+    Ok(out)
+}
+
+/// `read_many` of every channel of each source group, keyed like
+/// [`signals_via_mdf`].
+fn signals_via_read_many(
+    read_many: impl Fn(&[&str], &mf4_rs::ReadOptions) -> Result<Vec<Signal>, MdfError>,
+) -> Result<BTreeMap<String, Signal>, MdfError> {
+    let mut out = BTreeMap::new();
+    for group in ["Engine", "Body", "Slow", "Untimed"] {
+        let names: Vec<&str> = CHANNELS.iter().filter(|(g, _)| *g == group).map(|(_, c)| *c).collect();
+        let signals = read_many(&names, &mf4_rs::ReadOptions::new().group(group))?;
+        assert_eq!(signals.len(), names.len());
+        for (c, sig) in names.iter().zip(signals) {
+            out.insert(format!("{group}/{c}"), sig);
+        }
     }
     Ok(out)
 }
@@ -274,6 +273,83 @@ fn column_file_reads_back_identically() -> Result<(), MdfError> {
     let mut reloaded = MdfIndex::from_json(&index.to_json()?)?;
     reloaded.set_source(f.column.to_str().unwrap());
     assert_same(&expected, &signals_via_index(&reloaded)?, "reloaded index");
+
+    // read_many gives the same signals, through every reader.
+    let mdf = Mdf::from_file(f.column.to_str().unwrap())?;
+    assert_same(&expected, &signals_via_read_many(|n, o| mdf.read_many(n, o))?, "Mdf::read_many");
+    assert_same(&expected, &signals_via_read_many(|n, o| reloaded.read_many(n, o))?, "MdfIndex::read_many");
+    let window = mf4_rs::ReadOptions::new().group("Engine").time(Some(10.0), Some(20.5));
+    let names = ["Speed", "Time", "Gear", "Speed"];
+    let many = reloaded.read_many(&names, &window)?;
+    for (name, sig) in names.iter().zip(&many) {
+        let one = mdf.read(name, &window)?;
+        assert_eq!((&sig.values, &sig.timestamps), (&one.values, &one.timestamps), "windowed read_many {name}");
+    }
+    assert_eq!(many[0].values.len(), 1051);
+    Ok(())
+}
+
+/// An untimed source group with several channels becomes untimed one-channel
+/// groups; `group(name)` merges them back into the source group.
+#[test]
+fn untimed_column_groups_match_the_source_group() -> Result<(), MdfError> {
+    let dir = tempfile::tempdir()?;
+    let (source, column) = (dir.path().join("u.mf4"), dir.path().join("u_col.mf4"));
+    let mut w = MdfWriter::new(source.to_str().unwrap())?;
+    w.init_mdf_file()?;
+    for name in ["U", "V"] {
+        let g = w.add_channel_group(Some(name))?;
+        w.add_int_channel(&g, &format!("{name}1"))?;
+        w.add_int_channel(&g, &format!("{name}2"))?;
+        w.start_data_block(&g)?;
+        for i in 0..50u64 {
+            w.write_record(&g, &[DecodedValue::UnsignedInteger(i), DecodedValue::UnsignedInteger(2 * i)])?;
+        }
+        w.finish_data_block(&g)?;
+    }
+    w.finalize()?;
+    to_column_oriented(&source, &column, &ColumnOptions::default())?;
+    let src = Mdf::from_file(source.to_str().unwrap())?;
+    let col = Mdf::from_file(column.to_str().unwrap())?;
+    let index = MdfIndex::from_file(column.to_str().unwrap())?;
+    assert_eq!(col.groups()?.len(), 4, "one group per signal");
+    for name in ["U", "V"] {
+        let expected = src.group(name)?.expect(name);
+        assert_eq!(expected.channel_names.len(), 2);
+        assert_eq!(col.group(name)?.as_ref(), Some(&expected), "Mdf group {name}");
+        assert_eq!(index.group(name)?.as_ref(), Some(&expected), "index group {name}");
+    }
+    let values = |m: &Mdf| -> Result<Vec<Vec<f64>>, MdfError> {
+        Ok(m.read_many(&["U1", "V2"], None)?.iter().map(|s| s.values_f64()).collect())
+    };
+    assert_eq!(values(&col)?, values(&src)?);
+    Ok(())
+}
+
+/// `group(name)` on a column file merges the per-signal groups (and the
+/// shared time group, whatever its name) back into the source group.
+#[test]
+fn column_groups_match_the_source_groups() -> Result<(), MdfError> {
+    for sharing in [true, false] {
+        let f = fixture(&ColumnOptions { share_identical_time: sharing, ..small_blocks() })?;
+        let source = Mdf::from_file(f.source.to_str().unwrap())?;
+        let column = Mdf::from_file(f.column.to_str().unwrap())?;
+        let index = MdfIndex::from_file(f.column.to_str().unwrap())?;
+        for name in ["Engine", "Body", "Slow", "Untimed"] {
+            let expected = source.group(name)?.expect(name);
+            assert_eq!(column.group(name)?.as_ref(), Some(&expected), "Mdf group {name} (sharing {sharing})");
+            assert_eq!(index.group(name)?.as_ref(), Some(&expected), "index group {name} (sharing {sharing})");
+            for channel in &expected.channel_names {
+                let want = source.channel(channel, Some(name))?;
+                assert_eq!(column.channel(channel, Some(name))?, want, "{name}/{channel}");
+                assert_eq!(index.channel(channel, Some(name))?, want, "{name}/{channel}");
+            }
+        }
+        assert_eq!(column.group("Nope")?, None);
+        assert!(column.channel("Pressure", Some("Engine"))?.is_none());
+        // Physical groups are still listed one by one.
+        assert!(column.groups()?.len() > source.groups()?.len());
+    }
     Ok(())
 }
 
@@ -1120,6 +1196,62 @@ mod http {
             };
             assert!(*n <= budget, "{name}: {n} requests (budget {budget})");
         }
+        Ok(())
+    }
+
+    /// `read_many` over a URL: the same signals as one-by-one reads, the
+    /// shared time axis fetched once instead of once per signal, all of a
+    /// round's ranges requested concurrently.
+    #[test]
+    fn url_read_many_fetches_each_time_axis_once() -> Result<(), MdfError> {
+        let f = fixture(&small_blocks())?;
+        let expected = signals_via_mdf(&f.source)?;
+        let server = serve(&f.column);
+        let mut index = MdfIndex::from_file(f.column.to_str().unwrap())?;
+        index.set_source(server.url.as_str());
+
+        let time_group = index.channel_groups.iter().find(|g| g.name.as_deref() == Some("Engine")).unwrap();
+        assert!(time_group.master_channel().is_some(), "the first Engine group is the time group");
+        let time_start = time_group.data_blocks[0].file_offset;
+        let time_fetches = || {
+            server.ranges.lock().unwrap().iter().filter(|&&(a, b)| a <= time_start && time_start <= b).count()
+        };
+        let fetched_bytes = || server.ranges.lock().unwrap().iter().map(|(a, b)| b - a + 1).sum::<u64>();
+
+        // Engine and Body share the time axis: one batch, one fetch of it.
+        let (requests, bytes) = (server.requests.load(Ordering::SeqCst), fetched_bytes());
+        let names = ["Speed", "Rpm", "Gear", "Flag", "Temp", "Name"];
+        let many = index.read_many(&names, None)?;
+        let used = server.requests.load(Ordering::SeqCst) - requests;
+        let many_bytes = fetched_bytes() - bytes;
+        for (name, sig) in names.iter().zip(&many) {
+            let group = if matches!(*name, "Temp" | "Name") { "Body" } else { "Engine" };
+            let e = &expected[&format!("{group}/{name}")];
+            assert_eq!((&sig.values, &sig.timestamps), (&e.values, &e.timestamps), "{name}");
+        }
+        assert_eq!(time_fetches(), 1, "time axis fetched once");
+        eprintln!("read_many of {} signals: {used} requests, {many_bytes} bytes", names.len());
+        // Conversion block, one round of data (+ the VLSD stream of Name).
+        assert!(used <= 6, "read_many took {used} requests");
+
+        // One by one, every read fetches the time axis again.
+        let bytes = fetched_bytes();
+        for name in names {
+            index.read(name, None)?;
+        }
+        assert_eq!(time_fetches(), 1 + names.len());
+        assert!(fetched_bytes() - bytes > many_bytes + 4 * 8 * FAST as u64);
+
+        // A time window: searched once for the shared axis.
+        let window = mf4_rs::ReadOptions::new().time(Some(10.0), Some(20.0));
+        let windowed = index.read_many(&names, &window)?;
+        let mdf = Mdf::from_file(f.source.to_str().unwrap())?;
+        for (name, sig) in names.iter().zip(&windowed) {
+            let group = if matches!(*name, "Temp" | "Name") { "Body" } else { "Engine" };
+            let e = mdf.read(name, &window.clone().group(group))?;
+            assert_eq!((&sig.values, &sig.timestamps), (&e.values, &e.timestamps), "window {name}");
+        }
+        assert!(matches!(index.read_many(&["Speed", "Nope"], None), Err(MdfError::ChannelNotFound { .. })));
         Ok(())
     }
 

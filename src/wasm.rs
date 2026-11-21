@@ -214,6 +214,15 @@ fn conversion_to_js(
     }
 }
 
+/// A JS array of `Signal` objects.
+fn signals_to_js(signals: Vec<Signal>) -> Result<JsValue, JsError> {
+    let array = js_sys::Array::new_with_length(signals.len() as u32);
+    for (i, signal) in signals.into_iter().enumerate() {
+        array.set(i as u32, signal_to_js(signal)?);
+    }
+    Ok(array.into())
+}
+
 /// Finish one step of a gap-driven read: `{ done: false, needed }` while the
 /// probing reader recorded misses, otherwise `{ done: true, [key]: value }`
 /// (or the read's error).
@@ -356,6 +365,15 @@ impl WasmMdf {
     pub fn read(&self, name: &str, group: Option<String>, window: JsValue) -> Result<JsValue, JsError> {
         let options = read_options(group, window)?;
         signal_to_js(self.mdf.read(name, &options).map_err(err_to_js)?)
+    }
+
+    /// Read several channels as an array of `Signal` objects, in order, with
+    /// the same `group` / `window` for all of them (a shared time axis is
+    /// decoded once).
+    #[wasm_bindgen(js_name = readMany)]
+    pub fn read_many(&self, names: Vec<String>, group: Option<String>, window: JsValue) -> Result<JsValue, JsError> {
+        let options = read_options(group, window)?;
+        signals_to_js(self.mdf.read_many(&names, &options).map_err(err_to_js)?)
     }
 
     /// `{ start, end }` of the group's master (time) channel, or `undefined`
@@ -592,6 +610,56 @@ impl WasmMdfIndex {
         serde_wasm_bindgen::to_value(&step).map_err(|e| JsError::new(&e.to_string()))
     }
 
+    /// `conversionRangesStep` for a whole `readMany` batch: the conversion
+    /// blocks every name needs (and, with `withMaster`, their time axes'),
+    /// each block once. Drive it with only the conversion fragments fetched
+    /// so far — never the data — so each call stays cheap.
+    #[wasm_bindgen(js_name = conversionRangesManyStep)]
+    pub fn conversion_ranges_many_step(
+        &self,
+        names: Vec<String>,
+        group: Option<String>,
+        with_master: bool,
+        ranges: JsValue,
+        fragments: JsValue,
+        raw: Option<bool>,
+    ) -> Result<JsValue, JsError> {
+        let targets = self.index.locate_all(&names, group.as_deref()).map_err(err_to_js)?;
+        let raw = raw.unwrap_or(false);
+        let mut wanted: Vec<(usize, usize)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (g, c) in targets {
+            let own = (!raw).then_some((g, c));
+            let master = if with_master { self.index.master_location(g, c) } else { None };
+            for (tg, tc) in own.into_iter().chain(master) {
+                let channel = &self.index.channel_groups[tg].channels[tc];
+                if channel.conversion.is_none() && channel.conversion_addr != 0 && seen.insert(channel.conversion_addr) {
+                    wanted.push((tg, tc));
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return serde_wasm_bindgen::to_value(&BuildStepJs { done: true, json: None, needed: None })
+                .map_err(|e| JsError::new(&e.to_string()));
+        }
+        let parsed = build_fragment_reader(&ranges, &fragments)?;
+        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: false };
+        for (tg, tc) in wanted {
+            let before = reader.misses.len();
+            if let Err(e) = self.index.resolve_channel_conversion(tg, tc, &mut reader) {
+                if reader.misses.len() == before {
+                    return Err(err_to_js(e));
+                }
+            }
+        }
+        let step = if reader.misses.is_empty() {
+            BuildStepJs { done: true, json: None, needed: None }
+        } else {
+            BuildStepJs { done: false, json: None, needed: Some(misses_to_needed(reader.misses)) }
+        };
+        serde_wasm_bindgen::to_value(&step).map_err(|e| JsError::new(&e.to_string()))
+    }
+
     /// Serialise the index to a JSON string.
     #[wasm_bindgen(js_name = toJson)]
     pub fn to_json(&self) -> Result<String, JsError> {
@@ -745,6 +813,34 @@ impl WasmMdfIndex {
         gap_step(reader.misses, result, "values", |values| {
             Ok(Float64Array::from(values.as_slice()).into())
         })
+    }
+
+    /// One step of reading several channels at once (`readMany`), from
+    /// caller-fetched fragments.
+    ///
+    /// `window` is as for `readWindowStep` (or `undefined` for whole
+    /// channels). Drive it like `readWindowStep`: each call returns
+    /// `{ done: false, needed: [[offset, length], ...] }` with the gaps of
+    /// **every** channel of the batch, until it finishes with
+    /// `{ done: true, signals }` (one `Signal` per name, in order). A time
+    /// axis shared by several channels is searched and decoded once. Throws
+    /// for an unknown name before reporting any gap.
+    #[wasm_bindgen(js_name = readManyStep)]
+    pub fn read_many_step(
+        &self,
+        names: Vec<String>,
+        group: Option<String>,
+        window: JsValue,
+        ranges: JsValue,
+        fragments: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let options = read_options(None, window)?;
+        let window = options.window().map_err(err_to_js)?;
+        let targets = self.index.locate_all(&names, group.as_deref()).map_err(err_to_js)?;
+        let parsed = build_fragment_reader(&ranges, &fragments)?;
+        let mut reader = RecordingRangeReader { store: &parsed.store, misses: Vec::new(), whole_request: true };
+        let result = self.index.read_many_at(&targets, window, options.raw, &mut reader);
+        gap_step(reader.misses, result, "signals", signals_to_js)
     }
 
     /// One step of `timeRange`: reads the first and last record of the time

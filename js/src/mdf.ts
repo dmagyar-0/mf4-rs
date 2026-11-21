@@ -104,6 +104,17 @@ export class Mdf {
   }
 
   /**
+   * Read several channels at once, with the same `options` for all of them:
+   * one `Signal` per name, in order — like calling {@link read} for each, but
+   * a time axis shared by several of the channels is decoded once. Throws
+   * `ChannelNotFoundError` if any name is unknown.
+   */
+  readMany(names: string[], options: ReadOptions = {}): Signal[] {
+    const window = wasmWindow(options);
+    return guard(() => this.inner.readMany(names, options.group, window) as Signal[]);
+  }
+
+  /**
    * Read a numeric channel as a plain `Float64Array` (no timestamps).
    * Conversions are applied unless `options.raw`; invalid and non-numeric
    * samples are `NaN`. `options` as for {@link read}.

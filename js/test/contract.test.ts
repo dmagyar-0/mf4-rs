@@ -171,6 +171,17 @@ test("type fields match the contract and every reader gives the same answers", a
         assert.deepEqual(Array.from(await reader.values(name, window)), Array.from(mdf.values(name, window)), what);
       }
     }
+    const names = ["Speed", "Time", "Label", "Gear", "Speed"];
+    for (const window of WINDOWS) {
+      const many = await reader.readMany(names, window);
+      assert.equal(many.length, names.length);
+      names.forEach((name, i) =>
+        assert.deepEqual(plain(many[i]!), plain(mdf.read(name, window)), `${label}: readMany ${name}`),
+      );
+      assert.deepEqual(mdf.readMany(names, window).map(plain), names.map((n) => plain(mdf.read(n, window))));
+    }
+    assert.deepEqual(await reader.readMany([]), []);
+    await assert.rejects(reader.readMany(["Speed", "Nope"]), ChannelNotFoundError);
     await assert.rejects(reader.read("Nope"), ChannelNotFoundError);
     await assert.rejects(reader.values("Nope", { group: "Body" }), ChannelNotFoundError);
     await assert.rejects(reader.timeRange("Nope"), ChannelNotFoundError);
@@ -180,6 +191,7 @@ test("type fields match the contract and every reader gives the same answers", a
     reader.dispose();
   }
   assert.throws(() => mdf.read("Nope"), ChannelNotFoundError);
+  assert.throws(() => mdf.readMany(["Speed", "Nope"]), ChannelNotFoundError);
   assert.throws(() => mdf.values("Nope", { group: "Body" }), ChannelNotFoundError);
   assert.throws(() => mdf.timeRange("Nope"), ChannelNotFoundError);
   assert.throws(() => mdf.conversion("Nope"), ChannelNotFoundError);
@@ -251,10 +263,12 @@ test("writeColumns matches writeRecord", () => {
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Case = { name: string; group?: string } & Record<string, Json | undefined>;
+type ManyCase = { names: string[]; group?: string } & Record<string, Json | undefined>;
 
 const contractDir = join(__dirname, "..", "..", "..", "tests", "contract");
 const scenario = JSON.parse(readFileSync(join(contractDir, "scenario.json"), "utf8")) as {
   read_cases: Case[];
+  read_many_cases: ManyCase[];
   channel_cases: Case[];
   write_cases: {
     channels: Record<string, string>;
@@ -306,15 +320,16 @@ function buildScenarioFile(): Uint8Array {
 
 const WINDOW_KEYS = ["group", "start_time", "end_time", "start_record", "record_count", "raw"] as const;
 
-function caseLabel(c: Case): string {
+function caseLabel(c: Case | ManyCase): string {
   // `1.0` prints as `1`, in every language; a flag prints as its bare name.
   const parts = WINDOW_KEYS.filter((k) => c[k] !== undefined && c[k] !== false).map((k) =>
     c[k] === true ? k : `${k}=${c[k]}`,
   );
-  return [c.name, ...parts].join(" ");
+  // read_many cases: the names joined by commas.
+  return [Array.isArray(c.names) ? (c.names as string[]).join(",") : (c as Case).name, ...parts].join(" ");
 }
 
-function caseOptions(c: Case): ReadOptions {
+function caseOptions(c: Case | ManyCase): ReadOptions {
   const options: Record<string, unknown> = {};
   for (const key of WINDOW_KEYS) {
     if (c[key] !== undefined) options[camel(key)] = c[key];
@@ -368,6 +383,7 @@ type AnyReader = {
   startTimeNs(): bigint | undefined;
   channel(name: string, group?: string | null): unknown;
   read(name: string, options?: ReadOptions): Signal | Promise<Signal>;
+  readMany(names: string[], options?: ReadOptions): Signal[] | Promise<Signal[]>;
   values(name: string, options?: ReadOptions): Float64Array | Promise<Float64Array>;
   timeRange(name: string, group?: string | null): unknown;
   conversion(name: string, group?: string | null): unknown;
@@ -381,6 +397,12 @@ async function dump(reader: AnyReader): Promise<Json> {
       read: await guarded(async () => signalJson(await reader.read(c.name, options))),
       values: await guarded(async () => floats(await reader.values(c.name, options))),
     };
+  }
+  const readMany: Record<string, unknown> = {};
+  for (const c of scenario.read_many_cases) {
+    readMany[caseLabel(c)] = await guarded(async () =>
+      (await reader.readMany(c.names, caseOptions(c))).map(signalJson),
+    );
   }
   const channels: Record<string, unknown> = {};
   for (const c of scenario.channel_cases) {
@@ -398,6 +420,7 @@ async function dump(reader: AnyReader): Promise<Json> {
     channelNames: reader.channelNames(),
     groups: reader.groups(),
     reads,
+    readMany,
     channels,
   });
 }
