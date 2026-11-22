@@ -150,8 +150,8 @@ The codebase is organized into distinct layers. The module structure is defined 
 
 ### 1. API Layer (`src/api/`, `src/types.rs`, `src/signal.rs`)
 - **High-level user-facing API** - what external users interact with. The contract types and classes are re-exported at the crate root (`use mf4_rs::{Mdf, MdfIndex, MdfWriter, ReadOptions, Signal, …}`).
-- `Mdf` (`mdf.rs`) - Whole-file reader; wraps `MdfFile`. Contract methods: `from_file` / `from_bytes` / `from_url` (`http` feature), `groups()`, `group(name)`, `channel(name, group)`, `channel_names()`, `start_time_ns()`, `read(name, options)`, `read_many(names, options)`, `values(name, options)`, `time_range(name, group)`, `conversion(name, group)`, `file_layout()`. Lookups with a group search **every** group carrying that name (column-oriented files have one group per signal, all named after the source group), then the time groups those reference under another name (a shared time axis carries only one source group's name). `group(name)` merges a column file's per-signal groups (and untimed one-channel groups of the same name) back into the source group (`types::logical_group_members` / `merge_group_infos`, shared with `MdfIndex`); `groups()` stays physical. `read_many` caches decoded time axes per master block.
-- `src/types.rs` - the contract's plain data types: `GroupInfo`, `ChannelInfo`, `ConversionInfo` (`From<&ConversionBlock>`), `TimeRange`, `ReadOptions` (builder: `.group()`, `.time()`, `.records()`, `.raw()` — skip the channel's conversion; timestamps and time windows stay physical), plus the crate-internal `Window` (validated `ReadOptions`), `resolve_records` and `slice_signal`. All bindings serialise these same structs.
+- `Mdf` (`mdf.rs`) - Whole-file reader; wraps `MdfFile`. Contract methods: `from_file` / `from_bytes` / `from_url` (`http` feature), `groups()`, `group(name)`, `channel(name, group)`, `channel_names()`, `start_time_ns()`, `read(name, options)`, `read_many(names, options)`, `values(name, options)`, `time_range(name, group)`, `conversion(name, group)`, `file_layout()`. Lookups with a group search **every** group carrying that name (column-oriented files have one group per signal, all named after the source group), then the time groups those reference under another name (a shared time axis carries only one source group's name). `group(name)` merges a column file's per-signal groups (and untimed one-channel groups of the same name) back into the source group (`types::logical_group_members` / `merge_group_infos`, shared with `MdfIndex`); `groups()` stays physical. Names are read once per file into a lookup table (`Lookup`: names by group, first channel by name, groups by name); an unreadable name block is re-read by the lookup that reaches it, so it still reports its error. Reads go through `Channel::prepare` → `PreparedChannel` (records located, VLSD stream located, conversion resolved once) and decode **only the records a window selects** (`Mdf::record_window`: a time window is searched on the master with `types::search_time_window`, probing single records, exactly as `MdfIndex` does); `time_range` decodes two records. `read_many` caches decoded time axes per master block and window.
+- `src/types.rs` - the contract's plain data types: `GroupInfo`, `ChannelInfo`, `ConversionInfo` (`From<&ConversionBlock>`), `TimeRange`, `ReadOptions` (builder: `.group()`, `.time()`, `.records()`, `.raw()` — skip the channel's conversion; timestamps and time windows stay physical), plus the crate-internal `Window` (validated `ReadOptions`), `resolve_records` and `search_time_window`. All bindings serialise these same structs.
 - `Signal` (`src/signal.rs`) - `{ name, unit, timestamps: Vec<f64>, values: Vec<Option<DecodedValue>> }`, with `values_f64()` / `has_timestamps()`.
 - Underneath the contract (Rust-only block access): `Mdf::channel_groups()` → `ChannelGroup` (`channel_group.rs`: `name()`, `comment()`, `source()`, `channels()`, `master_channel()` — local master, or the MDF 4.2 remote master via `cg_cg_master` — `read(name)`, `info()`) → `Channel` (`channel.rs`: `name()`, `unit()`, `comment()`, `source()`, `conversion()`, `decoded_values()` → `Vec<Option<DecodedValue>>`, `values()` → `Vec<f64>`, `info()`). `Mdf::find_channel(name, group)` returns a `Channel`.
 - All block-wrapper types carry lifetime `'a` tied to the memory-mapped file owned by `Mdf`
@@ -205,7 +205,8 @@ The codebase is organized into distinct layers. The module structure is defined 
 - `MdfFile` (`mdf_file.rs`) - Opens file with `memmap2::Mmap`, parses identification block (64 bytes), header block, then walks data group → channel group → channel linked lists
 - `RawDataGroup` (`raw_data_group.rs`) - Wraps `DataGroupBlock` + `Vec<RawChannelGroup>`; `data_blocks()` method transparently follows `##DT`/`##DV`/`##DL` chains
 - `RawChannelGroup` (`raw_channel_group.rs`) - Simple wrapper: `addr` (its `##CG` offset, for resolving remote-master links) + `ChannelGroupBlock` + `Vec<RawChannel>`
-- `RawChannel` (`raw_channel.rs`) - Wraps `ChannelBlock`; `records()` returns a boxed iterator that handles both fixed-size records and VLSD channels (channel type 1 with `##SD`/`##DL` chains)
+- `RawChannel` (`raw_channel.rs`) - Wraps `ChannelBlock`; `records()` returns a boxed iterator: one item per record — the whole fixed-size record, or for a VLSD channel the payload the record's offset points at. It can only hand out slices of the file, so a fixed-size record split between two data blocks is reported as an error (read through `Channel` / `Mdf` instead)
+- `record_stream.rs` (crate-private) - `RecordSections` (a channel group's data blocks as one stream of fixed-size records; **records split across `##DL` fragments are reassembled**; `RawDataGroup::record_sections`) and `VlsdStream` (a VLSD channel's `##SD` / `##DL`→`##SD` data as one virtual stream; `entry(offset)`). Used by `Channel`, `cut` and `merge`
 - `decoder.rs` - Core value decoding:
   - `DecodedValue` enum: `UnsignedInteger(u64)`, `SignedInteger(i64)`, `Float(f64)`, `String(String)`, `ByteArray(Vec<u8>)`, `MimeSample`, `MimeStream`, `Unknown`
   - `decode_channel_value()` - Legacy decode without validity checking
@@ -329,7 +330,7 @@ Conversions transform raw channel values to physical values. Supported types:
 - **Identity** (type 0): passthrough
 - **Linear** (type 1): `phys = cc_val[0] + cc_val[1] * raw`
 - **Rational** (type 2): `phys = (P1*X² + P2*X + P3) / (P4*X² + P5*X + P6)` using 6 coefficients
-- **Algebraic** (type 3): formula string evaluated via `meval` with variable `X`
+- **Algebraic** (type 3): formula string evaluated via `meval` with variable `X` (`X1` accepted); parsed once per thread and cached (`linear::eval_formula`)
 - **Table lookups** (types 4-6): interpolated, non-interpolated, and range-based
 - **Text conversions** (types 7-11): value-to-text, range-to-text, text-to-value, text-to-text, bitfield
 
@@ -339,7 +340,7 @@ Conversions can be chained (one conversion's cc_ref points to another `##CC` blo
 - Default/fallback conversions (last cc_ref entry for certain types like RangeToText)
 
 ### VLSD (Variable-Length Signal Data)
-Channels with `channel_type == 1` and a non-zero `data` field store variable-length values in `##SD` (SignalDataBlock) or `##DL`→`##SD` chains. Each VLSD entry is `[u32 length][value bytes]`. The `RawChannel::records()` method transparently handles this via a stateful `from_fn` iterator.
+Channels with `channel_type == 1` and a non-zero `data` field store variable-length values in `##SD` (SignalDataBlock) or `##DL`→`##SD` chains. Each VLSD entry is `[u32 length][value bytes]`; each record's fixed-length field (64 bits) holds the offset of its entry in the virtual stream. Readers **follow that offset** (entries may be shared, reordered, or present for invalid records) and honour per-record invalidation bits — `Mdf` (`VlsdStream`), `RawChannel::records()` and `MdfIndex` alike.
 
 ## Important Implementation Notes
 
@@ -368,6 +369,8 @@ Channels with `channel_type == 1` and a non-zero `data` field store variable-len
 - `ByteRangeReader` trait allows plugging in HTTP, S3, or other data sources
 - VLSD channels (`channel_type == 1`) are readable through the index: each channel's `##SD` fragment chain is captured at build time in `IndexedChannel.vlsd_data_blocks`, and `read()` / `values()` resolve each record's inline 8-byte offset into that stream. `byte_ranges()` still refuses VLSD channels (a static range cannot express the offset indirection). Old JSON indexes without `vlsd_data_blocks` load fine but error on VLSD reads with a "rebuild the index" message.
 - Compressed blocks (`##DZ`) are not yet supported in the index reader
+- Local and range-reader builds share one data-block walk (`extract_data_blocks_via_reader`; local builds pass a `BorrowedSliceReader` and never derive fragment sizes): bounds-checked, NIL `##DL` links skipped, cyclic chains refused. The metadata walk (`reader_walk.rs`) refuses cyclic `##DG`/`##CG`/`##CN` chains too — a looping chain must never be walked until memory runs out
+- The index reader still refuses records that span data-block fragments ("record spans data block fragments"); `Mdf` reassembles them
 - `from_range_reader` does **not** read fragment headers of an equal-length `##DL` reached directly from a DG when `cycles × record size` is consistent with the list and the file size (`derive_equal_length_fragments`); the read path verifies the in-span headers it fetches. This is what keeps a column-oriented index build inside the metadata prefix
 - Reader-based value reads go through `for_each_data_section`, which coalesces physically adjacent blocks (≤7 bytes padding apart, ≤64 MiB per request) into one `read_range` — one request per contiguous signal. Keep new read paths on it
 - `locate_in(group, name)` searches every group with that name (column files repeat group names), then the time groups they reference (`time_group`)
@@ -377,7 +380,7 @@ Channels with `channel_type == 1` and a non-zero `data` field store variable-len
 - URL time windows and `time_range` go through `MdfIndex::batched_reads`: the search runs against a `RecordingRangeReader` (`src/fragments.rs`, shared with the wasm bindings), every gap of a round is fetched concurrently (`HttpRangeReader::read_ranges_parallel`, up to `MAX_PARALLEL_REQUESTS`), then the search re-runs — the native twin of the TS gap loop. Keep new multi-probe URL reads on it
 - All `HttpRangeReader`s share one process-wide `ureq::Agent` (`shared_http_agent`), so connections stay alive across `read()` calls; don't build agents per call
 - Reads check the source against the index: `map_source_file` / `http_source` refuse a file or URL whose size (file length / every response's `Content-Range` total) differs from `file_size` with `InvalidArgument` ("does not match the index"). The TS `MdfIndex` does the same via `RangeSource.knownSize()`
-- The time-window search is `types::search_time_window`, shared by `Mdf` (`slice_signal`) and `MdfIndex` so both select identical records; it refuses a time axis whose probed values go backwards (`InvalidArgument`, "not monotonic")
+- The time-window search is `types::search_time_window`, shared by `Mdf` (`record_window`) and `MdfIndex` so both select identical records; it refuses a time axis whose probed values go backwards (`InvalidArgument`, "not monotonic")
 - VLSD window reads (`read_vlsd_window_values`) fetch the window's offsets and only the slice of the `##SD` stream they point into; full reads still fetch the whole stream
 - Rust HTTP tests in `tests/column.rs` use a thread-per-connection `std::net` server: tiny_http's fixed pool strands concurrently opened keep-alive connections, which hangs parallel range requests
 
@@ -491,7 +494,7 @@ asammdf-built sources (incl. a VLSD string and a linear conversion) → `to_colu
 6. **Module declarations** - `api` and `parsing` modules are declared inline in `lib.rs`; add new modules there
 10. **API drift** - never change the public surface of one language alone; see *Cross-Language API Contract* at the top
 7. **Conversion resolution** - When creating indexes, conversions must be resolved with the file's mmap available; after serialization, they work without file data
-8. **Data block splitting** - Don't assume a single DT block per channel group; the writer may create multiple fragments linked by a DL block
+8. **Data block splitting** - Don't assume a single DT block per channel group; the writer may create multiple fragments linked by a DL block, and other writers may split a record across two fragments. Iterate records through `RecordSections::for_each` (in-memory readers), never block by block
 9. **Record ID** - Many simple files use `record_id_len = 0`, but the code must handle non-zero values (used when multiple channel groups share a data group)
 
 ## Comparison with asammdf (Python)
