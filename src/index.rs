@@ -1505,74 +1505,14 @@ impl MdfIndex {
         }
     }
 
-    /// Extract data block information from a channel group
+    /// Extract data block information from a channel group.
+    ///
+    /// The same bounds-checked, cycle-checked walk as a range-reader build
+    /// (over the in-memory file), reading every fragment header: a
+    /// truncated file is an error, not a panic.
     fn extract_data_blocks(group: &crate::api::channel_group::ChannelGroup) -> Result<Vec<DataBlockInfo>, MdfError> {
-        let mut data_blocks = Vec::new();
-        let raw_data_group = group.raw_data_group();
-        let mmap = group.mmap();
-        
-        // Start at the group's primary data pointer
-        let mut current_block_address = raw_data_group.block.data_block_addr;
-        while current_block_address != 0 {
-            let byte_offset = current_block_address as usize;
-
-            // Read the block header
-            let block_header = crate::blocks::common::BlockHeader::from_bytes(&mmap[byte_offset..byte_offset + 24])?;
-
-            match block_header.id.as_str() {
-                "##DT" | "##DV" => {
-                    // Single contiguous DataBlock
-                    let data_block_info = DataBlockInfo {
-                        file_offset: current_block_address,
-                        size: block_header.block_len,
-                        is_compressed: false,
-                    };
-                    data_blocks.push(data_block_info);
-                    // No list to follow, we're done
-                    current_block_address = 0;
-                }
-                "##DZ" => {
-                    // Compressed data block  
-                    let data_block_info = DataBlockInfo {
-                        file_offset: current_block_address,
-                        size: block_header.block_len,
-                        is_compressed: true,
-                    };
-                    data_blocks.push(data_block_info);
-                    current_block_address = 0;
-                }
-                "##DL" => {
-                    // Fragmented list of data blocks
-                    let data_list_block = crate::blocks::data_list_block::DataListBlock::from_bytes(&mmap[byte_offset..])?;
-
-                    // Parse each fragment in this list
-                    for &fragment_address in &data_list_block.data_links {
-                        let fragment_offset = fragment_address as usize;
-                        let fragment_header = crate::blocks::common::BlockHeader::from_bytes(&mmap[fragment_offset..fragment_offset + 24])?;
-                        
-                        let is_compressed = fragment_header.id == "##DZ";
-                        let data_block_info = DataBlockInfo {
-                            file_offset: fragment_address,
-                            size: fragment_header.block_len,
-                            is_compressed,
-                        };
-                        data_blocks.push(data_block_info);
-                    }
-
-                    // Move to the next DLBLOCK in the chain (0 = end)
-                    current_block_address = data_list_block.next;
-                }
-
-                unexpected_id => {
-                    return Err(MdfError::BlockIDError {
-                        actual: unexpected_id.to_string(),
-                        expected: "##DT / ##DV / ##DL / ##DZ".to_string(),
-                    });
-                }
-            }
-        }
-        
-        Ok(data_blocks)
+        let mut reader = BorrowedSliceReader { data: group.mmap() };
+        Self::extract_data_blocks_via_reader(&mut reader, group.raw_data_group().block.data_block_addr, None, 0)
     }
 
     /// Create an index from an in-memory MDF byte buffer.
@@ -1740,8 +1680,15 @@ impl MdfIndex {
         }
 
         let mut current_block_address = data_block_addr;
+        let mut visited = std::collections::HashSet::new();
 
         while current_block_address != 0 {
+            if !visited.insert(current_block_address) {
+                return Err(MdfError::BlockLinkError(format!(
+                    "cycle detected in data block chain at address {:#x}",
+                    current_block_address
+                )));
+            }
             let header_bytes = probe_read!(current_block_address, 24);
             let block_header =
                 crate::blocks::common::BlockHeader::from_bytes(&header_bytes)?;
@@ -1779,6 +1726,9 @@ impl MdfIndex {
                         }
 
                     for &fragment_address in &data_list_block.data_links {
+                        if fragment_address == 0 {
+                            continue; // NIL link (skipped by the in-memory reader too)
+                        }
                         let frag_header_bytes = probe_read!(fragment_address, 24);
                         let fragment_header = crate::blocks::common::BlockHeader::from_bytes(
                             &frag_header_bytes,
@@ -2527,7 +2477,7 @@ impl MdfIndex {
     ) -> Result<(u64, u64), MdfError> {
         let (group, channel) = self.group_and_channel(g, c)?;
         let Some((mg, m)) = self.time_axis_location(g, c) else {
-            // Same rule as the in-memory reader (`types::slice_signal`): an
+            // Same rule as the in-memory reader (`Mdf::record_window`): an
             // empty group selects nothing, otherwise a master is required.
             if group.record_count == 0 {
                 return Ok((0, 0));

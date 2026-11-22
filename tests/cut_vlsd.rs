@@ -19,8 +19,8 @@ fn cut_preserves_vlsd_byte_channel() -> Result<(), MdfError> {
     }
 
     // Build source: time (f64 master) + VLSD ByteArray channel. The parent
-    // record reserves 8 bytes for the VLSD slot (we write zeros there; the
-    // library iterates SD entries sequentially regardless of slot value).
+    // record's 8-byte VLSD slot holds the offset of the record's entry in
+    // the ##SD stream (readers follow it to find the payload).
     let mut writer = MdfWriter::new(input.to_str().unwrap())?;
     writer.init_mdf_file()?;
     let cg_id = writer.add_channel_group_with(None, |_| {})?;
@@ -38,8 +38,8 @@ fn cut_preserves_vlsd_byte_channel() -> Result<(), MdfError> {
     })?;
 
     // Open the parent DT block and the VLSD ##SD chain, then write 10
-    // records: time + 8 zero bytes (VLSD slot) and one variable-length
-    // payload per record.
+    // records: time + the VLSD slot (offset of the entry) and one
+    // variable-length payload per record.
     writer.start_data_block_for_cg_raw(
         &cg_id,
         /* record_id_len */ 0,
@@ -52,12 +52,14 @@ fn cut_preserves_vlsd_byte_channel() -> Result<(), MdfError> {
         .map(|i| format!("event-{}-payload", i).into_bytes())
         .collect();
 
+    let mut offset = 0u64;
     for i in 0..10u64 {
         let mut record = Vec::with_capacity(16);
         record.extend_from_slice(&(i as f64 * 0.1).to_le_bytes());
-        record.extend_from_slice(&[0u8; 8]); // VLSD inline slot
+        record.extend_from_slice(&offset.to_le_bytes()); // VLSD inline slot
         writer.write_raw_record(&cg_id, &record)?;
         writer.write_signal_data(&vlsd_id, &payloads[i as usize])?;
+        offset += 4 + payloads[i as usize].len() as u64;
     }
     writer.finish_signal_data_block(&vlsd_id)?;
     writer.finish_data_block(&cg_id)?;
@@ -287,12 +289,14 @@ fn cut_preserves_empty_vlsd_payloads() -> Result<(), MdfError> {
     let payloads: Vec<Vec<u8>> = (0..6u64)
         .map(|i| if i == 1 || i == 3 { Vec::new() } else { vec![i as u8; (i + 1) as usize] })
         .collect();
+    let mut offset = 0u64;
     for i in 0..6u64 {
         let mut record = Vec::with_capacity(16);
         record.extend_from_slice(&(i as f64 * 0.1).to_le_bytes());
-        record.extend_from_slice(&[0u8; 8]);
+        record.extend_from_slice(&offset.to_le_bytes()); // VLSD inline slot
         writer.write_raw_record(&cg_id, &record)?;
         writer.write_signal_data(&vlsd_id, &payloads[i as usize])?;
+        offset += 4 + payloads[i as usize].len() as u64;
     }
     writer.finish_signal_data_block(&vlsd_id)?;
     writer.finish_data_block(&cg_id)?;

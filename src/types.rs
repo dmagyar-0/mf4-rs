@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::blocks::conversion::ConversionBlock;
 use crate::error::MdfError;
-use crate::signal::Signal;
 
 /// Metadata of one channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,8 +78,8 @@ impl GroupInfo {
 /// of the same name, which are merged too (`channel_counts[i]` is the number
 /// of channels of group `i`). A row-oriented group (local master, or untimed
 /// with several channels) is just itself.
-pub(crate) fn logical_group_members(
-    names: &[Option<String>],
+pub(crate) fn logical_group_members<S: PartialEq>(
+    names: &[S],
     time_groups: &[Option<usize>],
     channel_counts: &[usize],
     first: usize,
@@ -329,53 +328,6 @@ pub(crate) fn resolve_records(start: u64, count: Option<u64>, total: u64) -> Res
     }
 }
 
-/// Slice an already decoded [`Signal`] to a window (the in-memory reader's
-/// path; the index fetches only the window's bytes instead).
-///
-/// A time window searches the signal's time axis: its `timestamps`, or its own
-/// values when it is the master (`is_master`).
-pub(crate) fn slice_signal(mut signal: Signal, window: Window, is_master: bool) -> Result<Signal, MdfError> {
-    // A (malformed) file may give the master a different record count than
-    // the channel; only the records both have can be selected.
-    let total = if signal.timestamps.is_empty() {
-        signal.values.len()
-    } else {
-        signal.values.len().min(signal.timestamps.len())
-    };
-    let (start, count) = match window {
-        Window::All => return Ok(signal),
-        Window::Records(start, count) => resolve_records(start, count, total as u64)?,
-        Window::Time(t0, t1) => {
-            let own_values;
-            let axis: &[f64] = if !signal.timestamps.is_empty() {
-                &signal.timestamps[..total]
-            } else if is_master {
-                own_values = signal.values_f64();
-                &own_values
-            } else if signal.values.is_empty() {
-                &[]
-            } else {
-                return Err(MdfError::InvalidArgument(format!(
-                    "channel '{}' has no master (time) channel; cannot select by time",
-                    signal.name
-                )));
-            };
-            // The same search the index runs over its source, so `Mdf` and
-            // `MdfIndex` select exactly the same records (and reject the same
-            // non-monotonic time axes).
-            search_time_window(axis.len() as u64, t0, t1, |i| Ok(axis[i as usize]))?
-        }
-    };
-    let (s, e) = (start as usize, (start + count) as usize);
-    signal.values.truncate(e);
-    signal.values.drain(..s);
-    if !signal.timestamps.is_empty() {
-        signal.timestamps.truncate(e);
-        signal.timestamps.drain(..s);
-    }
-    Ok(signal)
-}
-
 /// Records probed per round of [`search_time_window`].
 const TIME_SEARCH_FANOUT: u64 = 16;
 
@@ -393,7 +345,7 @@ const TIME_SEARCH_FANOUT: u64 = 16;
 ///
 /// Both bounds' probes of a round are attempted before the first error is
 /// returned, so a probing reader (the batched / wasm fragment drivers)
-/// records every gap of a round in one pass. `Mdf` (whole axis in memory) and
+/// records every gap of a round in one pass. `Mdf` (probes decoded from memory) and
 /// `MdfIndex` (probes fetched from the source) share this function, so they
 /// select identical records.
 pub(crate) fn search_time_window(

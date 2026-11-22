@@ -27,7 +27,10 @@ fn put_u64(b: &mut [u8], o: usize, v: u64) {
 
 /// Two-channel file (`Time`, `Val`) as bytes.
 fn file_bytes() -> Vec<u8> {
-    let path = tmp("source.mf4");
+    // Tests run in parallel: each call writes its own file.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = tmp(&format!("source_{}_{n}.mf4", std::process::id()));
     let mut w = MdfWriter::new(&path).unwrap();
     w.init_mdf_file().unwrap();
     let g = w.add_channel_group(Some("G")).unwrap();

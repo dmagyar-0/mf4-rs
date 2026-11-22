@@ -67,6 +67,32 @@ impl BlockParse<'_> for ConversionBlock {
 
         let header = Self::parse_header(bytes)?;
 
+        // The links and the fixed 8-byte data prefix (type, precision, flags,
+        // counts) must be present before anything is read or allocated: a
+        // short buffer or a forged link count must be an error, not a panic.
+        let fixed_len = usize::try_from(header.links_nr)
+            .ok()
+            .filter(|&links| links >= 4)
+            .and_then(|links| links.checked_mul(8))
+            .and_then(|l| l.checked_add(24 + 8));
+        match fixed_len {
+            Some(len) if bytes.len() >= len => {}
+            Some(len) => {
+                return Err(MdfError::TooShortBuffer {
+                    actual: bytes.len(),
+                    expected: len,
+                    file: file!(),
+                    line: line!(),
+                })
+            }
+            None => {
+                return Err(MdfError::BlockSerializationError(format!(
+                    "##CC block declares {} links (at least 4 are required)",
+                    header.links_nr
+                )))
+            }
+        }
+
         let mut offset = 24;
 
         // Fixed links

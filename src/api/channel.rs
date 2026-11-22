@@ -1,11 +1,15 @@
+use std::borrow::Cow;
+
 use crate::error::MdfError;
 use crate::blocks::channel_block::ChannelBlock;
-use crate::blocks::conversion::ConversionType;
-use crate::parsing::decoder::{ DecodedValue, decode_channel_value, decode_channel_value_with_validity, decode_f64_from_record, check_value_validity };
+use crate::blocks::conversion::{ConversionBlock, ConversionType};
+use crate::parsing::decoder::{ DecodedValue, decode_channel_value, decode_f64_from_record, check_value_validity, vlsd_offset };
 use crate::parsing::raw_channel_group::RawChannelGroup;
 use crate::parsing::raw_data_group::RawDataGroup;
 use crate::parsing::raw_channel::RawChannel;
+use crate::parsing::record_stream::{RecordSections, VlsdStream};
 use crate::parsing::source_info::SourceInfo;
+use crate::signal::decoded_opt_to_f64;
 use crate::blocks::common::read_string_block;
 
 /// High level handle for a single channel within a group.
@@ -16,6 +20,7 @@ pub struct Channel<'a> {
     block:          &'a ChannelBlock,
     raw_data_group:   &'a RawDataGroup,
     raw_channel_group:     &'a RawChannelGroup,
+    #[allow(dead_code)] // kept for `Channel::new`'s signature; records are read via the group
     raw_channel:    &'a RawChannel,
     mmap:           &'a [u8],
 }
@@ -104,111 +109,11 @@ impl<'a> Channel<'a> {
         self.decoded_values_as(false)
     }
 
-    /// The channel's conversion applied to `value`, or `value` unchanged when
-    /// `raw` (the stored value is wanted).
-    fn physical(&self, value: DecodedValue, raw: bool) -> Result<DecodedValue, MdfError> {
-        if raw {
-            Ok(value)
-        } else {
-            self.block.apply_conversion_value(value, self.mmap)
-        }
-    }
-
     /// [`decoded_values`](Self::decoded_values), or the stored values without
     /// the conversion when `raw`.
     pub(crate) fn decoded_values_as(&self, raw: bool) -> Result<Vec<Option<DecodedValue>>, MdfError> {
-        let record_id_len = self.raw_data_group.block.record_id_len as usize;
-        let cg_data_bytes = self.raw_channel_group.block.samples_byte_nr;
-        let invalidation_bytes_nr = self.raw_channel_group.block.invalidation_bytes_nr;
-        let capacity = self.raw_channel_group.block.cycles_nr as usize;
-        let mut out = Vec::with_capacity(capacity);
-
-        // cn_flags bit 0: all values invalid, regardless of invalidation bytes
-        let all_invalid = self.block.flags & 0x01 != 0;
-
-        // Virtual channels (cn_type 3 master / 6 data) store no bytes: the
-        // raw value is the record index.
-        if matches!(self.block.channel_type, 3 | 6) {
-            for i in 0..self.raw_channel_group.block.cycles_nr {
-                out.push(Some(self.physical(DecodedValue::UnsignedInteger(i), raw)?));
-            }
-            return Ok(out);
-        }
-
-        // VLSD channels must use the boxed iterator path. The iterator yields
-        // the variable-length payload, not the fixed record, so per-record
-        // invalidation bits cannot be checked here — only the all-invalid flag.
-        if self.block.channel_type == 1 && self.block.data != 0 {
-            let records_iter = self
-                .raw_channel
-                .records(self.raw_data_group, self.raw_channel_group, self.mmap)?;
-            for rec_res in records_iter {
-                let rec = rec_res?;
-                if all_invalid {
-                    out.push(None);
-                } else if let Some(decoded) = decode_channel_value(rec, record_id_len, self.block) {
-                    let phys = self.physical(decoded, raw)?;
-                    out.push(Some(phys));
-                } else {
-                    out.push(None);
-                }
-            }
-            return Ok(out);
-        }
-
-        // Fast path: iterate over data blocks directly without Box<dyn Iterator>
-        let sample_byte_len = cg_data_bytes as usize;
-        let invalidation_bytes = invalidation_bytes_nr as usize;
-        let record_size = record_id_len + sample_byte_len + invalidation_bytes;
-
-        if record_size == 0 {
-            return Ok(out);
-        }
-
-        let blocks = self.raw_data_group.data_blocks(self.mmap)?;
-
-        if invalidation_bytes_nr == 0 && !all_invalid {
-            // Fast path: no invalidation bytes and no all-invalid flag
-            for data_block in &blocks {
-                let bytes = data_block.data;
-                let valid_len = (bytes.len() / record_size) * record_size;
-                let mut offset = 0;
-                while offset + record_size <= valid_len {
-                    let rec = &bytes[offset..offset + record_size];
-                    if let Some(decoded) = decode_channel_value(rec, record_id_len, self.block) {
-                        let phys = self.physical(decoded, raw)?;
-                        out.push(Some(phys));
-                    } else {
-                        out.push(None);
-                    }
-                    offset += record_size;
-                }
-            }
-        } else {
-            // Slow path: must check invalidation flags/bits per record
-            for data_block in &blocks {
-                let bytes = data_block.data;
-                let valid_len = (bytes.len() / record_size) * record_size;
-                let mut offset = 0;
-                while offset + record_size <= valid_len {
-                    let rec = &bytes[offset..offset + record_size];
-                    if let Some(decoded) = decode_channel_value_with_validity(
-                        rec, record_id_len, cg_data_bytes, self.block
-                    ) {
-                        if decoded.is_valid {
-                            let phys = self.physical(decoded.value, raw)?;
-                            out.push(Some(phys));
-                        } else {
-                            out.push(None);
-                        }
-                    } else {
-                        out.push(None);
-                    }
-                    offset += record_size;
-                }
-            }
-        }
-        Ok(out)
+        let prepared = self.prepare(raw)?;
+        prepared.decoded(0, prepared.record_count())
     }
 
     /// Decode all samples as **physical** f64 values.
@@ -226,97 +131,207 @@ impl<'a> Channel<'a> {
     /// [`values`](Self::values), or the stored values without the conversion
     /// when `raw`.
     pub(crate) fn values_as(&self, raw: bool) -> Result<Vec<f64>, MdfError> {
-        let record_id_len = self.raw_data_group.block.record_id_len as usize;
-        let cg_data_bytes = self.raw_channel_group.block.samples_byte_nr;
-        let capacity = self.raw_channel_group.block.cycles_nr as usize;
-        let mut out = Vec::with_capacity(capacity);
+        let prepared = self.prepare(raw)?;
+        prepared.values(0, prepared.record_count())
+    }
 
-        if matches!(self.block.channel_type, 3 | 6) {
-            return Ok(self.decoded_values_as(raw)?.iter().map(crate::signal::decoded_opt_to_f64).collect());
-        }
-
-        let all_invalid = self.block.flags & 0x01 != 0;
-        let conv = if raw { None } else { self.block.conversion.as_ref() };
-        let has_conversion = conv.is_some_and(|c| c.cc_type != ConversionType::Identity);
-        let linear_coeffs = conv.and_then(|c| {
-            if c.cc_type == ConversionType::Linear && c.cc_val.len() >= 2 {
-                Some((c.cc_val[0], c.cc_val[1]))
+    /// Locate this channel's records (and, for a VLSD channel, its signal
+    /// data) and resolve its conversion — unless `raw` — so that any number
+    /// of record windows can then be decoded without repeating that work.
+    pub(crate) fn prepare(&self, raw: bool) -> Result<PreparedChannel<'a>, MdfError> {
+        let block = self.block;
+        let records = if matches!(block.channel_type, 3 | 6) {
+            // Virtual channels store no bytes: the raw value is the record index.
+            Records::Virtual(self.raw_channel_group.block.cycles_nr)
+        } else {
+            let sections = self.raw_data_group.record_sections(self.raw_channel_group, self.mmap)?;
+            if block.channel_type == 1 && block.data != 0 {
+                Records::Vlsd(sections, VlsdStream::new(self.mmap, block.data)?)
             } else {
-                None
+                Records::Fixed(sections)
             }
-        });
-
-        // Applies conversion to one raw record slice, returning the physical f64.
-        let convert_record = |rec: &[u8], out: &mut Vec<f64>| -> Result<(), MdfError> {
-            if let Some((a, b)) = linear_coeffs {
-                let stored = decode_f64_from_record(rec, record_id_len, self.block);
-                out.push(a + b * stored);
-            } else if has_conversion {
-                if let Some(decoded) = decode_channel_value(rec, record_id_len, self.block) {
-                    match self.block.apply_conversion_value(decoded, self.mmap)? {
-                        DecodedValue::Float(v) => out.push(v),
-                        DecodedValue::UnsignedInteger(v) => out.push(v as f64),
-                        DecodedValue::SignedInteger(v) => out.push(v as f64),
-                        _ => out.push(f64::NAN),
-                    }
-                } else {
-                    out.push(f64::NAN);
-                }
-            } else {
-                out.push(decode_f64_from_record(rec, record_id_len, self.block));
-            }
-            Ok(())
         };
-
-        // VLSD channels must use the boxed iterator path. Only the all-invalid
-        // flag can be checked (the iterator yields payloads, not records).
-        if self.block.channel_type == 1 && self.block.data != 0 {
-            let records_iter = self
-                .raw_channel
-                .records(self.raw_data_group, self.raw_channel_group, self.mmap)?;
-            for rec_res in records_iter {
-                let rec = rec_res?;
-                if all_invalid {
-                    out.push(f64::NAN);
-                } else {
-                    convert_record(rec, &mut out)?;
-                }
-            }
-            return Ok(out);
-        }
-
-        // Fast path: iterate over data blocks directly without Box<dyn Iterator>
-        let sample_byte_len = cg_data_bytes as usize;
-        let invalidation_bytes = self.raw_channel_group.block.invalidation_bytes_nr as usize;
-        let record_size = record_id_len + sample_byte_len + invalidation_bytes;
-
-        if record_size == 0 {
-            return Ok(out);
-        }
-
-        let blocks = self.raw_data_group.data_blocks(self.mmap)?;
-        for data_block in &blocks {
-            let bytes = data_block.data;
-            let valid_len = (bytes.len() / record_size) * record_size;
-            let mut offset = 0;
-            while offset + record_size <= valid_len {
-                let rec = &bytes[offset..offset + record_size];
-                if all_invalid
-                    || (invalidation_bytes > 0
-                        && !check_value_validity(rec, record_id_len, cg_data_bytes, self.block))
-                {
-                    out.push(f64::NAN);
-                } else {
-                    convert_record(rec, &mut out)?;
-                }
-                offset += record_size;
-            }
-        }
-        Ok(out)
+        let conversion = if raw { None } else { block.conversion.as_ref().map(|c| resolved(c, self.mmap)) };
+        let linear = conversion.as_deref().and_then(|c| {
+            (c.cc_type == ConversionType::Linear && c.cc_val.len() >= 2).then(|| (c.cc_val[0], c.cc_val[1]))
+        });
+        let has_conversion = conversion.as_deref().is_some_and(|c| c.cc_type != ConversionType::Identity);
+        Ok(PreparedChannel {
+            block,
+            mmap: self.mmap,
+            record_id_len: self.raw_data_group.block.record_id_len as usize,
+            cg_data_bytes: self.raw_channel_group.block.samples_byte_nr,
+            has_invalidation: self.raw_channel_group.block.invalidation_bytes_nr > 0,
+            all_invalid: block.flags & 0x01 != 0,
+            records,
+            conversion,
+            linear,
+            has_conversion,
+        })
     }
 
     /// Get the channel block (for internal use)
     pub fn block(&self) -> &ChannelBlock {
         self.block
+    }
+}
+
+/// `conversion` with every referenced text and nested conversion resolved
+/// up front, so applying it does not re-parse blocks for every sample. A
+/// conversion without references (linear, rational, tables, …) needs no
+/// resolution and is borrowed; one whose resolution fails is used as it is
+/// (applying it then reads its references from the file, as before).
+fn resolved<'a>(conversion: &'a ConversionBlock, mmap: &[u8]) -> Cow<'a, ConversionBlock> {
+    if conversion.cc_ref.iter().all(|&r| r == 0) {
+        return Cow::Borrowed(conversion);
+    }
+    let mut resolved = conversion.clone();
+    match resolved.resolve_all_dependencies(mmap) {
+        Ok(()) => Cow::Owned(resolved),
+        Err(_) => Cow::Borrowed(conversion),
+    }
+}
+
+/// Where a prepared channel's records come from.
+enum Records<'a> {
+    /// A virtual channel (`cn_type` 3 / 6): `count` records, no bytes.
+    Virtual(u64),
+    /// Fixed-length values inside the records.
+    Fixed(RecordSections<'a>),
+    /// VLSD: each record holds an offset into the signal-data stream.
+    Vlsd(RecordSections<'a>, VlsdStream<'a>),
+}
+
+/// A [`Channel`] ready to decode any window of its records: records located,
+/// VLSD stream located and conversion resolved once (see
+/// [`Channel::prepare`]). Used for whole reads, windows and the single-record
+/// probes of a time-window search alike, so they all decode identically.
+pub(crate) struct PreparedChannel<'a> {
+    block: &'a ChannelBlock,
+    mmap: &'a [u8],
+    record_id_len: usize,
+    cg_data_bytes: u32,
+    has_invalidation: bool,
+    all_invalid: bool,
+    records: Records<'a>,
+    conversion: Option<Cow<'a, ConversionBlock>>,
+    linear: Option<(f64, f64)>,
+    has_conversion: bool,
+}
+
+impl PreparedChannel<'_> {
+    /// Number of records the channel holds.
+    pub(crate) fn record_count(&self) -> u64 {
+        match &self.records {
+            Records::Virtual(count) => *count,
+            Records::Fixed(sections) | Records::Vlsd(sections, _) => sections.record_count(),
+        }
+    }
+
+    /// The conversion applied to `value` (none for a raw read).
+    fn physical(&self, value: DecodedValue) -> Result<DecodedValue, MdfError> {
+        match &self.conversion {
+            Some(conversion) => conversion.apply_decoded(value, self.mmap),
+            None => Ok(value),
+        }
+    }
+
+    /// `false` when `record`'s sample is flagged invalid.
+    #[inline(always)]
+    fn is_valid(&self, record: &[u8]) -> bool {
+        !self.all_invalid
+            && (!self.has_invalidation
+                || check_value_validity(record, self.record_id_len, self.cg_data_bytes, self.block))
+    }
+
+    /// Decoded (and converted) values of records `[start, end)`; `None` marks
+    /// an invalid or undecodable sample.
+    pub(crate) fn decoded(&self, start: u64, end: u64) -> Result<Vec<Option<DecodedValue>>, MdfError> {
+        let end = end.min(self.record_count());
+        let mut out = Vec::with_capacity(end.saturating_sub(start).min(1 << 24) as usize);
+        match &self.records {
+            Records::Virtual(_) => {
+                for i in start..end {
+                    out.push(Some(self.physical(DecodedValue::UnsignedInteger(i))?));
+                }
+            }
+            Records::Fixed(sections) => sections.for_each(start, end, |record| {
+                out.push(match self.is_valid(record) {
+                    true => match decode_channel_value(record, self.record_id_len, self.block) {
+                        Some(value) => Some(self.physical(value)?),
+                        None => None,
+                    },
+                    false => None,
+                });
+                Ok(())
+            })?,
+            Records::Vlsd(sections, stream) => sections.for_each(start, end, |record| {
+                out.push(self.vlsd_value(record, stream)?);
+                Ok(())
+            })?,
+        }
+        Ok(out)
+    }
+
+    /// The value a VLSD record's offset points at, `None` when invalid.
+    fn vlsd_value(&self, record: &[u8], stream: &VlsdStream<'_>) -> Result<Option<DecodedValue>, MdfError> {
+        if !self.is_valid(record) {
+            return Ok(None);
+        }
+        let payload = stream.entry(vlsd_offset(self.block, record, self.record_id_len)?)?;
+        match decode_channel_value(payload, 0, self.block) {
+            Some(value) => Ok(Some(self.physical(value)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Physical `f64` values of records `[start, end)`; invalid and
+    /// non-numeric samples are `NaN`.
+    pub(crate) fn values(&self, start: u64, end: u64) -> Result<Vec<f64>, MdfError> {
+        let Records::Fixed(sections) = &self.records else {
+            // Virtual and VLSD values go through the decoded path.
+            return Ok(self.decoded(start, end)?.iter().map(decoded_opt_to_f64).collect());
+        };
+        let end = end.min(self.record_count());
+        let mut out = Vec::with_capacity(end.saturating_sub(start).min(1 << 24) as usize);
+        let (record_id_len, block) = (self.record_id_len, self.block);
+        match (self.linear, self.has_conversion) {
+            (Some((a, b)), _) => sections.for_each(start, end, |record| {
+                out.push(match self.is_valid(record) {
+                    true => a + b * decode_f64_from_record(record, record_id_len, block),
+                    false => f64::NAN,
+                });
+                Ok(())
+            })?,
+            (None, true) => sections.for_each(start, end, |record| {
+                let value = match self.is_valid(record) {
+                    true => decode_channel_value(record, record_id_len, block),
+                    false => None,
+                };
+                out.push(match value {
+                    Some(value) => match self.physical(value)? {
+                        DecodedValue::Float(v) => v,
+                        DecodedValue::UnsignedInteger(v) => v as f64,
+                        DecodedValue::SignedInteger(v) => v as f64,
+                        _ => f64::NAN,
+                    },
+                    None => f64::NAN,
+                });
+                Ok(())
+            })?,
+            (None, false) => sections.for_each(start, end, |record| {
+                out.push(match self.is_valid(record) {
+                    true => decode_f64_from_record(record, record_id_len, block),
+                    false => f64::NAN,
+                });
+                Ok(())
+            })?,
+        }
+        Ok(out)
+    }
+
+    /// Physical `f64` value of record `i` (`NaN` past the end).
+    pub(crate) fn value_at(&self, i: u64) -> Result<f64, MdfError> {
+        Ok(self.values(i, i + 1)?.first().copied().unwrap_or(f64::NAN))
     }
 }

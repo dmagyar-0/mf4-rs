@@ -6,6 +6,62 @@ use byteorder::{LittleEndian, BigEndian, ByteOrder};
 const CN_FLAG_ALL_INVALID: u32 = 0x01;  // Bit 0: All values are invalid
 const CN_FLAG_INVAL_BIT_VALID: u32 = 0x02;  // Bit 1: Invalidation bit is valid
 
+/// Integer data types are at most 64 bits wide (MDF 4.1 §6.6.3); a wider
+/// field cannot be decoded into a `u64` / `i64`.
+const MAX_INTEGER_BITS: usize = 64;
+
+/// Bits `[bit_offset, bit_offset + bit_count)` of a little-endian field.
+/// Folded into a `u128` so a 64-bit field shifted by up to 7 bits (9 bytes)
+/// keeps its high bits. `bit_count` <= 64, `slice` at most 16 bytes.
+#[inline(always)]
+fn bits_le(slice: &[u8], bit_offset: usize, bit_count: usize) -> u64 {
+    let raw = slice.iter().rev().fold(0u128, |acc, &b| (acc << 8) | b as u128);
+    mask_bits((raw >> bit_offset) as u64, bit_count)
+}
+
+/// [`bits_le`] for a big-endian field.
+#[inline(always)]
+fn bits_be(slice: &[u8], bit_offset: usize, bit_count: usize) -> u64 {
+    let raw = slice.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128);
+    mask_bits((raw >> bit_offset) as u64, bit_count)
+}
+
+#[inline(always)]
+fn mask_bits(value: u64, bit_count: usize) -> u64 {
+    if bit_count >= 64 { value } else { value & ((1u64 << bit_count) - 1) }
+}
+
+/// Two's-complement sign extension of a `bit_count`-bit value (1..=64).
+#[inline(always)]
+fn sign_extend(value: u64, bit_count: usize) -> i64 {
+    let shift = 64 - bit_count.min(64) as u32;
+    ((value << shift) as i64) >> shift
+}
+
+/// The signal-data offset a VLSD channel's fixed-length field holds in
+/// `record` (an unsigned little-endian integer, 64 bits wide per the spec).
+pub(crate) fn vlsd_offset(channel: &ChannelBlock, record: &[u8], record_id_size: usize) -> Result<u64, crate::error::MdfError> {
+    let start = record_id_size + channel.byte_offset as usize;
+    let bit_offset = channel.bit_offset as usize;
+    let bit_count = channel.bit_count as usize;
+    let len = (bit_offset + bit_count).div_ceil(8);
+    match record.get(start..start + len) {
+        Some(field) if bit_count > 0 && bit_count <= MAX_INTEGER_BITS && bit_offset <= 7 => {
+            Ok(bits_le(field, bit_offset, bit_count))
+        }
+        Some(_) => Err(crate::error::MdfError::BlockSerializationError(format!(
+            "VLSD channel has a {bit_count}-bit offset field at bit offset {bit_offset}; \
+             the offset must be an integer of at most 64 bits"
+        ))),
+        None => Err(crate::error::MdfError::TooShortBuffer {
+            actual: record.len(),
+            expected: start + len,
+            file: file!(),
+            line: line!(),
+        }),
+    }
+}
+
 /// An enum representing the decoded value of a channel sample.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodedValue {
@@ -150,7 +206,7 @@ pub fn decode_f64_from_record(
     // bit_count == 0 has no value to decode (and would underflow the
     // sign-bit computation below); bit_offset must be 0..=7 per the spec
     // (larger values would overflow the shifts below).
-    if bit_count == 0 || bit_offset > 7 {
+    if bit_count == 0 || bit_offset > 7 || bit_count > MAX_INTEGER_BITS {
         return f64::NAN;
     }
 
@@ -209,10 +265,7 @@ pub fn decode_f64_from_record(
                     _ => {}
                 }
             }
-            let raw = slice.iter().rev().fold(0u64, |acc, &b| (acc << 8) | b as u64);
-            let shifted = raw >> bit_offset;
-            let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
-            (shifted & mask) as f64
+            bits_le(slice, bit_offset, bit_count) as f64
         },
         DataType::UnsignedIntegerBE => {
             if bit_offset == 0 {
@@ -224,10 +277,7 @@ pub fn decode_f64_from_record(
                     _ => {}
                 }
             }
-            let raw = slice.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
-            let shifted = raw >> bit_offset;
-            let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
-            (shifted & mask) as f64
+            bits_be(slice, bit_offset, bit_count) as f64
         },
         DataType::SignedIntegerLE => {
             if bit_offset == 0 {
@@ -239,16 +289,7 @@ pub fn decode_f64_from_record(
                     _ => {}
                 }
             }
-            let raw = slice.iter().rev().fold(0u64, |acc, &b| (acc << 8) | b as u64);
-            let shifted = raw >> bit_offset;
-            let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
-            let unsigned = shifted & mask;
-            let sign_bit = 1u64 << (bit_count - 1);
-            if unsigned & sign_bit != 0 {
-                ((unsigned as i64) | (!(mask as i64))) as f64
-            } else {
-                unsigned as f64
-            }
+            sign_extend(bits_le(slice, bit_offset, bit_count), bit_count) as f64
         },
         DataType::SignedIntegerBE => {
             if bit_offset == 0 {
@@ -260,16 +301,7 @@ pub fn decode_f64_from_record(
                     _ => {}
                 }
             }
-            let raw = slice.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
-            let shifted = raw >> bit_offset;
-            let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
-            let unsigned = shifted & mask;
-            let sign_bit = 1u64 << (bit_count - 1);
-            if unsigned & sign_bit != 0 {
-                ((unsigned as i64) | (!(mask as i64))) as f64
-            } else {
-                unsigned as f64
-            }
+            sign_extend(bits_be(slice, bit_offset, bit_count), bit_count) as f64
         },
         _ => f64::NAN,
     }
@@ -303,7 +335,7 @@ fn decode_value_internal(
     // bit_count == 0 has no value to decode (and would underflow the
     // sign-bit computation for signed integers); bit_offset must be 0..=7
     // per the spec (larger values would overflow the shifts below).
-    if is_numeric && (bit_count == 0 || bit_offset > 7) {
+    if is_numeric && (bit_count == 0 || bit_offset > 7 || bit_count > MAX_INTEGER_BITS) {
         return None;
     }
 
@@ -348,10 +380,7 @@ fn decode_value_internal(
                     _ => {}
                 }
             }
-            let raw = slice.iter().rev().fold(0u64, |acc, &b| (acc << 8) | b as u64);
-            let shifted = raw >> bit_offset;
-            let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
-            Some(DecodedValue::UnsignedInteger(shifted & mask))
+            Some(DecodedValue::UnsignedInteger(bits_le(slice, bit_offset, bit_count)))
         },
         DataType::UnsignedIntegerBE => {
             if bit_offset == 0 {
@@ -363,10 +392,7 @@ fn decode_value_internal(
                     _ => {}
                 }
             }
-            let raw = slice.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
-            let shifted = raw >> bit_offset;
-            let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
-            Some(DecodedValue::UnsignedInteger(shifted & mask))
+            Some(DecodedValue::UnsignedInteger(bits_be(slice, bit_offset, bit_count)))
         },
         DataType::SignedIntegerLE => {
             if bit_offset == 0 {
@@ -378,17 +404,7 @@ fn decode_value_internal(
                     _ => {}
                 }
             }
-            let raw = slice.iter().rev().fold(0u64, |acc, &b| (acc << 8) | b as u64);
-            let shifted = raw >> bit_offset;
-            let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
-            let unsigned = shifted & mask;
-            let sign_bit = 1u64 << (bit_count - 1);
-            let signed = if unsigned & sign_bit != 0 {
-                (unsigned as i64) | (!(mask as i64))
-            } else {
-                unsigned as i64
-            };
-            Some(DecodedValue::SignedInteger(signed))
+            Some(DecodedValue::SignedInteger(sign_extend(bits_le(slice, bit_offset, bit_count), bit_count)))
         },
         DataType::SignedIntegerBE => {
             if bit_offset == 0 {
@@ -400,17 +416,7 @@ fn decode_value_internal(
                     _ => {}
                 }
             }
-            let raw = slice.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
-            let shifted = raw >> bit_offset;
-            let mask = if bit_count >= 64 { u64::MAX } else { (1u64 << bit_count) - 1 };
-            let unsigned = shifted & mask;
-            let sign_bit = 1u64 << (bit_count - 1);
-            let signed = if unsigned & sign_bit != 0 {
-                (unsigned as i64) | (!(mask as i64))
-            } else {
-                unsigned as i64
-            };
-            Some(DecodedValue::SignedInteger(signed))
+            Some(DecodedValue::SignedInteger(sign_extend(bits_be(slice, bit_offset, bit_count), bit_count)))
         },
         DataType::FloatLE => {
             if bit_offset == 0 {
