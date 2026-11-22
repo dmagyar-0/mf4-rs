@@ -16,9 +16,12 @@ use std::sync::OnceLock;
 type AxisCache = HashMap<(usize, u64, u64), Vec<f64>>;
 
 /// Names and time-axis links of every physical group, read once on the first
-/// lookup — otherwise every lookup re-reads every name block it passes.
+/// lookup — otherwise every lookup re-reads every name block it passes — and
+/// indexed so a lookup does not scan every group.
 #[derive(Debug)]
 struct Lookup {
+    /// Per physical group: its (data group, channel group) position in the file.
+    locations: Vec<(usize, usize)>,
     /// Per group: its name; `None` when its name block cannot be read (the
     /// lookup that reaches it re-reads it to report the error).
     group_names: Vec<Option<Option<String>>>,
@@ -28,10 +31,26 @@ struct Lookup {
     /// master, the referenced group for an MDF 4.2 remote master, `None`
     /// when untimed.
     time_groups: Vec<Option<usize>>,
+    /// Groups by name, in file order.
+    groups_by_name: HashMap<String, Vec<usize>>,
+    /// First group whose name cannot be read.
+    unreadable_group: Option<usize>,
+    /// First `(group, channel)` carrying each (readable) channel name.
+    first_channel: HashMap<String, (usize, usize)>,
+    /// First `(group, channel)` whose name cannot be read.
+    unreadable_channel: Option<(usize, usize)>,
 }
 
 impl Lookup {
-    fn new(groups: &[ChannelGroup<'_>]) -> Self {
+    fn new(file: &MdfFile) -> Self {
+        let mut locations = Vec::new();
+        let mut groups = Vec::new();
+        for (d, dg) in file.data_groups.iter().enumerate() {
+            for (c, cg) in dg.channel_groups.iter().enumerate() {
+                locations.push((d, c));
+                groups.push(ChannelGroup::with_file_groups(dg, cg, &file.mmap, &file.data_groups));
+            }
+        }
         let has_master = |g: &ChannelGroup<'_>| {
             g.raw_channel_group().raw_channels.iter().any(|c| matches!(c.block.channel_type, 2 | 3))
         };
@@ -49,14 +68,46 @@ impl Lookup {
                 by_addr.get(&target).copied().filter(|&m| m != i && has_master(&groups[m]))
             })
             .collect();
-        Lookup {
-            group_names: groups.iter().map(|g| g.name().ok()).collect(),
-            channel_names: groups
-                .iter()
-                .map(|g| g.channels().iter().map(|c| c.name().ok()).collect())
-                .collect(),
-            time_groups,
+        let group_names: Vec<Option<Option<String>>> = groups.iter().map(|g| g.name().ok()).collect();
+        let channel_names: Vec<Vec<Option<Option<String>>>> =
+            groups.iter().map(|g| g.channels().iter().map(|c| c.name().ok()).collect()).collect();
+
+        let mut groups_by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for (g, name) in group_names.iter().enumerate() {
+            if let Some(Some(name)) = name {
+                groups_by_name.entry(name.clone()).or_default().push(g);
+            }
         }
+        let mut first_channel = HashMap::new();
+        let mut unreadable_channel = None;
+        for (g, names) in channel_names.iter().enumerate() {
+            for (c, name) in names.iter().enumerate() {
+                match name {
+                    Some(Some(name)) => {
+                        first_channel.entry(name.clone()).or_insert((g, c));
+                    }
+                    Some(None) => {}
+                    None => {
+                        unreadable_channel.get_or_insert((g, c));
+                    }
+                }
+            }
+        }
+        Lookup {
+            locations,
+            unreadable_group: group_names.iter().position(Option::is_none),
+            group_names,
+            channel_names,
+            time_groups,
+            groups_by_name,
+            first_channel,
+            unreadable_channel,
+        }
+    }
+
+    /// Group `g`'s name, when readable.
+    fn group_name(&self, g: usize) -> Option<&str> {
+        self.group_names[g].as_ref().and_then(|n| n.as_deref())
     }
 }
 
@@ -139,7 +190,7 @@ impl Mdf {
     /// source group and carries that group's name.
     pub fn group(&self, name: &str) -> Result<Option<GroupInfo>, MdfError> {
         let groups = self.channel_groups();
-        let names = self.group_names(&groups)?;
+        let names = self.group_names()?;
         let Some(first) = names.iter().position(|n| *n == Some(name)) else {
             return Ok(None);
         };
@@ -160,13 +211,12 @@ impl Mdf {
 
     /// Names of every named channel across all groups (duplicates kept).
     pub fn channel_names(&self) -> Result<Vec<String>, MdfError> {
-        let groups = self.channel_groups();
         let mut names = Vec::new();
         for (g, channels) in self.lookup().channel_names.iter().enumerate() {
             for (c, name) in channels.iter().enumerate() {
                 match name {
                     Some(name) => names.extend(name.clone()),
-                    None => names.extend(groups[g].channels()[c].name()?),
+                    None => names.extend(self.group_at(g).channels()[c].name()?),
                 }
             }
         }
@@ -421,42 +471,62 @@ impl Mdf {
     /// the time groups they reference under another name — so the shared time
     /// channel is found in every source group it serves, as in the source file.
     fn find(&self, name: &str, group: Option<&str>) -> Result<Option<(ChannelGroup<'_>, usize)>, MdfError> {
-        let mut groups = self.channel_groups();
+        let lookup = self.lookup();
         let Some(wanted) = group else {
-            for i in 0..groups.len() {
-                if let Some(ci) = self.position(&groups, i, name)? {
-                    return Ok(Some((groups.swap_remove(i), ci)));
+            // First match in file order — unless an unreadable name comes
+            // first, whose read error a scan in file order reports.
+            let hit = lookup.first_channel.get(name).copied();
+            return match (hit, lookup.unreadable_channel) {
+                (Some((g, c)), unreadable) if unreadable.is_none_or(|u| (g, c) < u) => {
+                    Ok(Some((self.group_at(g), c)))
                 }
-            }
-            return Ok(None);
+                (None, None) => Ok(None),
+                _ => {
+                    for g in 0..lookup.locations.len() {
+                        if let Some(c) = self.position(g, name)? {
+                            return Ok(Some((self.group_at(g), c)));
+                        }
+                    }
+                    Ok(None)
+                }
+            };
         };
-        let names = self.group_names(&groups)?;
-        let named: Vec<usize> = (0..groups.len()).filter(|&i| names[i] == Some(wanted)).collect();
-        let time_groups = &self.lookup().time_groups;
-        let remote = named.iter().filter_map(|&i| time_groups[i]).filter(|&t| names[t] != Some(wanted));
-        let candidates: Vec<usize> = named.iter().copied().chain(remote).collect();
-        for i in candidates {
-            if let Some(ci) = self.position(&groups, i, name)? {
-                return Ok(Some((groups.swap_remove(i), ci)));
+        if let Some(g) = lookup.unreadable_group {
+            self.group_at(g).name()?;
+        }
+        let named: &[usize] = lookup.groups_by_name.get(wanted).map_or(&[], Vec::as_slice);
+        let remote = named
+            .iter()
+            .filter_map(|&g| lookup.time_groups[g])
+            .filter(|&t| lookup.group_name(t) != Some(wanted));
+        for g in named.iter().copied().chain(remote) {
+            if let Some(c) = self.position(g, name)? {
+                return Ok(Some((self.group_at(g), c)));
             }
         }
         Ok(None)
     }
 
     fn lookup(&self) -> &Lookup {
-        self.lookup.get_or_init(|| Lookup::new(&self.channel_groups()))
+        self.lookup.get_or_init(|| Lookup::new(&self.raw))
     }
 
-    /// Position of the first channel named `name` in group `g` (of
-    /// `groups`, this file's [`channel_groups`](Self::channel_groups)). An
+    /// Physical group `g` (in [`channel_groups`](Self::channel_groups) order).
+    fn group_at(&self, g: usize) -> ChannelGroup<'_> {
+        let (d, c) = self.lookup().locations[g];
+        let dg = &self.raw.data_groups[d];
+        ChannelGroup::with_file_groups(dg, &dg.channel_groups[c], &self.raw.mmap, &self.raw.data_groups)
+    }
+
+    /// Position of the first channel named `name` in group `g`. An
     /// unreadable name it passes is re-read to report its error.
-    fn position(&self, groups: &[ChannelGroup<'_>], g: usize, name: &str) -> Result<Option<usize>, MdfError> {
+    fn position(&self, g: usize, name: &str) -> Result<Option<usize>, MdfError> {
         for (c, channel_name) in self.lookup().channel_names[g].iter().enumerate() {
             match channel_name {
                 Some(n) if n.as_deref() == Some(name) => return Ok(Some(c)),
                 Some(_) => {}
                 None => {
-                    if groups[g].channels()[c].name()?.as_deref() == Some(name) {
+                    if self.group_at(g).channels()[c].name()?.as_deref() == Some(name) {
                         return Ok(Some(c));
                     }
                 }
@@ -466,13 +536,14 @@ impl Mdf {
     }
 
     /// Every group's name (an unreadable one is re-read to report its error).
-    fn group_names<'s>(&'s self, groups: &[ChannelGroup<'_>]) -> Result<Vec<Option<&'s str>>, MdfError> {
-        let mut names = Vec::with_capacity(groups.len());
-        for (g, name) in self.lookup().group_names.iter().enumerate() {
+    fn group_names(&self) -> Result<Vec<Option<&str>>, MdfError> {
+        let lookup = self.lookup();
+        let mut names = Vec::with_capacity(lookup.group_names.len());
+        for (g, name) in lookup.group_names.iter().enumerate() {
             match name {
                 Some(name) => names.push(name.as_deref()),
                 None => {
-                    groups[g].name()?;
+                    self.group_at(g).name()?;
                     return Err(MdfError::BlockSerializationError(format!(
                         "the name of channel group {g} cannot be read"
                     )));
