@@ -535,28 +535,106 @@ fn mdf_windows_match_slices_on_column_oriented_files() -> Result<(), MdfError> {
 
 #[test]
 fn mdf_lookups_keep_their_error_behaviour() -> Result<(), MdfError> {
-    // A channel whose name link points past the end of the file: lookups
-    // that stop before it work, lookups that must read it fail with the
-    // read error (not "channel not found").
-    let path = tmp("broken_name.mf4");
-    time_val_file(&path, 3);
-    let mut b = std::fs::read(&path).unwrap();
+    // A lookup reports the read error of an unreadable name it has to pass
+    // (not "channel not found", and not a match found further on).
+    let three_channels = |name: &str| -> Result<(String, Vec<u8>), MdfError> {
+        let path = tmp(name);
+        let mut w = MdfWriter::new(&path)?;
+        w.init_mdf_file()?;
+        let g = w.add_channel_group(Some("G"))?;
+        w.add_time_channel(&g, "Time")?;
+        w.add_float_channel(&g, "Val")?;
+        w.add_float_channel(&g, "Other")?;
+        w.start_data_block(&g)?;
+        let v: Vec<f64> = (0..3).map(f64::from).collect();
+        w.write_columns(&g, &[ColumnData::F64(&v), ColumnData::F64(&v), ColumnData::F64(&v)])?;
+        w.finish_data_block(&g)?;
+        w.finalize()?;
+        let bytes = std::fs::read(&path).unwrap();
+        Ok((path, bytes))
+    };
+    let expect_read_error = |result: Result<Signal, MdfError>, what: &str| match result {
+        Err(MdfError::TooShortBuffer { .. }) => {}
+        other => panic!("{what}: expected the name read error, got {other:?}"),
+    };
+    let in_group = |g: Option<&str>| ReadOptions { group: g.map(str::to_string), ..Default::default() };
+
+    // `Val`'s name link points past the end of the file.
+    let (path, mut b) = three_channels("broken_channel_name.mf4")?;
     let cg = u64_at(&b, first_dg(&b) + 32) as usize;
     let cn1 = u64_at(&b, cg + 32) as usize;
     let cn2 = u64_at(&b, cn1 + 24) as usize;
     let past_end = b.len() as u64 + 4096;
     put_u64(&mut b, cn2 + 40, past_end);
     std::fs::write(&path, &b).unwrap();
-
     let mdf = Mdf::from_file(&path)?;
-    assert_eq!(mdf.values("Time", None)?.len(), 3);
-    assert_eq!(mdf.values("Time", &ReadOptions::new().group("G"))?.len(), 3);
     for group in [None, Some("G")] {
-        match mdf.read("Missing", &ReadOptions { group: group.map(str::to_string), ..Default::default() }) {
-            Err(MdfError::TooShortBuffer { .. }) => {}
-            other => panic!("expected the name read error, got {other:?}"),
-        }
+        // Found before the unreadable name.
+        assert_eq!(mdf.values("Time", &in_group(group))?.len(), 3);
+        // Must pass the unreadable name: an existing channel after it, and a
+        // missing one.
+        expect_read_error(mdf.read("Other", &in_group(group)), &format!("Other in {group:?}"));
+        expect_read_error(mdf.read("Missing", &in_group(group)), &format!("Missing in {group:?}"));
     }
+
+    // The group's name link points past the end of the file: a lookup by
+    // group must read every group's name; one without a group reads none.
+    let (path, mut b) = three_channels("broken_group_name.mf4")?;
+    let cg = u64_at(&b, first_dg(&b) + 32) as usize;
+    let past_end = b.len() as u64 + 4096;
+    put_u64(&mut b, cg + 40, past_end);
+    std::fs::write(&path, &b).unwrap();
+    let mdf = Mdf::from_file(&path)?;
+    assert_eq!(mdf.values("Other", None)?.len(), 3);
+    expect_read_error(mdf.read("Time", &in_group(Some("G"))), "Time in group G");
+    Ok(())
+}
+
+#[test]
+fn vlsd_offset_fields_narrower_than_64_bits_read_alike() -> Result<(), MdfError> {
+    // Out of spec (VLSD offsets are 64-bit), but readable: `Mdf` and
+    // `MdfIndex` must agree on a 32-bit offset field followed by another
+    // channel's bytes.
+    let path = tmp("vlsd_offset32.mf4");
+    let mut w = MdfWriter::new(&path)?;
+    w.init_mdf_file()?;
+    let cg = w.add_channel_group_with(None, |_| {})?;
+    let t = w.add_channel_with(&cg, None, |c| {
+        c.data_type = DataType::FloatLE;
+        c.bit_count = 64;
+        c.name = Some("Time".into());
+    })?;
+    w.set_time_channel(&t)?;
+    let vlsd = w.add_channel_with(&cg, Some(&t), |c| {
+        c.data_type = DataType::StringUtf8;
+        c.bit_count = 32;
+        c.channel_type = 1;
+        c.data = 1;
+        c.name = Some("Msg".into());
+    })?;
+    // record: Time f64 | 32-bit offset | 0xFFFFFFFF filler (not part of the offset)
+    w.start_data_block_for_cg_raw(&cg, 0, 16, 0)?;
+    w.start_signal_data_block(&vlsd)?;
+    let payloads: [&[u8]; 3] = [b"first", b"second", b"third"];
+    let mut offset = 0u32;
+    for (i, p) in payloads.iter().enumerate() {
+        let mut r = Vec::new();
+        r.extend_from_slice(&(i as f64).to_le_bytes());
+        r.extend_from_slice(&offset.to_le_bytes());
+        r.extend_from_slice(&[0xFF; 4]);
+        w.write_raw_record(&cg, &r)?;
+        w.write_signal_data(&vlsd, p)?;
+        offset += 4 + p.len() as u32;
+    }
+    w.finish_signal_data_block(&vlsd)?;
+    w.finish_data_block(&cg)?;
+    w.finalize()?;
+
+    let want = strs(&[Some("first"), Some("second"), Some("third")]);
+    assert_eq!(texts(&Mdf::from_file(&path)?.read("Msg", None)?), want);
+    let index = MdfIndex::from_file(&path)?;
+    assert_eq!(texts(&index.read("Msg", None)?), want);
+    assert_eq!(texts(&index.read("Msg", &ReadOptions::new().records(1, 2))?), want[1..].to_vec());
     Ok(())
 }
 
