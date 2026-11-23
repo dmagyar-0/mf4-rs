@@ -375,6 +375,21 @@ fn index_byte_ranges_cover_split_records() -> Result<(), MdfError> {
             }
         }
         assert!(ranges.len() <= sections.len());
+        // Exactly: per fragment, from the first to the last byte of the
+        // selected records' fields it holds (computed byte by byte).
+        let mut expected: Vec<(u64, u64)> = Vec::new();
+        let mut fragment_start = 0u64;
+        for &(offset, len) in &sections {
+            let in_fragment = (start..start + count)
+                .flat_map(|r| (0..field_len).map(move |b| r * RECORD as u64 + field_offset + b))
+                .filter(|&logical| logical >= fragment_start && logical < fragment_start + len);
+            let (first, last) = in_fragment.fold((u64::MAX, 0), |(lo, hi), l| (lo.min(l), hi.max(l)));
+            if first != u64::MAX {
+                expected.push((offset + (first - fragment_start), last - first + 1));
+            }
+            fragment_start += len;
+        }
+        assert_eq!(ranges, expected, "byte ranges of records {start}..{}", start + count);
     }
     Ok(())
 }
