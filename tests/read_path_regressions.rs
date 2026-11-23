@@ -780,8 +780,12 @@ fn reference_lookup(cc_val: &[f64], raw: f64, interp: bool) -> Option<f64> {
 fn table_lookups_match_the_reference_scan() {
     let tables: Vec<Vec<f64>> = vec![
         vec![5.0, 50.0],
-        // malformed: a single NaN key (passes the raw value through, no panic)
+        // malformed: NaN keys (no panic; the same results as the scan)
         vec![f64::NAN, 7.0],
+        vec![0.0, 7.0, f64::NAN, 8.0],
+        vec![f64::NAN, 7.0, 1.0, 8.0],
+        vec![0.0, 7.0, 1.0, 8.0, f64::NAN, 9.0],
+        vec![0.0, 7.0, f64::NAN, 8.0, 1.0, 9.0, 2.0, 10.0],
         vec![0.0, 1.0, 10.0, 2.0],
         vec![-4.0, 4.0, -1.0, 1.0, 0.0, 0.0, 2.5, -7.0, 9.0, 3.0],
         // duplicate keys (a step)
