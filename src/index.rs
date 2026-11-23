@@ -2715,7 +2715,8 @@ impl MdfIndex {
     }
 
     /// Refuse VLSD channels the index reader cannot decode (compressed
-    /// fragments, missing signal data, a malformed offset field).
+    /// fragments, missing signal data). The offset field is checked per
+    /// valid record, as `Mdf` does.
     fn check_vlsd_readable(group: &IndexedChannelGroup, channel: &IndexedChannel) -> Result<(), MdfError> {
         // Compressed fragments (either the fixed records or the SD stream) are
         // not decodable yet.
@@ -2744,18 +2745,8 @@ impl MdfIndex {
             )));
         }
 
-        // The spec fixes the VLSD offset field at 64 bits; a narrower
-        // unsigned field is read too (as `Mdf` reads it), anything that is
-        // not an integer of at most 64 bits is refused.
-        if channel.bit_count == 0 || channel.bit_count > 64 || channel.bit_offset > 7 {
-            return Err(MdfError::BlockSerializationError(format!(
-                "VLSD channel '{}' has a {}-bit record field at bit offset {}; the \
-                 inline VLSD offset must be an unsigned integer of at most 64 bits",
-                channel.name.as_deref().unwrap_or("<unnamed>"),
-                channel.bit_count,
-                channel.bit_offset
-            )));
-        }
+        // The offset field itself is read per valid record (`vlsd_offset`,
+        // as `Mdf` does): an unusable field only fails a read that needs it.
         Ok(())
     }
 
