@@ -391,6 +391,14 @@ mod url {
     struct Server {
         url: String,
         stop: Arc<AtomicBool>,
+        requests: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl Server {
+        /// Requests served so far.
+        fn requests(&self) -> u64 {
+            self.requests.load(Ordering::SeqCst)
+        }
     }
 
     impl Drop for Server {
@@ -406,13 +414,15 @@ mod url {
         let url = format!("http://{}/file.mf4", listener.local_addr().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
+        let requests = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let request_count = requests.clone();
         std::thread::spawn(move || {
             while !stop_flag.load(Ordering::SeqCst) {
                 let Ok((stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                let bytes = bytes.clone();
+                let (bytes, request_count) = (bytes.clone(), request_count.clone());
                 std::thread::spawn(move || {
                     stream.set_nonblocking(false).ok();
                     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -442,6 +452,7 @@ mod url {
                         if !saw_request {
                             continue;
                         }
+                        request_count.fetch_add(1, Ordering::SeqCst);
                         let total = bytes.len() as u64;
                         let range = range.and_then(|r| {
                             let (s, e) = r.strip_prefix("bytes=")?.split_once('-')?;
@@ -472,7 +483,7 @@ mod url {
                 });
             }
         });
-        Server { url, stop }
+        Server { url, stop, requests }
     }
 
     #[test]
@@ -496,6 +507,41 @@ mod url {
         let server = serve(&path);
         let index = MdfIndex::from_url(&server.url)?;
         assert_matches_mdf("from_url (equal-length)", &mdf, &["Val", "State", "Time"], &index_api(&index));
+        Ok(())
+    }
+
+    /// A windowed `values()` over a URL must batch its range requests like
+    /// `read()` does — not fetch the window one data block at a time.
+    #[test]
+    fn url_windowed_values_batch_their_requests() -> Result<(), MdfError> {
+        let path = tmp("values_batched_url.mf4");
+        three_channel_file(&path);
+        // 48 blocks of 1000 bytes (records straddle most boundaries).
+        split_data_block(&path, &[1000; 48], Some(1000));
+        let mdf = Mdf::from_file(&path)?;
+        let time_axis = mdf.values("Time", None)?;
+        let server = serve(&path);
+        let index = MdfIndex::from_url(&server.url)?;
+        for options in [
+            ReadOptions::new().records(0, N as u64),
+            ReadOptions::new().records(100, 1500),
+            ReadOptions::new().time(Some(time_axis[100]), Some(time_axis[1900])),
+            ReadOptions::new().time(Some(time_axis[100]), Some(time_axis[1900])).raw(true),
+        ] {
+            let before = server.requests();
+            let values = index.values("Val", &options)?;
+            let values_requests = server.requests() - before;
+            assert_eq!(values, mdf.values("Val", &options)?, "{options:?}");
+
+            let before = server.requests();
+            index.read("Val", &options)?;
+            let read_requests = server.requests() - before;
+
+            assert!(
+                values_requests <= read_requests.max(2) && values_requests <= 8,
+                "{options:?}: values() made {values_requests} requests, read() {read_requests}"
+            );
+        }
         Ok(())
     }
 }
