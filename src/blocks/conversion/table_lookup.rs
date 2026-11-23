@@ -18,7 +18,9 @@ pub fn lookup_table(cc_val: &[f64], raw: f64, interp: bool) -> Option<f64> {
     let val = |i: usize| cc_val[2 * i + 1];
     if raw <= key(0) { return Some(val(0)); }
     if raw >= key(n - 1) { return Some(val(n - 1)); }
-    if raw.is_nan() { return None; }
+    // NaN, or a malformed table (a NaN key) that clamps nothing: no result
+    // (the raw value passes through), as the linear scan this replaces gave.
+    if raw.is_nan() || n < 2 { return None; }
     // First segment [k_i, k_i+1] holding `raw`: the first i whose upper key
     // k_i+1 >= raw (key(0) < raw < key(n-1) here, so 0 <= i < n-1).
     let (mut lo, mut hi) = (1, n - 1);
