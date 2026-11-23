@@ -392,12 +392,19 @@ mod url {
         url: String,
         stop: Arc<AtomicBool>,
         requests: Arc<std::sync::atomic::AtomicU64>,
+        /// `(first, last)` byte of every range request, in arrival order.
+        ranges: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
     }
 
     impl Server {
         /// Requests served so far.
         fn requests(&self) -> u64 {
             self.requests.load(Ordering::SeqCst)
+        }
+
+        /// The byte ranges requested so far.
+        fn ranges(&self) -> Vec<(u64, u64)> {
+            self.ranges.lock().unwrap().clone()
         }
     }
 
@@ -416,13 +423,15 @@ mod url {
         let stop_flag = stop.clone();
         let requests = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let request_count = requests.clone();
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let range_log = ranges.clone();
         std::thread::spawn(move || {
             while !stop_flag.load(Ordering::SeqCst) {
                 let Ok((stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                let (bytes, request_count) = (bytes.clone(), request_count.clone());
+                let (bytes, request_count, range_log) = (bytes.clone(), request_count.clone(), range_log.clone());
                 std::thread::spawn(move || {
                     stream.set_nonblocking(false).ok();
                     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -460,6 +469,7 @@ mod url {
                             let e: u64 = if e.is_empty() { total - 1 } else { e.parse().ok()? };
                             Some((s, e.min(total - 1)))
                         });
+                        range_log.lock().unwrap().extend(range);
                         let (head, body): (String, &[u8]) = match range {
                             Some((s, _)) if s >= total => (
                                 format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\n\r\n"),
@@ -483,7 +493,7 @@ mod url {
                 });
             }
         });
-        Server { url, stop, requests }
+        Server { url, stop, requests, ranges }
     }
 
     #[test]
@@ -540,6 +550,50 @@ mod url {
             assert!(
                 values_requests <= read_requests.max(2) && values_requests <= 8,
                 "{options:?}: values() made {values_requests} requests, read() {read_requests}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn url_windowed_values_prime_deferred_conversions() -> Result<(), MdfError> {
+        // A URL-built index defers its conversions. A windowed `values()`
+        // must fetch the ones it needs — the channel's (unless raw) and, for
+        // a time window, the time axis's — up front in one read-ahead chunk,
+        // not block by block in extra request rounds (each starting at the
+        // ##CC block itself).
+        let path = tmp("values_primed_url.mf4");
+        three_channel_file(&path); // Time: linear, State: value-to-text, Val: none
+        split_data_block(&path, &[1000; 48], Some(1000));
+        let mdf = Mdf::from_file(&path)?;
+        let time_axis = mdf.values("Time", None)?;
+        let server = serve(&path);
+        let index = MdfIndex::from_url(&server.url)?;
+        let conversion_blocks: Vec<u64> = index.channel_groups[0]
+            .channels
+            .iter()
+            .map(|c| c.conversion_addr)
+            .filter(|&a| a != 0)
+            .collect();
+        assert_eq!(conversion_blocks.len(), 2, "Time and State carry a conversion");
+        let time_window = ReadOptions::new().time(Some(time_axis[100]), Some(time_axis[1900]));
+        for (name, options) in [
+            ("Val", time_window.clone()),       // the time axis's conversion
+            ("Val", time_window.clone().raw(true)),
+            ("State", ReadOptions::new().records(100, 1500)), // the channel's
+            ("State", time_window.clone()),     // both
+        ] {
+            let before = server.ranges().len();
+            let values = index.values(name, &options)?;
+            assert_eq!(debug(&values), debug(mdf.values(name, &options)?), "{name} {options:?}");
+            let unprimed: Vec<(u64, u64)> = server.ranges()[before..]
+                .iter()
+                .copied()
+                .filter(|(first, _)| conversion_blocks.contains(first))
+                .collect();
+            assert!(
+                unprimed.is_empty(),
+                "{name} {options:?}: conversion blocks fetched on their own: {unprimed:?}"
             );
         }
         Ok(())

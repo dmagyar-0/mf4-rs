@@ -307,6 +307,56 @@ fn mdf_vlsd_records_split_across_data_blocks() -> Result<(), MdfError> {
 }
 
 #[test]
+fn raw_records_and_cut_reassemble_split_vlsd_records() -> Result<(), MdfError> {
+    // 4 records of 17 bytes over 20 + 7 + 41 bytes: record 1 spans all three
+    // fragments. `RawChannel::records` (and `cut`, which uses it) follow the
+    // offsets of reassembled records too.
+    let path = tmp("vlsd_split_raw.mf4");
+    vlsd_file(&path, DataType::StringUtf8, &[b"x", b"y", b"z"], &[(true, 2), (false, 1), (true, 0), (true, 1)]);
+    split_data_block(&path, &[20, 7, 41]);
+
+    let file = mf4_rs::parsing::mdf_file::MdfFile::parse_from_file(&path)?;
+    let dg = &file.data_groups[0];
+    let cg = &dg.channel_groups[0];
+    let payloads = cg.raw_channels[1].records(dg, cg, &file.mmap)?.collect::<Result<Vec<_>, _>>()?;
+    // The invalid record 1 still points at a real entry, which is returned.
+    assert_eq!(payloads, vec![&b"z"[..], &b"y"[..], &b"x"[..], &b"y"[..]]);
+
+    let out = tmp("vlsd_split_raw_cut.mf4");
+    mf4_rs::cut_mdf_by_time(&path, &out, 0.0, 10.0)?;
+    let cut = Mdf::from_file(&out)?.read("Msg", None)?;
+    assert_eq!(texts(&cut), strs(&[Some("z"), None, Some("x"), Some("y")]));
+    Ok(())
+}
+
+#[test]
+fn malformed_vlsd_offset_fields_fail_only_when_read_in_both_readers() -> Result<(), MdfError> {
+    // A VLSD channel whose offset field is unusable (0 bits): every record
+    // invalid reads as all-`None` in both readers, a valid record errors in
+    // both.
+    let patch_bit_count = |path: &str, bits: u32| {
+        let mut b = std::fs::read(path).unwrap();
+        let cg = u64_at(&b, first_dg(&b) + 32) as usize;
+        let cn1 = u64_at(&b, cg + 32) as usize;
+        let cn2 = u64_at(&b, cn1 + 24) as usize;
+        b[cn2 + 96..cn2 + 100].copy_from_slice(&bits.to_le_bytes());
+        std::fs::write(path, &b).unwrap();
+    };
+    let all_invalid = tmp("vlsd_bad_field_invalid.mf4");
+    vlsd_file(&all_invalid, DataType::StringUtf8, &[b"a", b"b"], &[(false, 0), (false, 1)]);
+    patch_bit_count(&all_invalid, 0);
+    assert_eq!(Mdf::from_file(&all_invalid)?.read("Msg", None)?.values, vec![None, None]);
+    assert_eq!(MdfIndex::from_file(&all_invalid)?.read("Msg", None)?.values, vec![None, None]);
+
+    let one_valid = tmp("vlsd_bad_field_valid.mf4");
+    vlsd_file(&one_valid, DataType::StringUtf8, &[b"a", b"b"], &[(false, 0), (true, 1)]);
+    patch_bit_count(&one_valid, 0);
+    assert!(Mdf::from_file(&one_valid)?.read("Msg", None).is_err());
+    assert!(MdfIndex::from_file(&one_valid)?.read("Msg", None).is_err());
+    Ok(())
+}
+
+#[test]
 fn mdf_values_decodes_numeric_vlsd() -> Result<(), MdfError> {
     let path = tmp("vlsd_numeric.mf4");
     let payloads: Vec<[u8; 8]> = (0..3u64).map(|i| (100 + i).to_le_bytes()).collect();
