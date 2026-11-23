@@ -1,3 +1,8 @@
+## v4.2.1 — 2026-11-23
+
+### Fixes
+- reassemble split records, follow VLSD offsets and speed up reads (#103)
+
 ## v4.2.0 — 2026-11-21
 
 ### Features
