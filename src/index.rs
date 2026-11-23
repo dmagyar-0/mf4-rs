@@ -3368,9 +3368,64 @@ impl MdfIndex {
         if window == Window::All {
             return self.read_values_f64_via_source(g, c, options.raw);
         }
+        // Over a URL the window is located and fetched in batched rounds of
+        // concurrent requests, as `read` does — not one block at a time.
+        #[cfg(feature = "http")]
+        if let Source::Url(url) = self.require_source()? {
+            return self.values_window_url(url, g, c, window, options.raw, BATCH_MEMORY_LIMIT);
+        }
         let mut reader = self.source_reader(g, c, options.raw, false)?;
         let (start, count) = self.resolve_window_via(g, c, window, &mut reader)?;
         self.values_f64_window(g, c, start, count, options.raw, &mut reader)
+    }
+
+    /// Windowed [`values`](Self::values) over a URL: deferred conversions
+    /// (the channel's, unless `raw`, and the time axis a time window
+    /// searches) are fetched first through a small read-ahead cache, the
+    /// window is located in [`batched_reads_seeded`](Self::batched_reads_seeded)
+    /// rounds, and its records are then fetched as one round of concurrent
+    /// requests — or, above `batch_limit` bytes, streamed one data section at
+    /// a time.
+    #[cfg(feature = "http")]
+    fn values_window_url(
+        &self,
+        url: &str,
+        g: usize,
+        c: usize,
+        window: Window,
+        raw: bool,
+        batch_limit: u64,
+    ) -> Result<Vec<f64>, MdfError> {
+        let mut cached = CachingRangeReader::with_chunk_size(self.http_source(url)?, 64 * 1024);
+        if self.file_size > 0 {
+            cached.set_known_size(self.file_size);
+        }
+        let mut conversions = Vec::with_capacity(2);
+        if !raw {
+            conversions.push((g, c));
+        }
+        if matches!(window, Window::Time(..)) {
+            conversions.extend(self.time_axis_location(g, c));
+        }
+        let mut primed = std::collections::HashSet::new();
+        for (tg, tc) in conversions {
+            let channel = &self.channel_groups[tg].channels[tc];
+            if channel.conversion.is_none() && channel.conversion_addr != 0 && primed.insert(channel.conversion_addr) {
+                self.resolve_channel_conversion(tg, tc, &mut cached)?;
+            }
+        }
+        let (mut http, fetched) = cached.into_parts();
+        let mut store = FragmentStore::from_pairs(fetched)?;
+        let (start, count) = self.batched_reads_seeded(&mut http, &mut store, |r| self.resolve_window(g, c, window, r))?;
+
+        let group = &self.channel_groups[g];
+        let record = Self::checked_record_size(group)? as u64;
+        let vlsd: u64 = group.channels[c].vlsd_data_blocks.iter().map(|b| b.size).sum();
+        if count.saturating_mul(record).saturating_add(vlsd) > batch_limit {
+            let mut reader = ChunkedUrlReader { http, store };
+            return self.values_f64_window(g, c, start, count, raw, &mut reader);
+        }
+        self.batched_reads_seeded(&mut http, &mut store, |r| self.values_f64_window(g, c, start, count, raw, r))
     }
 
     /// First and last master (time) value of the group holding `name`, or
@@ -4678,7 +4733,11 @@ mod url_read_tests {
                             bytes.len(),
                             b + 1 - a
                         );
-                        if stream.write_all(head.as_bytes()).is_err() || stream.write_all(&bytes[a..=b]).is_err() {
+                        // One write per response: a separate head and body
+                        // write stalls ~40 ms on Nagle + delayed ACK.
+                        let mut response = head.into_bytes();
+                        response.extend_from_slice(&bytes[a..=b]);
+                        if stream.write_all(&response).is_err() {
                             return;
                         }
                     }
@@ -4736,6 +4795,14 @@ mod url_read_tests {
                     let got = index.read_many_url_limited(&url, &targets, window, options.raw, limit).unwrap();
                     for (g, w) in got.iter().zip(&want) {
                         assert_eq!((&g.values, &g.timestamps), (&w.values, &w.timestamps), "limit {limit} {options:?}");
+                    }
+                    // Windowed `values` takes the same two paths.
+                    if window != Window::All {
+                        for (&(g, c), name) in targets.iter().zip(names) {
+                            let got = index.values_window_url(&url, g, c, window, options.raw, limit).unwrap();
+                            let want = mdf.values(name, options).unwrap();
+                            assert_eq!(format!("{got:?}"), format!("{want:?}"), "values limit {limit} {options:?}");
+                        }
                     }
                 }
             }
