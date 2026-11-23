@@ -613,4 +613,55 @@ mod url {
         }
         Ok(())
     }
+
+    #[test]
+    fn url_windowed_values_read_a_byte_less_virtual_master() -> Result<(), MdfError> {
+        // A column-oriented file whose source had a virtual master (cn_type 3)
+        // keeps it in a time group that stores no bytes (record size 0). A
+        // windowed `values()` over a URL must read it like every other path.
+        let src = tmp("virtual_master_src.mf4");
+        let out = tmp("virtual_master_col.mf4");
+        let mut w = MdfWriter::new(&src)?;
+        w.init_mdf_file()?;
+        let cg = w.add_channel_group_with(None, |_| {})?;
+        let t = w.add_channel_with(&cg, None, |ch| {
+            ch.data_type = DataType::UnsignedIntegerLE;
+            ch.name = Some("t".into());
+            ch.channel_type = 3;
+            ch.sync_type = 1;
+            ch.bit_count = 0;
+        })?;
+        w.add_channel_with(&cg, Some(&t), |ch| {
+            ch.data_type = DataType::UnsignedIntegerLE;
+            ch.name = Some("V".into());
+            ch.bit_count = 32;
+        })?;
+        w.start_data_block_for_cg(&cg, 0)?;
+        for i in 0..50u64 {
+            w.write_record(&cg, &[DecodedValue::UnsignedInteger(0), DecodedValue::UnsignedInteger(i)])?;
+        }
+        w.finish_data_block(&cg)?;
+        w.finalize()?;
+        mf4_rs::to_column_oriented(&src, &out, &Default::default())?;
+
+        let mdf = Mdf::from_file(&out)?;
+        let server = serve(&out);
+        let index = MdfIndex::from_url(&server.url)?;
+        for options in [
+            ReadOptions::new().records(5, 10),
+            ReadOptions::new().time(Some(3.0), Some(7.0)),
+            ReadOptions::new().time(Some(3.0), Some(7.0)).raw(true),
+        ] {
+            for name in ["t", "V"] {
+                let want = mdf.values(name, &options)?;
+                assert!(!want.is_empty());
+                let got = index
+                    .values(name, &options)
+                    .unwrap_or_else(|e| panic!("values({name}, {options:?}) over a URL failed: {e}"));
+                assert_eq!(got, want, "values({name}, {options:?})");
+                assert_eq!(index.read(name, &options)?.values_f64(), want, "read({name}, {options:?})");
+            }
+        }
+        Ok(())
+    }
 }
