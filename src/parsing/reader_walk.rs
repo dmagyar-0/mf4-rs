@@ -33,6 +33,19 @@ use crate::blocks::header_block::HeaderBlock;
 use crate::blocks::identification_block::IdentificationBlock;
 use crate::error::MdfError;
 use crate::index::ByteRangeReader;
+use std::collections::HashSet;
+
+/// Record `addr` as visited, refusing a linked list that revisits a block
+/// (the same rule the in-memory parser applies).
+fn check_new(visited: &mut HashSet<u64>, addr: u64, list: &str) -> Result<(), MdfError> {
+    if visited.insert(addr) {
+        Ok(())
+    } else {
+        Err(MdfError::BlockLinkError(format!(
+            "cycle detected in {list} linked list at address {addr:#x}"
+        )))
+    }
+}
 
 pub(crate) struct WalkedChannel {
     pub block: ChannelBlock,
@@ -86,7 +99,11 @@ where
 
     let mut groups = Vec::new();
     let mut dg_addr = header.first_dg_addr;
+    // A chain that links back to an earlier block would otherwise be walked
+    // forever (each lap re-reading and re-collecting the same blocks).
+    let mut visited_dg = HashSet::new();
     while dg_addr != 0 {
+        check_new(&mut visited_dg, dg_addr, "data group")?;
         let dg_bytes = match reader.read_range(dg_addr, DG_BLOCK_LEN) {
             Ok(b) => b,
             Err(e) => {
@@ -108,8 +125,10 @@ where
         let next_dg_addr = dg.next_dg_addr;
         let mut cg_addr = dg.first_cg_addr;
         let mut cg_count = 0usize;
+        let mut visited_cg = HashSet::new();
 
         while cg_addr != 0 {
+            check_new(&mut visited_cg, cg_addr, "channel group")?;
             cg_count += 1;
             let cg_bytes = match reader.read_range(cg_addr, CG_BLOCK_LEN) {
                 Ok(b) => b,
@@ -148,7 +167,9 @@ where
 
             let mut channels = Vec::new();
             let mut ch_addr = cg.first_ch_addr;
+            let mut visited_cn = HashSet::new();
             while ch_addr != 0 {
+                check_new(&mut visited_cn, ch_addr, "channel")?;
                 let cn_bytes = match reader.read_range(ch_addr, CN_BLOCK_LEN) {
                     Ok(b) => b,
                     Err(e) => {

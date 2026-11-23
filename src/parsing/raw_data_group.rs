@@ -1,5 +1,6 @@
 use crate::error::MdfError;
 use crate::parsing::raw_channel_group::RawChannelGroup;
+use crate::parsing::record_stream::RecordSections;
 use crate::blocks::{
     data_block::DataBlock,
     data_group_block::DataGroupBlock,
@@ -14,6 +15,23 @@ pub struct RawDataGroup {
     pub channel_groups: Vec<RawChannelGroup>,
 }
 impl RawDataGroup {
+
+    /// The records of channel group `cg` (one of this data group's), read as
+    /// one continuous stream across all data blocks: records split between
+    /// two blocks of a `##DL` list are reassembled.
+    pub(crate) fn record_sections<'a>(
+        &self,
+        cg: &RawChannelGroup,
+        mmap: &'a [u8],
+    ) -> Result<RecordSections<'a>, MdfError> {
+        let record_size = self.block.record_id_len as usize
+            + cg.block.samples_byte_nr as usize
+            + cg.block.invalidation_bytes_nr as usize;
+        if record_size == 0 {
+            return Ok(RecordSections::new(Vec::new(), 0));
+        }
+        Ok(RecordSections::new(self.data_blocks(mmap)?, record_size))
+    }
 
     /// Collect all data blocks referenced by this data group.
     ///

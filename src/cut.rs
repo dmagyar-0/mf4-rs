@@ -249,9 +249,6 @@ pub fn cut_mdf_by_time(
         for cg in &dg.channel_groups {
             let samples_byte_nr = cg.block.samples_byte_nr;
             let invalidation_bytes_nr = cg.block.invalidation_bytes_nr;
-            let record_size = record_id_len as usize
-                + samples_byte_nr as usize
-                + invalidation_bytes_nr as usize;
 
             let src_record_id = cg.block.record_id;
             let cg_id = writer.add_channel_group_with(prev_cg.as_deref(), |c| {
@@ -426,16 +423,10 @@ pub fn cut_mdf_by_time(
                 c.block.channel_type == 2 && c.block.sync_type == 1
             });
 
-            // Iterate raw parent records from the source DT/DL chain.
-            let blocks = dg.data_blocks(&mdf.mmap)?;
-            for data_block in blocks {
-                let raw = data_block.data;
-                if record_size == 0 {
-                    // Degenerate CG with no record bytes — nothing to do.
-                    break;
-                }
-                let valid_len = (raw.len() / record_size) * record_size;
-                for record_chunk in raw[..valid_len].chunks_exact(record_size) {
+            // Iterate raw parent records from the source DT/DL chain (records
+            // split between two data blocks are reassembled).
+            let sections = dg.record_sections(cg, &mdf.mmap)?;
+            sections.for_each(0, sections.record_count(), |record_chunk| {
                     // Pull one VLSD entry per VLSD channel in lockstep with
                     // the parent record, regardless of whether we keep the
                     // record. This keeps the iterators aligned.
@@ -470,7 +461,7 @@ pub fn cut_mdf_by_time(
                             DecodedValue::Float(f) => f,
                             DecodedValue::UnsignedInteger(u) => u as f64,
                             DecodedValue::SignedInteger(i) => i as f64,
-                            _ => continue,
+                            _ => return Ok(()),
                         };
                         // Scale-aware tolerance keeps timestamps produced by
                         // `i * 0.1`-style accumulation inclusive at both
@@ -528,8 +519,8 @@ pub fn cut_mdf_by_time(
                                 state.next_offset.saturating_add(4 + payload.len() as u64);
                         }
                     }
-                }
-            }
+                    Ok(())
+            })?;
 
             for cn_id in &vlsd_out_ids {
                 writer.finish_signal_data_block(cn_id)?;

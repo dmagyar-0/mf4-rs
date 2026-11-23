@@ -4,31 +4,50 @@ use crate::parsing::decoder::DecodedValue;
 use super::linear::extract_numeric;
 
 /// General table lookup: either interpolated or nearest neighbour.
-/// `cc_val` must be `[key0, val0, key1, val1, …]`.
+/// `cc_val` must be `[key0, val0, key1, val1, …]` with ascending keys (as
+/// the MDF spec requires). Inputs below / above the table clamp to its first
+/// / last value; `NaN` has no result.
+///
+/// Binary search over the keys in place: no allocation, `O(log n)` per value.
+/// A table that breaks the ascending order is still answered: when the
+/// segment the search lands on does not hold `raw` (e.g. a NaN key), the
+/// first segment that does is found by a front-to-back scan, as the scan
+/// this replaced did. (With keys merely out of order, the search may land on
+/// a later segment that also holds `raw` than the scan would.)
 pub fn lookup_table(cc_val: &[f64], raw: f64, interp: bool) -> Option<f64> {
     let len = cc_val.len();
     // A single key/value pair is spec-valid: every input clamps to that value.
     if len < 2 || !len.is_multiple_of(2) { return None; }
     let n = len / 2;
-    let mut table = Vec::with_capacity(n);
-    for i in 0..n { table.push((cc_val[2*i], cc_val[2*i + 1])); }
-    if raw <= table[0].0 { return Some(table[0].1); }
-    if raw >= table[n-1].0 { return Some(table[n-1].1); }
-    for i in 0..(n-1) {
-        let (k0, v0) = table[i];
-        let (k1, v1) = table[i+1];
-        if raw >= k0 && raw <= k1 {
-            if interp {
-                let t = (raw - k0) / (k1 - k0);
-                return Some(v0 + t * (v1 - v0));
-            } else {
-                let d0 = raw - k0;
-                let d1 = k1 - raw;
-                return Some(if d1 < d0 { v1 } else { v0 });
-            }
-        }
+    let key = |i: usize| cc_val[2 * i];
+    let val = |i: usize| cc_val[2 * i + 1];
+    if raw <= key(0) { return Some(val(0)); }
+    if raw >= key(n - 1) { return Some(val(n - 1)); }
+    // NaN, or a malformed table (a NaN key) that clamps nothing: no result
+    // (the raw value passes through), as the linear scan this replaces gave.
+    if raw.is_nan() || n < 2 { return None; }
+    let holds = |i: usize| key(i) <= raw && raw <= key(i + 1);
+    // First segment [k_i, k_i+1] holding `raw`: the first i whose upper key
+    // k_i+1 >= raw (key(0) < raw < key(n-1) here, so 0 <= i < n-1).
+    let (mut lo, mut hi) = (1, n - 1);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if key(mid) < raw { lo = mid + 1 } else { hi = mid }
     }
-    None
+    let i = match lo - 1 {
+        i if holds(i) => i,
+        // Keys out of order: scan, as before.
+        _ => (0..n - 1).find(|&i| holds(i))?,
+    };
+    let (k0, v0, k1, v1) = (key(i), val(i), key(i + 1), val(i + 1));
+    if interp {
+        let t = (raw - k0) / (k1 - k0);
+        Some(v0 + t * (v1 - v0))
+    } else {
+        let d0 = raw - k0;
+        let d1 = k1 - raw;
+        Some(if d1 < d0 { v1 } else { v0 })
+    }
 }
 
 pub fn apply_table_lookup(block: &ConversionBlock, value: DecodedValue, interp: bool) -> Result<DecodedValue, MdfError> {

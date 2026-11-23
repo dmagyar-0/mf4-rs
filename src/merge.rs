@@ -192,18 +192,24 @@ fn collect_groups(file: &MdfFile, src_file: usize) -> Result<Vec<MergedGroup>, M
                 });
             }
             let mut data: Vec<Vec<DecodedValue>> = metas.iter().map(|_| Vec::new()).collect();
+            // Records split between two data blocks are reassembled.
+            let sections = dg.record_sections(cg, mmap)?;
             for (idx, ch) in cg.raw_channels.iter().enumerate() {
                 let is_vlsd = ch.block.channel_type == 1 && ch.block.data != 0;
-                let iter = ch.records(dg, cg, mmap)?;
-                for rec in iter {
-                    let bytes = rec?;
-                    let val = if is_vlsd {
-                        vlsd_payload_to_value(bytes, &ch.block.data_type)
-                    } else {
-                        decode_channel_value(bytes, record_id_len as usize, &ch.block)
-                            .unwrap_or(DecodedValue::Unknown)
-                    };
-                    data[idx].push(val);
+                if is_vlsd {
+                    // One payload per record, located by the record's offset.
+                    for rec in ch.records(dg, cg, mmap)? {
+                        data[idx].push(vlsd_payload_to_value(rec?, &ch.block.data_type));
+                    }
+                } else {
+                    let values = &mut data[idx];
+                    sections.for_each(0, sections.record_count(), |record| {
+                        values.push(
+                            decode_channel_value(record, record_id_len as usize, &ch.block)
+                                .unwrap_or(DecodedValue::Unknown),
+                        );
+                        Ok(())
+                    })?;
                 }
             }
             groups.push(MergedGroup {

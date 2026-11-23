@@ -91,7 +91,7 @@ impl BlockHeader {
             });
         }
         Ok(Self {
-            id: String::from_utf8_lossy(&bytes[0..4]).to_string(),
+            id: String::from_utf8_lossy(&bytes[0..4]).into_owned(),
             reserved0: LittleEndian::read_u32(&bytes[4..8]),
             block_len: LittleEndian::read_u64(&bytes[8..16]),
             links_nr: LittleEndian::read_u64(&bytes[16..24]),

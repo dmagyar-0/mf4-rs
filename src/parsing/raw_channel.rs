@@ -1,10 +1,9 @@
 use crate::blocks::channel_block::ChannelBlock;
-use crate::blocks::data_list_block::DataListBlock;
-use crate::blocks::signal_data_block::SignalDataBlock;
-use crate::blocks::common::BlockParse;
+use crate::error::MdfError;
+use crate::parsing::decoder::{check_value_validity, vlsd_offset};
 use crate::parsing::raw_channel_group::RawChannelGroup;
 use crate::parsing::raw_data_group::RawDataGroup;
-use crate::error::MdfError;
+use crate::parsing::record_stream::{RecordCursor, VlsdStream};
 
 /// A channel with lazy access to its raw record bytes (fixed-length or VLSD).
 #[derive(Debug)]
@@ -16,8 +15,16 @@ impl<'a> RawChannel {
 
     /// Return an iterator over raw record bytes for this channel.
     ///
-    /// The iterator yields a `Result` for each record and transparently handles
-    /// both fixed-size and VLSD storage schemes.
+    /// The iterator yields one `Result` per record:
+    /// * a fixed-length channel yields each whole record (record id, data
+    ///   and invalidation bytes). A record split between two data blocks of
+    ///   a `##DL` list cannot be returned as one slice of the file: the
+    ///   iterator then yields an error and stops (read the channel through
+    ///   [`Channel`](crate::api::channel::Channel) / `Mdf`, which reassemble
+    ///   such records);
+    /// * a VLSD channel yields the payload each record's offset points at in
+    ///   the `##SD` stream (an invalid record whose offset does not resolve
+    ///   yields an empty payload).
     ///
     /// # Arguments
     /// * `data_group` - Parent data group owning the records
@@ -33,136 +40,39 @@ impl<'a> RawChannel {
         channel_group: &'a RawChannelGroup,
         mmap: &'a [u8],
     ) -> Result<Box<dyn Iterator<Item = Result<&'a [u8], MdfError>> + 'a>, MdfError> {
-        // 1) VLSD path: channel has its own data pointer => SD/DL chain
+        // VLSD: follow each record's offset into the SD stream, one record
+        // at a time (nothing is collected up front).
         if self.block.channel_type == 1 && self.block.data != 0 {
-            // Capture the file bytes and channel pointer
-            let bytes = mmap;
-            let mut next_addr = self.block.data;
-            let mut data_links = Vec::new();
-            let mut link_idx = 0;
-            let mut current_sdb: Option<SignalDataBlock> = None;
-            let mut sdb_pos = 0;
-            let mut visited_dl: std::collections::HashSet<u64> = std::collections::HashSet::new();
-
-            // Build a from_fn iterator carrying that mutable state
-            let vlsd_iter = std::iter::from_fn(move || -> Option<Result<&'a [u8], MdfError>> {
-                loop {
-                    // 1) Yield from an open SDBLOCK if any
-                    if let Some(sdb) = &current_sdb {
-                        let buf = sdb.data;
-                        if sdb_pos + 4 <= buf.len() {
-                            let len = u32::from_le_bytes(
-                                buf[sdb_pos..sdb_pos+4].try_into().unwrap()
-                            ) as usize;
-                            let start = sdb_pos + 4;
-                            let end = start + len;
-                            if end > buf.len() {
-                                return Some(Err(MdfError::TooShortBuffer {
-                                    actual:   buf.len(),
-                                    expected: end,
-                                    file:     file!(),
-                                    line:     line!(),
-                                }));
-                            }
-                            let slice = &buf[start..end];
-                            sdb_pos = end;
-                            return Some(Ok(slice));
-                        }
-                        // exhausted
-                        current_sdb = None;
-                    }
-
-                    // 2) Next link in current DL batch?
-                    if link_idx < data_links.len() {
-                        let frag_addr = data_links[link_idx];
-                        link_idx += 1;
-                        if frag_addr == 0 {
-                            continue; // null link
-                        }
-                        let off = frag_addr as usize;
-                        if off >= bytes.len() {
-                            return Some(Err(MdfError::TooShortBuffer {
-                                actual:   bytes.len(),
-                                expected: off.saturating_add(24),
-                                file:     file!(),
-                                line:     line!(),
-                            }));
-                        }
-                        match SignalDataBlock::from_bytes(&bytes[off..]) {
-                            Ok(sdb) => {
-                                // Prepare to yield from it on the next loop
-                                current_sdb = Some(sdb);
-                                sdb_pos = 0;
-                                continue;
-                            }
-                            Err(e) => return Some(Err(e)),
-                        }
-                    }
-
-                    // 3) If we have a next_addr, peek its ID to decide what it is
-                    if next_addr != 0 {
-                        // Cycle detection: a chain that revisits an address
-                        // would otherwise loop forever.
-                        if !visited_dl.insert(next_addr) {
-                            return Some(Err(MdfError::BlockLinkError(format!(
-                                "cycle detected in VLSD data chain at address {:#x}",
-                                next_addr
-                            ))));
-                        }
-                        let off = next_addr as usize;
-                        // read the 4-byte ID (bounds-checked)
-                        let id = match bytes.get(off..off.saturating_add(4)) {
-                            Some(id) => id,
-                            None => {
-                                return Some(Err(MdfError::TooShortBuffer {
-                                    actual:   bytes.len(),
-                                    expected: off.saturating_add(4),
-                                    file:     file!(),
-                                    line:     line!(),
-                                }));
-                            }
-                        };
-                        match id {
-                            b"##DL" => {
-                                // Data List Block
-                                match DataListBlock::from_bytes(&bytes[off..]) {
-                                    Ok(dl) => {
-                                        data_links = dl.data_links.clone();
-                                        link_idx = 0;
-                                        next_addr = dl.next;
-                                        continue;  // back to loop start
-                                    }
-                                    Err(e) => return Some(Err(e)),
-                                }
-                            }
-                            b"##SD" => {
-                                // Direct Signal Data Block
-                                match SignalDataBlock::from_bytes(&bytes[off..]) {
-                                    Ok(sdb) => {
-                                        current_sdb = Some(sdb);
-                                        sdb_pos = 0;
-                                        next_addr = 0; // no list chain
-                                        continue;
-                                    }
-                                    Err(e) => return Some(Err(e)),
-                                }
-                            }
-                            other => {
-                                // unexpected block type
-                                return Some(Err(MdfError::BlockIDError {
-                                    actual:   String::from_utf8_lossy(other).into(),
-                                    expected: "##DL or ##SD".to_string(),
-                                }));
-                            }
-                        }
-                    }
-
-                    // 4) Done
+            let record_id_len = data_group.block.record_id_len as usize;
+            let cg_data_bytes = channel_group.block.samples_byte_nr;
+            let mut records = RecordCursor::new(data_group.record_sections(channel_group, mmap)?);
+            let stream = VlsdStream::new(mmap, self.block.data)?;
+            // The iterator outlives `&self`: keep a copy of the layout fields
+            // the validity check and the offset field need.
+            let mut layout = ChannelBlock::default();
+            layout.flags = self.block.flags;
+            layout.pos_invalidation_bit = self.block.pos_invalidation_bit;
+            layout.byte_offset = self.block.byte_offset;
+            layout.bit_offset = self.block.bit_offset;
+            layout.bit_count = self.block.bit_count;
+            let mut failed = false;
+            let payloads = std::iter::from_fn(move || {
+                if failed {
                     return None;
                 }
+                let item = records.next_with(|record| {
+                    let valid = check_value_validity(record, record_id_len, cg_data_bytes, &layout);
+                    match vlsd_offset(&layout, record, record_id_len).and_then(|o| stream.entry(o)) {
+                        Ok(payload) => Ok(payload),
+                        // An invalid record whose offset does not resolve.
+                        Err(_) if !valid => Ok(&[][..]),
+                        Err(e) => Err(e),
+                    }
+                })?;
+                failed = item.is_err();
+                Some(item)
             });
-
-            return Ok(Box::new(vlsd_iter));
+            return Ok(Box::new(payloads));
         }
 
         // Compute the size of each record:
@@ -178,23 +88,41 @@ impl<'a> RawChannel {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        // Gather all DataBlock fragments (DT, DV or DZ):
-        let blocks = data_group.data_blocks(mmap)?;
+        // Gather all DataBlock fragments (DT or DV):
+        let blocks: Vec<_> = data_group
+            .data_blocks(mmap)?
+            .into_iter()
+            .filter(|b| !b.data.is_empty())
+            .collect();
+        let last = blocks.len().saturating_sub(1);
 
-        // Build a single iterator that:
-        //  - goes block by block
-        //  - trims any partial record at the end of each block
-        //  - yields & [u8] of length `record_size`
-        let iter = blocks.into_iter().flat_map(move |data_block| {
-            // For DZBLOCK you already unzipped into DataBlock, so here data_block.data
-            let raw = data_block.data;
-            let valid_len = (raw.len() / record_size) * record_size;
-            // `chunks_exact` returns an iterator of &[u8] each exactly record_size
-            raw[..valid_len].chunks_exact(record_size)
-                // wrap each slice in Ok(...) so the overall Iterator<Item=Result<_,_>>
-                .map(Ok)
-                // If you wanted to handle an unexpected remainder, you could check raw.len() % record_size != 0 here.
-        });
+        // Whole records block by block. A block other than the last that
+        // ends in a partial record means a record straddles two blocks: it
+        // cannot be returned as one slice, so report it (instead of skipping
+        // it and misaligning every later record) and stop.
+        let iter = blocks
+            .into_iter()
+            .enumerate()
+            .flat_map(move |(i, data_block)| {
+                let raw = data_block.data;
+                let whole = (raw.len() / record_size) * record_size;
+                let split = (i < last && whole < raw.len()).then(|| {
+                    Err(MdfError::BlockSerializationError(
+                        "a record spans two data blocks of the ##DL list; RawChannel::records \
+                         cannot return it as one slice — read the channel through \
+                         Channel::decoded_values / Mdf::read, which reassemble it"
+                            .to_string(),
+                    ))
+                });
+                raw[..whole].chunks_exact(record_size).map(Ok).chain(split)
+            })
+            .scan(false, |failed, item| {
+                if *failed {
+                    return None;
+                }
+                *failed = item.is_err();
+                Some(item)
+            });
 
         Ok(Box::new(iter))
     }
