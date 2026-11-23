@@ -9,6 +9,11 @@ use super::linear::extract_numeric;
 /// / last value; `NaN` has no result.
 ///
 /// Binary search over the keys in place: no allocation, `O(log n)` per value.
+/// A table that breaks the ascending order is still answered: when the
+/// segment the search lands on does not hold `raw` (e.g. a NaN key), the
+/// first segment that does is found by a front-to-back scan, as the scan
+/// this replaced did. (With keys merely out of order, the search may land on
+/// a later segment that also holds `raw` than the scan would.)
 pub fn lookup_table(cc_val: &[f64], raw: f64, interp: bool) -> Option<f64> {
     let len = cc_val.len();
     // A single key/value pair is spec-valid: every input clamps to that value.
@@ -21,6 +26,7 @@ pub fn lookup_table(cc_val: &[f64], raw: f64, interp: bool) -> Option<f64> {
     // NaN, or a malformed table (a NaN key) that clamps nothing: no result
     // (the raw value passes through), as the linear scan this replaces gave.
     if raw.is_nan() || n < 2 { return None; }
+    let holds = |i: usize| key(i) <= raw && raw <= key(i + 1);
     // First segment [k_i, k_i+1] holding `raw`: the first i whose upper key
     // k_i+1 >= raw (key(0) < raw < key(n-1) here, so 0 <= i < n-1).
     let (mut lo, mut hi) = (1, n - 1);
@@ -28,7 +34,11 @@ pub fn lookup_table(cc_val: &[f64], raw: f64, interp: bool) -> Option<f64> {
         let mid = lo + (hi - lo) / 2;
         if key(mid) < raw { lo = mid + 1 } else { hi = mid }
     }
-    let i = lo - 1;
+    let i = match lo - 1 {
+        i if holds(i) => i,
+        // Keys out of order: scan, as before.
+        _ => (0..n - 1).find(|&i| holds(i))?,
+    };
     let (k0, v0, k1, v1) = (key(i), val(i), key(i + 1), val(i + 1));
     if interp {
         let t = (raw - k0) / (k1 - k0);
