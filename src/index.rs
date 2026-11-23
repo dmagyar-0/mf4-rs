@@ -12,6 +12,7 @@ use crate::error::MdfError;
 #[cfg(feature = "http")]
 use crate::fragments::{merge_ranges_bridging, FragmentStore, RecordingRangeReader};
 use crate::parsing::decoder::{check_value_validity, decode_channel_value, decode_channel_value_with_validity, decode_f64_from_record, DecodedValue};
+use crate::parsing::record_stream::RecordCarry;
 use crate::signal::Signal;
 use crate::types::{
     logical_group_members, merge_group_infos, resolve_records, search_time_window, ChannelInfo, ConversionInfo,
@@ -2137,24 +2138,6 @@ impl MdfIndex {
         })
     }
 
-    /// Number of whole records in a data block's data section.
-    ///
-    /// Errors if the block size underflows the header or if the data section
-    /// is not a multiple of the record size — a record spanning data-block
-    /// fragments is unsupported and silently flooring would decode garbage
-    /// for every record after the split.
-    fn records_in_block(data_block: &DataBlockInfo, record_size: usize) -> Result<u64, MdfError> {
-        let data_len = Self::data_section_size(data_block)?;
-        if data_len % record_size as u64 != 0 {
-            return Err(MdfError::BlockSerializationError(format!(
-                "data block at offset {}: data section of {} bytes is not a multiple of \
-                 the {}-byte record — record spans data block fragments, which is unsupported",
-                data_block.file_offset, data_len, record_size
-            )));
-        }
-        Ok(data_len / record_size as u64)
-    }
-
     /// Error for VLSD channels on the byte-range calculation paths.
     ///
     /// A VLSD channel's fixed record field holds an 8-byte offset into a
@@ -2327,8 +2310,13 @@ impl MdfIndex {
         Ok(values)
     }
 
-    /// Call `f` with the bytes of the records `[start, start + count)` of
-    /// `group`, one slice per data block the window touches.
+    /// Call `f` with the records `[start, start + count)` of `group` (each
+    /// call a run of whole records).
+    ///
+    /// The group's data blocks form one byte stream, in which record `i`
+    /// occupies bytes `[i·size, (i+1)·size)`: only the part of each block the
+    /// window covers is read, and a record split between two blocks is
+    /// reassembled.
     fn for_each_window_section<R, F>(
         reader: &mut R,
         group: &IndexedChannelGroup,
@@ -2341,13 +2329,18 @@ impl MdfIndex {
         R: ByteRangeReader<Error = MdfError>,
         F: FnMut(&[u8]) -> Result<(), MdfError>,
     {
-        let end = start + count;
+        let size = record_size as u64;
+        let overflow = || MdfError::BlockSerializationError("record window overflows".to_string());
+        let window_start = start.checked_mul(size).ok_or_else(overflow)?;
+        let window_end = start.checked_add(count).and_then(|e| e.checked_mul(size)).ok_or_else(overflow)?;
+        let mut records = RecordCarry::new(record_size);
+        // Stream offset of the current block's first data byte.
         let mut block_start = 0u64;
         // A probing reader (the wasm fragment driver) records every missing
         // block of the window in one pass instead of stopping at the first.
         let mut first_err = None;
         for block in &group.data_blocks {
-            if block_start >= end {
+            if block_start >= window_end {
                 break;
             }
             if block.is_compressed {
@@ -2355,14 +2348,14 @@ impl MdfIndex {
                     "Compressed blocks not yet supported in index reader".to_string(),
                 ));
             }
-            let block_end = block_start + Self::records_in_block(block, record_size)?;
-            let (from, to) = (start.max(block_start), end.min(block_end));
+            let block_end = block_start.saturating_add(Self::data_section_size(block)?);
+            let (from, to) = (window_start.max(block_start), window_end.min(block_end));
             if from < to {
-                let rel = (from - block_start) * record_size as u64;
-                let len = (to - from) * record_size as u64;
+                let rel = from - block_start;
+                let len = to - from;
                 // Verify the block header like the full read path does (the
                 // header wins over the index): a window starting at the
-                // block's first record reads header and data in one request.
+                // block's first byte reads header and data in one request.
                 let read = if rel == 0 {
                     reader.read_range(block.file_offset, 24 + len).map(|mut bytes| {
                         let data = bytes.split_off(24.min(bytes.len()));
@@ -2376,14 +2369,14 @@ impl MdfIndex {
                 match read {
                     Ok((header, data)) if first_err.is_none() => {
                         let real_len = Self::verified_data_len(Some(&header), block)?;
-                        if rel + len > real_len {
+                        if rel + len > real_len || data.len() as u64 != len {
                             return Err(MdfError::BlockSerializationError(format!(
                                 "data block at offset {} holds {} data bytes but the index \
                                  expects at least {} (inconsistent file; rebuild the index)",
                                 block.file_offset, real_len, rel + len
                             )));
                         }
-                        f(&data)?
+                        records.feed(&data, &mut f)?;
                     }
                     Ok(_) => {}
                     Err(e) if reader.is_probing() => {
@@ -2397,23 +2390,37 @@ impl MdfIndex {
         if let Some(e) = first_err {
             return Err(e);
         }
-        if block_start < end {
+        if block_start < window_end {
             return Err(MdfError::BlockSerializationError(format!(
                 "record window ending at {} exceeds the {} records held by the data blocks",
-                end, block_start
+                start + count,
+                block_start / size
             )));
         }
         Ok(())
     }
 
-    /// Records held by a group's data blocks.
+    /// Records a whole read of `group` decodes (for pre-allocation); refuses
+    /// compressed blocks, which the index reader cannot decode yet.
+    fn whole_read_records(group: &IndexedChannelGroup) -> Result<usize, MdfError> {
+        if group.data_blocks.iter().any(|b| b.is_compressed) {
+            return Err(MdfError::BlockSerializationError(
+                "Compressed blocks not yet supported in index reader".to_string(),
+            ));
+        }
+        Ok(Self::stored_records(group)? as usize)
+    }
+
+    /// Records held by a group's data blocks: the blocks form one byte
+    /// stream (a record may straddle two of them); a trailing partial record
+    /// does not count.
     fn stored_records(group: &IndexedChannelGroup) -> Result<u64, MdfError> {
         let record_size = Self::checked_record_size(group)?;
-        let mut total = 0u64;
+        let mut bytes = 0u64;
         for block in &group.data_blocks {
-            total = total.saturating_add(Self::records_in_block(block, record_size)?);
+            bytes = bytes.saturating_add(Self::data_section_size(block)?);
         }
-        Ok(total)
+        Ok(bytes / record_size as u64)
     }
 
     fn group_and_channel(&self, g: usize, c: usize) -> Result<(&IndexedChannelGroup, &IndexedChannel), MdfError> {
@@ -2570,23 +2577,19 @@ impl MdfIndex {
         reader: &mut R,
     ) -> Result<Vec<Option<DecodedValue>>, MdfError> {
         let record_size = Self::checked_record_size(group)?;
-        let mut total_records: usize = 0;
-        for data_block in &group.data_blocks {
-            if data_block.is_compressed {
-                return Err(MdfError::BlockSerializationError(
-                    "Compressed blocks not yet supported in index reader".to_string()
-                ));
-            }
-            total_records += Self::records_in_block(data_block, record_size)? as usize;
-        }
+        let total_records = Self::whole_read_records(group)?;
         // Cap the pre-allocation: `total_records` derives from index-supplied
         // block sizes, and a forged value must not abort on allocation. The
         // vector still grows as needed; real reads fail earlier at the reader.
         let mut values = Vec::with_capacity(total_records.min(1 << 24));
         let temp_cb = channel.to_decode_only_channel_block();
 
+        // Records split between two blocks are reassembled.
+        let mut records = RecordCarry::new(record_size);
         Self::for_each_data_section(reader, &group.data_blocks, |block_data| {
-            Self::decode_records_to_values(block_data, record_size, group, conversion, &temp_cb, &mut values)
+            records.feed(block_data, |run| {
+                Self::decode_records_to_values(run, record_size, group, conversion, &temp_cb, &mut values)
+            })
         })?;
 
         Ok(values)
@@ -2640,21 +2643,12 @@ impl MdfIndex {
         let mut payload_cb = channel.to_decode_only_channel_block();
         payload_cb.data = 1;
 
-        let mut total_records: usize = 0;
-        for data_block in &group.data_blocks {
-            total_records += Self::records_in_block(data_block, record_size)? as usize;
-        }
+        let total_records = Self::whole_read_records(group)?;
         let mut values = Vec::with_capacity(total_records.min(1 << 24));
 
-        Self::for_each_data_section(reader, &group.data_blocks, |block_data| {
-            if block_data.len() % record_size != 0 {
-                return Err(MdfError::BlockSerializationError(format!(
-                    "data block length {} is not a multiple of the {}-byte record — \
-                     record spans data block fragments, which is unsupported",
-                    block_data.len(),
-                    record_size
-                )));
-            }
+        // Records split between two blocks are reassembled.
+        let mut records = RecordCarry::new(record_size);
+        Self::for_each_data_section(reader, &group.data_blocks, |section| records.feed(section, |block_data| {
             let record_count = block_data.len() / record_size;
             for i in 0..record_count {
                 let record = &block_data[i * record_size..(i + 1) * record_size];
@@ -2724,7 +2718,7 @@ impl MdfIndex {
                 }
             }
             Ok(())
-        })?;
+        }))?;
 
         Ok(values)
     }
@@ -2961,10 +2955,10 @@ impl MdfIndex {
                 "invalid index: record size is 0".to_string(),
             ));
         }
+        // Callers pass whole records (`RecordCarry` reassembles split ones).
         if !block_data.len().is_multiple_of(record_size) {
             return Err(MdfError::BlockSerializationError(format!(
-                "data block length {} is not a multiple of the {}-byte record — \
-                 record spans data block fragments, which is unsupported",
+                "internal error: {} bytes are not a whole number of {}-byte records",
                 block_data.len(),
                 record_size
             )));
@@ -3014,10 +3008,10 @@ impl MdfIndex {
                 "invalid index: record size is 0".to_string(),
             ));
         }
+        // Callers pass whole records (`RecordCarry` reassembles split ones).
         if !block_data.len().is_multiple_of(record_size) {
             return Err(MdfError::BlockSerializationError(format!(
-                "data block length {} is not a multiple of the {}-byte record — \
-                 record spans data block fragments, which is unsupported",
+                "internal error: {} bytes are not a whole number of {}-byte records",
                 block_data.len(),
                 record_size
             )));
@@ -4184,53 +4178,48 @@ impl MdfIndex {
             (channel.bit_offset as usize + channel.bit_count as usize).div_ceil(8).max(1)
         };
 
+        // The data blocks form one byte stream in which record `r`'s field
+        // occupies `[r·size + offset, r·size + offset + len)`; a record (and
+        // even the field) may straddle two blocks. Per block, return the span
+        // from the first to the last field byte of the selected records it
+        // holds.
+        let size = record_size as u64;
+        let (field_offset, field_len) = (channel_offset_in_record as u64, channel_bytes_per_record as u64);
+        let end_record = start_record + record_count;
         let mut byte_ranges = Vec::new();
-        let mut records_processed = 0u64;
-        
+        let mut block_start = 0u64; // stream offset of the block's first data byte
+
         for data_block in &group.data_blocks {
             if data_block.is_compressed {
                 return Err(MdfError::BlockSerializationError(
                     "Compressed blocks not supported for byte range calculation".to_string()
                 ));
             }
-
-            let block_data_start = data_block.file_offset + 24; // Skip block header
-            let records_in_block = Self::records_in_block(data_block, record_size)?;
-            
-            // Determine which records from this block we need
-            let block_start_record = records_processed;
-            let block_end_record = records_processed + records_in_block;
-            
-            let need_start = start_record.max(block_start_record);
-            let need_end = (start_record + record_count).min(block_end_record);
-            
-            if need_start < need_end {
-                // We need some records from this block
-                let first_record_in_block = need_start - block_start_record;
-                let last_record_in_block = need_end - block_start_record - 1;
-                
-                // Calculate byte range for the channel data in these records
-                let first_channel_byte = block_data_start + 
-                    first_record_in_block * record_size as u64 + 
-                    channel_offset_in_record as u64;
-                
-                let last_channel_byte = block_data_start + 
-                    last_record_in_block * record_size as u64 + 
-                    channel_offset_in_record as u64 + 
-                    channel_bytes_per_record as u64 - 1;
-                
-                let range_length = last_channel_byte - first_channel_byte + 1;
-                byte_ranges.push((first_channel_byte, range_length));
-            }
-            
-            records_processed = block_end_record;
-            
-            // Early exit if we've processed all needed records
-            if records_processed >= start_record + record_count {
+            let block_end = block_start.saturating_add(Self::data_section_size(data_block)?);
+            if record_count == 0 || field_len == 0 || block_start >= end_record.saturating_mul(size) {
                 break;
             }
+            // Selected records whose field intersects [block_start, block_end):
+            // r·size + offset < block_end and r·size + offset + len > block_start.
+            let first = (block_start + 1).saturating_sub(field_offset + field_len).div_ceil(size);
+            let first = first.max(start_record);
+            let last = match block_end.checked_sub(field_offset + 1) {
+                Some(v) => (v / size).min(end_record - 1),
+                None => {
+                    block_start = block_end;
+                    continue;
+                }
+            };
+            if first <= last {
+                let lo = (first * size + field_offset).max(block_start);
+                let hi = (last * size + field_offset + field_len).min(block_end);
+                if lo < hi {
+                    byte_ranges.push((data_block.file_offset + 24 + (lo - block_start), hi - lo));
+                }
+            }
+            block_start = block_end;
         }
-        
+
         Ok(byte_ranges)
     }
 
@@ -4243,9 +4232,11 @@ impl MdfIndex {
     ///
     /// Note: each returned range is one *coalesced* span per data-block
     /// fragment, running from the first byte of the channel in the fragment's
-    /// first record to its last byte in the fragment's last record. Because
-    /// records interleave all channels of the group, the span **includes the
-    /// bytes of the other channels** lying between this channel's samples.
+    /// first record to its last byte in the fragment's last record (clipped
+    /// at the fragment's edges when a record — or the channel's field itself
+    /// — is split between two fragments). Because records interleave all
+    /// channels of the group, the span **includes the bytes of the other
+    /// channels** lying between this channel's samples.
     ///
     /// Pass `group` to resolve the channel in the group(s) with that name.
     /// Refused for VLSD channels (use `read` / `values`).
@@ -4300,16 +4291,7 @@ impl MdfIndex {
         }
 
         let record_size = Self::checked_record_size(group)?;
-
-        let mut total_records: usize = 0;
-        for data_block in &group.data_blocks {
-            if data_block.is_compressed {
-                return Err(MdfError::BlockSerializationError(
-                    "Compressed blocks not yet supported in index reader".to_string()
-                ));
-            }
-            total_records += Self::records_in_block(data_block, record_size)? as usize;
-        }
+        let total_records = Self::whole_read_records(group)?;
         // Cap the pre-allocation: `total_records` derives from index-supplied
         // block sizes, and a forged value must not abort on allocation. The
         // vector still grows as needed; real reads fail earlier at the reader.
@@ -4319,8 +4301,12 @@ impl MdfIndex {
         let linear_coeffs = Self::get_linear_coeffs(conversion.as_deref());
         let has_conversion = conversion.is_some();
 
+        // Records split between two blocks are reassembled.
+        let mut records = RecordCarry::new(record_size);
         Self::for_each_data_section(reader, &group.data_blocks, |block_data| {
-            Self::decode_records_to_f64(block_data, record_size, group, channel, conversion.as_deref(), &temp_cb, linear_coeffs, has_conversion, &mut values)
+            records.feed(block_data, |run| {
+                Self::decode_records_to_f64(run, record_size, group, channel, conversion.as_deref(), &temp_cb, linear_coeffs, has_conversion, &mut values)
+            })
         })?;
 
         Ok(values)
@@ -4355,24 +4341,20 @@ impl MdfIndex {
         }
 
         let record_size = Self::checked_record_size(group)?;
-        let mut total_records: usize = 0;
-        for data_block in &group.data_blocks {
-            if data_block.is_compressed {
-                return Err(MdfError::BlockSerializationError(
-                    "Compressed blocks not yet supported in index reader".to_string()
-                ));
-            }
-            total_records += Self::records_in_block(data_block, record_size)? as usize;
-        }
+        let total_records = Self::whole_read_records(group)?;
         // Cap the pre-allocation: `total_records` derives from index-supplied
         // block sizes, and a forged value must not abort on allocation. The
         // vector still grows as needed; real reads fail earlier at the reader.
         let mut values = Vec::with_capacity(total_records.min(1 << 24));
         let temp_cb = channel.to_decode_only_channel_block();
 
+        // Records split between two blocks are reassembled.
+        let mut records = RecordCarry::new(record_size);
         for data_block in &group.data_blocks {
             let block_data = Self::slice_data_block(file_data, data_block)?;
-            Self::decode_records_to_values(block_data, record_size, group, conversion.as_deref(), &temp_cb, &mut values)?;
+            records.feed(block_data, |run| {
+                Self::decode_records_to_values(run, record_size, group, conversion.as_deref(), &temp_cb, &mut values)
+            })?;
         }
 
         Ok(values)
@@ -4409,15 +4391,7 @@ impl MdfIndex {
         }
 
         let record_size = Self::checked_record_size(group)?;
-        let mut total_records: usize = 0;
-        for data_block in &group.data_blocks {
-            if data_block.is_compressed {
-                return Err(MdfError::BlockSerializationError(
-                    "Compressed blocks not yet supported in index reader".to_string()
-                ));
-            }
-            total_records += Self::records_in_block(data_block, record_size)? as usize;
-        }
+        let total_records = Self::whole_read_records(group)?;
         // Cap the pre-allocation: `total_records` derives from index-supplied
         // block sizes, and a forged value must not abort on allocation. The
         // vector still grows as needed; real reads fail earlier at the reader.
@@ -4426,9 +4400,13 @@ impl MdfIndex {
         let linear_coeffs = Self::get_linear_coeffs(conversion.as_deref());
         let has_conversion = conversion.is_some();
 
+        // Records split between two blocks are reassembled.
+        let mut records = RecordCarry::new(record_size);
         for data_block in &group.data_blocks {
             let block_data = Self::slice_data_block(file_data, data_block)?;
-            Self::decode_records_to_f64(block_data, record_size, group, channel, conversion.as_deref(), &temp_cb, linear_coeffs, has_conversion, &mut values)?;
+            records.feed(block_data, |run| {
+                Self::decode_records_to_f64(run, record_size, group, channel, conversion.as_deref(), &temp_cb, linear_coeffs, has_conversion, &mut values)
+            })?;
         }
 
         Ok(values)

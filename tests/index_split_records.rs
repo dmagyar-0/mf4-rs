@@ -416,6 +416,9 @@ mod url {
                 std::thread::spawn(move || {
                     stream.set_nonblocking(false).ok();
                     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    // One write per response, sent at once (a separate head and
+                    // body write stalls on Nagle + delayed ACK, ~40 ms each).
+                    stream.set_nodelay(true).ok();
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut stream = stream;
                     loop {
@@ -460,7 +463,9 @@ mod url {
                             ),
                             None => (format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n"), &bytes[..]),
                         };
-                        if stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(body)).is_err() {
+                        let mut response = head.into_bytes();
+                        response.extend_from_slice(body);
+                        if stream.write_all(&response).is_err() {
                             return;
                         }
                     }

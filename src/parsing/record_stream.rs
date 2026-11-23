@@ -103,6 +103,52 @@ impl<'a> RecordSections<'a> {
     }
 }
 
+/// Reassembles fixed-size records from data sections fed in stream order,
+/// for readers that receive the sections one at a time (the index's range
+/// reads). A section need not hold whole records: [`feed`](Self::feed)
+/// passes on runs of whole records — slices of the section where possible —
+/// and keeps the start of a record split between sections until its end
+/// arrives.
+pub(crate) struct RecordCarry {
+    record_size: usize,
+    carry: Vec<u8>,
+}
+
+impl RecordCarry {
+    pub(crate) fn new(record_size: usize) -> Self {
+        RecordCarry { record_size, carry: Vec::new() }
+    }
+
+    /// Feed the next section; `f` receives whole records only (each slice a
+    /// non-zero multiple of the record size), in order.
+    pub(crate) fn feed(
+        &mut self,
+        mut data: &[u8],
+        mut f: impl FnMut(&[u8]) -> Result<(), MdfError>,
+    ) -> Result<(), MdfError> {
+        let rs = self.record_size;
+        if rs == 0 {
+            return Ok(());
+        }
+        if !self.carry.is_empty() {
+            let take = (rs - self.carry.len()).min(data.len());
+            self.carry.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.carry.len() < rs {
+                return Ok(());
+            }
+            f(&self.carry)?;
+            self.carry.clear();
+        }
+        let whole = data.len() / rs * rs;
+        if whole > 0 {
+            f(&data[..whole])?;
+        }
+        self.carry.extend_from_slice(&data[whole..]);
+        Ok(())
+    }
+}
+
 /// A VLSD channel's signal data: the data sections of its `##SD` blocks (one
 /// `##SD`, or a `##DL` chain of them) as one virtual stream of
 /// `[u32 length][payload]` entries, addressed by the offset each record
