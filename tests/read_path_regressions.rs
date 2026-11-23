@@ -629,6 +629,15 @@ fn vlsd_offset_fields_narrower_than_64_bits_read_alike() -> Result<(), MdfError>
     w.finish_signal_data_block(&vlsd)?;
     w.finish_data_block(&cg)?;
     w.finalize()?;
+    // The writer always stores 64 for a VLSD channel: patch `Msg`'s
+    // cn_bit_count to 32 so the field ends before the 0xFF filler.
+    let mut b = std::fs::read(&path).unwrap();
+    let cg_addr = u64_at(&b, first_dg(&b) + 32) as usize;
+    let cn1 = u64_at(&b, cg_addr + 32) as usize;
+    let cn2 = u64_at(&b, cn1 + 24) as usize;
+    assert_eq!(u32::from_le_bytes(b[cn2 + 96..cn2 + 100].try_into().unwrap()), 64);
+    b[cn2 + 96..cn2 + 100].copy_from_slice(&32u32.to_le_bytes());
+    std::fs::write(&path, &b).unwrap();
 
     let want = strs(&[Some("first"), Some("second"), Some("third")]);
     assert_eq!(texts(&Mdf::from_file(&path)?.read("Msg", None)?), want);

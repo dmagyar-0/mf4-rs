@@ -11,7 +11,7 @@ use crate::blocks::conversion::{ConversionBlock, ConversionType};
 use crate::error::MdfError;
 #[cfg(feature = "http")]
 use crate::fragments::{merge_ranges_bridging, FragmentStore, RecordingRangeReader};
-use crate::parsing::decoder::{check_value_validity, decode_channel_value, decode_channel_value_with_validity, decode_f64_from_record, DecodedValue};
+use crate::parsing::decoder::{check_value_validity, decode_channel_value, decode_channel_value_with_validity, decode_f64_from_record, vlsd_offset, DecodedValue};
 use crate::parsing::record_stream::RecordCarry;
 use crate::signal::Signal;
 use crate::types::{
@@ -2635,7 +2635,6 @@ impl MdfIndex {
         let cg_data_bytes = group.record_size;
         let has_invalidation = group.invalidation_bytes > 0;
         let all_invalid = channel.flags & 0x1 != 0;
-        let offset_pos = record_id_len + channel.byte_offset as usize;
 
         // A fixed-record channel block (data == 0) drives the validity check;
         // a separate VLSD block (data != 0) drives payload decoding.
@@ -2661,17 +2660,9 @@ impl MdfIndex {
                     continue;
                 }
 
-                // Read the inline 8-byte virtual offset.
-                if offset_pos + 8 > record.len() {
-                    return Err(MdfError::TooShortBuffer {
-                        actual: record.len(),
-                        expected: offset_pos + 8,
-                        file: file!(),
-                        line: line!(),
-                    });
-                }
-                let virtual_offset =
-                    u64::from_le_bytes(record[offset_pos..offset_pos + 8].try_into().unwrap());
+                // The record's offset into the signal-data stream (read like
+                // `Mdf` does: an unsigned field of the channel's bit count).
+                let virtual_offset = vlsd_offset(&validity_cb, record, record_id_len)?;
 
                 if virtual_offset >= stream_len {
                     return Err(MdfError::BlockSerializationError(format!(
@@ -2753,13 +2744,13 @@ impl MdfIndex {
             )));
         }
 
-        // The VLSD offset field is fixed at 64 bits by the spec and is
-        // byte-aligned; a nonzero bit offset would silently shift every
-        // resolved stream offset.
-        if channel.bit_count != 64 || channel.bit_offset != 0 {
+        // The spec fixes the VLSD offset field at 64 bits; a narrower
+        // unsigned field is read too (as `Mdf` reads it), anything that is
+        // not an integer of at most 64 bits is refused.
+        if channel.bit_count == 0 || channel.bit_count > 64 || channel.bit_offset > 7 {
             return Err(MdfError::BlockSerializationError(format!(
                 "VLSD channel '{}' has a {}-bit record field at bit offset {}; the \
-                 inline VLSD offset must be a byte-aligned 64-bit field",
+                 inline VLSD offset must be an unsigned integer of at most 64 bits",
                 channel.name.as_deref().unwrap_or("<unnamed>"),
                 channel.bit_count,
                 channel.bit_offset
@@ -2787,7 +2778,6 @@ impl MdfIndex {
         let record_id_len = group.record_id_len as usize;
         let has_invalidation = group.invalidation_bytes > 0;
         let all_invalid = channel.flags & 0x1 != 0;
-        let offset_pos = record_id_len + channel.byte_offset as usize;
         let validity_cb = channel.to_decode_only_channel_block();
         let mut payload_cb = channel.to_decode_only_channel_block();
         payload_cb.data = 1;
@@ -2803,13 +2793,7 @@ impl MdfIndex {
                     offsets.push(None);
                     continue;
                 }
-                let field = record.get(offset_pos..offset_pos + 8).ok_or(MdfError::TooShortBuffer {
-                    actual: record.len(),
-                    expected: offset_pos + 8,
-                    file: file!(),
-                    line: line!(),
-                })?;
-                offsets.push(Some(u64::from_le_bytes(field.try_into().unwrap())));
+                offsets.push(Some(vlsd_offset(&validity_cb, record, record_id_len)?));
             }
             Ok(())
         })?;

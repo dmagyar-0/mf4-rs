@@ -3,7 +3,7 @@ use crate::error::MdfError;
 use crate::parsing::decoder::{check_value_validity, vlsd_offset};
 use crate::parsing::raw_channel_group::RawChannelGroup;
 use crate::parsing::raw_data_group::RawDataGroup;
-use crate::parsing::record_stream::VlsdStream;
+use crate::parsing::record_stream::{RecordCursor, VlsdStream};
 
 /// A channel with lazy access to its raw record bytes (fixed-length or VLSD).
 #[derive(Debug)]
@@ -40,29 +40,39 @@ impl<'a> RawChannel {
         channel_group: &'a RawChannelGroup,
         mmap: &'a [u8],
     ) -> Result<Box<dyn Iterator<Item = Result<&'a [u8], MdfError>> + 'a>, MdfError> {
-        // VLSD: follow each record's offset into the SD stream.
+        // VLSD: follow each record's offset into the SD stream, one record
+        // at a time (nothing is collected up front).
         if self.block.channel_type == 1 && self.block.data != 0 {
             let record_id_len = data_group.block.record_id_len as usize;
             let cg_data_bytes = channel_group.block.samples_byte_nr;
-            let sections = data_group.record_sections(channel_group, mmap)?;
+            let mut records = RecordCursor::new(data_group.record_sections(channel_group, mmap)?);
             let stream = VlsdStream::new(mmap, self.block.data)?;
-            let mut payloads: Vec<Result<&'a [u8], MdfError>> =
-                Vec::with_capacity(sections.record_count().min(1 << 20) as usize);
-            // The closure's error only stops the walk; the real error has
-            // already been pushed for the caller.
-            let _ = sections.for_each(0, sections.record_count(), |record| {
-                let valid = check_value_validity(record, record_id_len, cg_data_bytes, &self.block);
-                match vlsd_offset(&self.block, record, record_id_len).and_then(|o| stream.entry(o)) {
-                    Ok(payload) => payloads.push(Ok(payload)),
-                    Err(_) if !valid => payloads.push(Ok(&[])),
-                    Err(e) => {
-                        payloads.push(Err(e));
-                        return Err(MdfError::BlockSerializationError(String::new()));
-                    }
+            // The iterator outlives `&self`: keep a copy of the layout fields
+            // the validity check and the offset field need.
+            let mut layout = ChannelBlock::default();
+            layout.flags = self.block.flags;
+            layout.pos_invalidation_bit = self.block.pos_invalidation_bit;
+            layout.byte_offset = self.block.byte_offset;
+            layout.bit_offset = self.block.bit_offset;
+            layout.bit_count = self.block.bit_count;
+            let mut failed = false;
+            let payloads = std::iter::from_fn(move || {
+                if failed {
+                    return None;
                 }
-                Ok(())
+                let item = records.next_with(|record| {
+                    let valid = check_value_validity(record, record_id_len, cg_data_bytes, &layout);
+                    match vlsd_offset(&layout, record, record_id_len).and_then(|o| stream.entry(o)) {
+                        Ok(payload) => Ok(payload),
+                        // An invalid record whose offset does not resolve.
+                        Err(_) if !valid => Ok(&[][..]),
+                        Err(e) => Err(e),
+                    }
+                })?;
+                failed = item.is_err();
+                Some(item)
             });
-            return Ok(Box::new(payloads.into_iter()));
+            return Ok(Box::new(payloads));
         }
 
         // Compute the size of each record:

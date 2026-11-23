@@ -103,6 +103,52 @@ impl<'a> RecordSections<'a> {
     }
 }
 
+/// A lazy cursor over the records of a [`RecordSections`] stream, for
+/// iterators that must not collect every record up front. A record split
+/// between sections is reassembled in a small reusable buffer, so each record
+/// is lent to a closure ([`next_with`](Self::next_with)) rather than returned.
+pub(crate) struct RecordCursor<'a> {
+    stream: RecordSections<'a>,
+    next: u64,
+    section: usize,
+    buf: Vec<u8>,
+}
+
+impl<'a> RecordCursor<'a> {
+    pub(crate) fn new(stream: RecordSections<'a>) -> Self {
+        RecordCursor { stream, next: 0, section: 0, buf: Vec::new() }
+    }
+
+    /// `f` applied to the next record, or `None` past the last one.
+    pub(crate) fn next_with<T>(&mut self, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
+        if self.next >= self.stream.records {
+            return None;
+        }
+        let rs = self.stream.record_size;
+        let pos = self.next * rs as u64;
+        self.next += 1;
+        // Sections are non-empty and the record lies within the stream.
+        while self.stream.starts[self.section] + self.stream.sections[self.section].len() as u64 <= pos {
+            self.section += 1;
+        }
+        let section = self.stream.sections[self.section];
+        let offset = (pos - self.stream.starts[self.section]) as usize;
+        if offset + rs <= section.len() {
+            return Some(f(&section[offset..offset + rs]));
+        }
+        self.buf.clear();
+        self.buf.extend_from_slice(&section[offset..]);
+        let mut i = self.section + 1;
+        while self.buf.len() < rs {
+            let next = self.stream.sections[i];
+            let take = (rs - self.buf.len()).min(next.len());
+            self.buf.extend_from_slice(&next[..take]);
+            i += 1;
+        }
+        Some(f(&self.buf))
+    }
+}
+
 /// Reassembles fixed-size records from data sections fed in stream order,
 /// for readers that receive the sections one at a time (the index's range
 /// reads). A section need not hold whole records: [`feed`](Self::feed)

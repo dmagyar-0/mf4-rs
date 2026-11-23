@@ -2,6 +2,9 @@
 //! record in memory: `RawChannel::records()` is lazy, and `cut_mdf_by_time`
 //! resolves each record's payload as it copies the record.
 //!
+//! (The writer `cut` writes through buffers the output's ##SD stream by
+//! design; the budget below allows for that buffer.)
+//!
 //! A counting global allocator measures the peak heap growth of each call
 //! (this test binary holds a single test, so nothing else allocates
 //! concurrently).
@@ -109,6 +112,7 @@ fn vlsd_record_reads_do_not_hold_every_record_in_memory() -> Result<(), MdfError
         records.next().map(|r| r.map(<[u8]>::to_vec))
     });
     assert_eq!(first.unwrap()?, b"m0".to_vec());
+    eprintln!("records() + next(): peak heap growth {growth} bytes");
     assert!(
         growth < per_record_list / 10,
         "records() + next() grew the heap by {growth} bytes for {RECORDS} records"
@@ -116,14 +120,22 @@ fn vlsd_record_reads_do_not_hold_every_record_in_memory() -> Result<(), MdfError
 
     let (count, growth) = peak_growth(|| cg.raw_channels[1].records(dg, cg, &file.mmap).unwrap().count());
     assert_eq!(count, RECORDS);
+    eprintln!("records() iterated: peak heap growth {growth} bytes");
     assert!(growth < per_record_list / 10, "iterating records() grew the heap by {growth} bytes");
 
     let out = tmp("vlsd_memory_cut.mf4");
     let (cut, growth) = peak_growth(|| mf4_rs::cut_mdf_by_time(&path, &out, 0.0, RECORDS as f64));
     cut?;
+    eprintln!("cut_mdf_by_time: peak heap growth {growth} bytes");
+    // The *writer* keeps the output's whole ##SD stream in memory until the
+    // data block is finished (by design, so the ##DT block stays contiguous):
+    // allow that buffer (with Vec growth slack) plus the 1 MiB file buffer,
+    // but not a per-record list on the reading side as well.
+    let sd_stream: usize = (0..RECORDS).map(|i| 4 + format!("m{}", i % 10).len()).sum();
+    let budget = 3 * sd_stream + (2 << 20);
     assert!(
-        growth < per_record_list / 2,
-        "cut_mdf_by_time grew the heap by {growth} bytes for {RECORDS} records"
+        growth < budget && growth < per_record_list,
+        "cut_mdf_by_time grew the heap by {growth} bytes for {RECORDS} records (budget {budget})"
     );
     let values = Mdf::from_file(&out)?.read("Msg", None)?.values;
     assert_eq!(values.len(), RECORDS);
