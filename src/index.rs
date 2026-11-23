@@ -3394,7 +3394,9 @@ impl MdfIndex {
         let (start, count) = self.batched_reads_seeded(&mut http, &mut store, |r| self.resolve_window(g, c, window, r))?;
 
         let group = &self.channel_groups[g];
-        let record = Self::checked_record_size(group)? as u64;
+        // Only sizes the read: a byte-less group (a virtual master) fetches
+        // nothing, as in `window_read_bytes`.
+        let record = Self::checked_record_size(group).unwrap_or(0) as u64;
         let vlsd: u64 = group.channels[c].vlsd_data_blocks.iter().map(|b| b.size).sum();
         if count.saturating_mul(record).saturating_add(vlsd) > batch_limit {
             let mut reader = ChunkedUrlReader { http, store };
